@@ -197,6 +197,10 @@ pub enum ElementKind {
     Text {
         text: String,
         font_size: f64,
+        /// Max line width in world units; when set, lines wrap at this width.
+        /// None = no wrapping (natural width).
+        #[serde(default)]
+        wrap_width: Option<f64>,
     },
 }
 
@@ -251,6 +255,7 @@ impl Element {
             ElementKind::Text {
                 text,
                 font_size: DEFAULT_FONT_SIZE,
+                wrap_width: None,
             },
             WBounds::new(origin.x, origin.y, 0.0, DEFAULT_FONT_SIZE * LINE_HEIGHT),
             style,
@@ -269,6 +274,13 @@ impl Element {
 
     pub fn is_text(&self) -> bool {
         matches!(self.kind, ElementKind::Text { .. })
+    }
+
+    pub fn wrap_width(&self) -> Option<f64> {
+        match &self.kind {
+            ElementKind::Text { wrap_width, .. } => *wrap_width,
+            _ => None,
+        }
     }
 
     pub fn text(&self) -> Option<&str> {
@@ -320,8 +332,11 @@ impl Element {
                     p.y *= sy.abs();
                 }
             }
-            ElementKind::Text { font_size, .. } => {
+            ElementKind::Text { font_size, wrap_width, .. } => {
                 *font_size = (*font_size * esx.max(0.05)).clamp(4.0, 400.0);
+                if let Some(w) = wrap_width {
+                    *w = (*w * esx).max(4.0);
+                }
             }
             _ => {}
         }
@@ -566,5 +581,22 @@ mod tests {
         // bounds.w scales by the same uniform factor (not sx alone), so the
         // frame never becomes narrower than the (rescaled) text.
         assert!((t.bounds.w - orig_w * 0.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn text_rescale_corner_scales_wrap_width() {
+        // Corner drag scales both font_size and wrap_width uniformly.
+        let mut t = Element::new_text(WPoint::new(0.0, 0.0), "abc".into(), rect_style());
+        if let ElementKind::Text { wrap_width, .. } = &mut t.kind {
+            *wrap_width = Some(100.0);
+        }
+        t.rescale(2.0, 2.0, WPoint::new(0.0, 0.0));
+        match t.kind {
+            ElementKind::Text { font_size, wrap_width, .. } => {
+                assert!((font_size - DEFAULT_FONT_SIZE * 2.0).abs() < 1e-9);
+                assert!((wrap_width.unwrap() - 200.0).abs() < 1e-9);
+            }
+            _ => panic!(),
+        }
     }
 }

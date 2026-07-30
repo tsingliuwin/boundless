@@ -36,6 +36,7 @@ pub struct EditingState {
     pub element_id: ElementId,
     pub session: TextEditSession,
     pub font_size: f64,
+    pub wrap_width: Option<f64>,
     /// True when the text element was created by this editing session.
     pub is_new: bool,
 }
@@ -190,14 +191,17 @@ impl BoardView {
         let Some(el) = self.scene.get(element_id) else {
             return;
         };
-        let (text, font_size) = match &el.kind {
-            ElementKind::Text { text, font_size } => (text.clone(), *font_size),
+        let (text, font_size, wrap_width) = match &el.kind {
+            ElementKind::Text { text, font_size, wrap_width } => {
+                (text.clone(), *font_size, *wrap_width)
+            }
             _ => return,
         };
         self.editing = Some(EditingState {
             element_id,
             session: TextEditSession::new(&text),
             font_size,
+            wrap_width,
             is_new,
         });
         cx.notify();
@@ -224,7 +228,7 @@ impl BoardView {
                 if !ed.is_new {
                     self.history.record(&self.scene);
                 }
-                let (w, h) = measure_text(&text, ed.font_size, window);
+                let (w, h) = measure_text(&text, ed.font_size, ed.wrap_width, window);
                 if let Some(el) = self.scene.get_mut(id) {
                     if let ElementKind::Text { text: t, .. } = &mut el.kind {
                         *t = text.clone();
@@ -645,12 +649,44 @@ impl BoardView {
                     self.mark_dirty();
                 }
                 let pivot = WPoint::new(original_bounds.x, original_bounds.y);
+                let is_corner = matches!(
+                    handle,
+                    crate::render::Handle::Nw
+                        | crate::render::Handle::Ne
+                        | crate::render::Handle::Se
+                        | crate::render::Handle::Sw
+                );
+                let is_horizontal_edge = matches!(
+                    handle,
+                    crate::render::Handle::E | crate::render::Handle::W
+                );
                 for original in &originals {
                     let mut scaled = original.clone();
-                    scaled.rescale(sx, sy, pivot);
-                    // Text bounds are determined by font_size; queue a precise
-                    // re-measure so the frame tracks the actual text extent
-                    // instead of the linear scale estimate.
+                    if let ElementKind::Text { font_size, wrap_width, .. } = &mut scaled.kind {
+                        // Text resize is handle-aware:
+                        //  - corner: scale font (and wrap width) uniformly
+                        //  - horizontal edge (E/W): change wrap width, keep font
+                        //  - vertical edge (N/S): scale font, keep wrap width
+                        if is_corner {
+                            let scale = (sx.abs() + sy.abs()) / 2.0;
+                            *font_size = (*font_size * scale.max(0.05)).clamp(4.0, 400.0);
+                            if let Some(w) = wrap_width {
+                                *w = (*w * scale).max(4.0);
+                            }
+                        } else if is_horizontal_edge {
+                            // Enable/update wrapping at the new width.
+                            *wrap_width = Some(new_bounds.w.max(8.0));
+                        } else {
+                            // Vertical edge: scale font, keep wrap width.
+                            *font_size = (*font_size * sy.abs().max(0.05)).clamp(4.0, 400.0);
+                        }
+                        // Position the element at the new top-left; width/height
+                        // will be recomputed by pending_measure.
+                        scaled.bounds.x = new_bounds.x;
+                        scaled.bounds.y = new_bounds.y;
+                    } else {
+                        scaled.rescale(sx, sy, pivot);
+                    }
                     if scaled.is_text() {
                         self.pending_measure.push(original.id);
                     }
@@ -921,7 +957,7 @@ impl BoardView {
         let world = self.to_world(screen);
         let text = ed.session.text();
         let color = color_u32(0x000000, 1.0);
-        let (lines, line_height) = shape_text(&text, ed.font_size, &self.camera, color, window);
+        let (lines, line_height) = shape_text(&text, ed.font_size, &self.camera, color, ed.wrap_width, window);
         if lines.is_empty() {
             return Some(0);
         }
@@ -950,7 +986,7 @@ impl BoardView {
     ) -> Option<(Point<Pixels>, Pixels)> {
         let text = ed.session.text();
         let color = color_u32(0x000000, 1.0);
-        let (lines, line_height) = shape_text(&text, ed.font_size, &self.camera, color, window);
+        let (lines, line_height) = shape_text(&text, ed.font_size, &self.camera, color, ed.wrap_width, window);
         if lines.is_empty() {
             return None;
         }
@@ -1148,10 +1184,10 @@ impl BoardView {
                 continue; // painted via the editing session
             }
             match &el.kind {
-                ElementKind::Text { text, font_size } => {
+                ElementKind::Text { text, font_size, .. } => {
                     let color = color_u32(el.style.stroke, el.style.opacity);
                     let (lines, line_height) =
-                        shape_text(text, *font_size, &self.camera, color, window);
+                        shape_text(text, *font_size, &self.camera, color, el.wrap_width(), window);
                     let screen_origin = self.camera.world_to_screen(
                         WPoint::new(el.bounds.x, el.bounds.y),
                         origin,
@@ -1254,7 +1290,7 @@ impl BoardView {
         let el = self.scene.get(ed.element_id)?;
         let text = ed.session.text();
         let color = color_u32(el.style.stroke, el.style.opacity);
-        let (lines, line_height) = shape_text(&text, ed.font_size, &self.camera, color, window);
+        let (lines, line_height) = shape_text(&text, ed.font_size, &self.camera, color, ed.wrap_width, window);
         let origin = self
             .camera
             .world_to_screen(WPoint::new(el.bounds.x, el.bounds.y), canvas_origin);
@@ -1370,11 +1406,13 @@ impl Render for BoardView {
             let pending = std::mem::take(&mut self.pending_measure);
             for id in pending {
                 let info = self.scene.get(id).and_then(|el| match &el.kind {
-                    ElementKind::Text { text, font_size } => Some((text.clone(), *font_size)),
+                    ElementKind::Text { text, font_size, wrap_width } => {
+                        Some((text.clone(), *font_size, *wrap_width))
+                    }
                     _ => None,
                 });
-                if let Some((text, font_size)) = info {
-                    let (w, h) = measure_text(&text, font_size, window);
+                if let Some((text, font_size, wrap_width)) = info {
+                    let (w, h) = measure_text(&text, font_size, wrap_width, window);
                     if let Some(el) = self.scene.get_mut(id) {
                         el.bounds.w = w.max(1.0);
                         el.bounds.h = h.max(1.0);

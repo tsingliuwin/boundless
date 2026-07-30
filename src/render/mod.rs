@@ -76,22 +76,25 @@ pub struct ShapedTextLine {
     pub width: Pixels,
 }
 
-/// Shape every line of a text element at the current zoom.
+/// Shape every line of a text element at the current zoom. When
+/// `wrap_width_world` is set, over-long paragraphs wrap at that width
+/// (measured in world units, scaled to screen px here).
 pub fn shape_text(
     text: &str,
     font_size_world: f64,
     camera: &Camera,
     color: Hsla,
+    wrap_width_world: Option<f64>,
     window: &Window,
 ) -> (Vec<ShapedTextLine>, Pixels) {
     let font_size = camera.scale(font_size_world).max(px(1.0));
     let line_height = font_size * LINE_HEIGHT as f32;
+    let wrap_px = wrap_width_world.map(|w| camera.scale(w).max(px(1.0)));
     let font = canvas_font();
     let text_system = window.text_system();
-    let mut lines = Vec::new();
-    let mut offset = 0usize;
-    for raw in text.split('\n') {
-        let line_text = if raw.is_empty() { " " } else { raw };
+
+    let shape_one = |s: &str| {
+        let line_text = if s.is_empty() { " " } else { s };
         let shaped = text_system.shape_line(
             line_text.to_string().into(),
             font_size,
@@ -105,18 +108,28 @@ pub fn shape_text(
             }],
             None,
         );
-        let shaped = if raw.is_empty() {
+        if s.is_empty() {
             shaped.with_len(0)
         } else {
             shaped
-        };
-        let width = shaped.width;
-        lines.push(ShapedTextLine {
-            line: shaped,
-            byte_range: offset..offset + raw.len(),
-            width,
-        });
-        offset += raw.len() + 1; // + '\n'
+        }
+    };
+
+    let mut lines = Vec::new();
+    let mut offset = 0usize;
+    for raw in text.split('\n') {
+        let segments = wrap_segment(raw, wrap_px, &shape_one);
+        for seg in segments {
+            let shaped = shape_one(&seg);
+            let width = shaped.width;
+            lines.push(ShapedTextLine {
+                line: shaped,
+                byte_range: offset..offset + seg.len(),
+                width,
+            });
+            offset += seg.len();
+        }
+        offset += 1; // the '\n'
     }
     if lines.is_empty() {
         let shaped = text_system.shape_line(
@@ -141,15 +154,69 @@ pub fn shape_text(
     (lines, line_height)
 }
 
+/// Split a single paragraph (no embedded newlines) into wrap segments that
+/// each fit within `wrap_px`. Splits on character boundaries; if a single
+/// character exceeds the width it still gets its own line.
+fn wrap_segment(
+    s: &str,
+    wrap_px: Option<Pixels>,
+    shape: &impl Fn(&str) -> ShapedLine,
+) -> Vec<String> {
+    let Some(wrap) = wrap_px else {
+        return vec![s.to_string()];
+    };
+    if s.is_empty() {
+        return vec![String::new()];
+    }
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    let mut out = Vec::new();
+    let mut start = 0usize; // byte offset of current line start
+    let mut last_space = None; // byte offset after last breakable space
+    for i in 0..chars.len() {
+        let (byte_off, ch) = chars[i];
+        // Tentative line from start to this char (inclusive).
+        let candidate = &s[start..byte_off + ch.len_utf8()];
+        let width = shape(candidate).width;
+        if width > wrap && byte_off > start {
+            // Wrap: break before this char. Prefer breaking after the last
+            // space if one exists in the current line.
+            let break_at = last_space.unwrap_or(byte_off);
+            out.push(s[start..break_at].to_string());
+            start = break_at;
+            // Skip a single space at the break so we don't start a line with it.
+            if s[start..].starts_with(' ') {
+                start += 1;
+            }
+            last_space = None;
+        }
+        if ch == ' ' {
+            last_space = Some(byte_off + 1);
+        }
+    }
+    if start < s.len() {
+        out.push(s[start..].to_string());
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
 /// Measure a text element's world-space size (max line width, total height).
 /// Uses a zoom of 1 so results are in world units.
-pub fn measure_text(text: &str, font_size_world: f64, window: &Window) -> (f64, f64) {
+pub fn measure_text(
+    text: &str,
+    font_size_world: f64,
+    wrap_width: Option<f64>,
+    window: &Window,
+) -> (f64, f64) {
     let camera = Camera {
         x: 0.0,
         y: 0.0,
         zoom: 1.0,
     };
-    let (lines, line_height) = shape_text(text, font_size_world, &camera, gpui::hsla(0., 0., 0., 1.), window);
+    let (lines, line_height) =
+        shape_text(text, font_size_world, &camera, gpui::hsla(0., 0., 0., 1.), wrap_width, window);
     let max_width = lines
         .iter()
         .map(|l| l.width.to_f64())
