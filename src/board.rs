@@ -1387,7 +1387,7 @@ impl Render for BoardView {
         // div alone is overridden by the canvas's default).
         let cursor = match (&self.drag, self.tool) {
             (DragState::Panning { .. }, _) => CursorStyle::OpenHand,
-            (DragState::Moving { .. }, _) => CursorStyle::ClosedHand,
+            (DragState::Moving { .. }, _) => CursorStyle::PointingHand,
             (DragState::Resizing { handle, .. }, _) => match handle {
                 crate::render::Handle::N | crate::render::Handle::S => CursorStyle::ResizeUpDown,
                 crate::render::Handle::E | crate::render::Handle::W => CursorStyle::ResizeLeftRight,
@@ -1416,7 +1416,7 @@ impl Render for BoardView {
                         }
                     }
                 } else if self.hover_over_element {
-                    CursorStyle::OpenHand
+                    CursorStyle::PointingHand
                 } else {
                     CursorStyle::Arrow
                 }
