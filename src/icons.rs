@@ -4,22 +4,7 @@
 //! to the button's origin and stroked with the caller-provided color. Buttons
 //! are fixed at 20×20 logical px so no scaling is needed.
 
-use gpui::{
-    canvas, point, px, Bounds, Hsla, IntoElement, PathBuilder, PathStyle, Pixels, Point, Styled,
-    Window,
-};
-
-// GPUI re-exports lyon's stroke tessellation types via path_builder.
-use gpui::{FillOptions, StrokeOptions};
-
-/// LineCap/LineJoin come from lyon (not re-exported by gpui), but they're only
-/// needed to configure StrokeOptions. gpui's StrokeOptions is lyon's, so the
-/// lyon types are the same; we access them through the re-exported
-/// StrokeOptions methods which accept lyon types — but those aren't in scope.
-// We avoid needing LineCap/LineJoin directly by using default options with
-// only line_width set; round caps are the lyon default for stroke tessellation
-// in gpui's renderer? To be safe we accept default caps (butt). The icons still
-// read fine.
+use gpui::{canvas, point, px, Hsla, IntoElement, PathBuilder, Styled};
 
 /// Logical icon drawing space.
 pub const S: f32 = 20.0;

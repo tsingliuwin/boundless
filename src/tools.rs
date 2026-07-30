@@ -21,6 +21,8 @@ pub enum ActiveTool {
 }
 
 impl ActiveTool {
+    /// Human-readable label (used for tooltips / accessibility).
+    #[allow(dead_code)]
     pub fn label(self) -> &'static str {
         match self {
             ActiveTool::Select => "选择",
