@@ -345,21 +345,20 @@ impl Element {
     pub fn hit_test(&self, p: WPoint, tol: f64) -> bool {
         let stroke_tol = (self.style.stroke_width / 2.0).max(2.0) + tol;
         match &self.kind {
-            ElementKind::Rectangle => {
-                if self.style.background.is_some() && self.bounds.contains(p) {
-                    return true;
-                }
-                near_rect_border(p, &self.bounds, stroke_tol)
-            }
+            // Closed shapes: the whole bounding area is hit-testable (so a
+            // click anywhere on the shape selects/moves it), regardless of
+            // fill — matching Excalidraw. The border still wins for precise
+            // edge hits when the shape is filled.
+            ElementKind::Rectangle => self.bounds.inflate(tol, tol).contains(p),
             ElementKind::Diamond => {
                 let poly = diamond_polygon(&self.bounds);
-                if self.style.background.is_some() && point_in_polygon(p, &poly) {
-                    return true;
-                }
-                distance_to_polygon(p, &poly, true) <= stroke_tol
+                point_in_polygon(p, &poly)
+                    || distance_to_polygon(p, &poly, true) <= stroke_tol
+                    || self.bounds.inflate(tol, tol).contains(p)
             }
             ElementKind::Ellipse => {
-                point_near_ellipse(p, &self.bounds, stroke_tol, self.style.background.is_some())
+                self.bounds.inflate(tol, tol).contains(p)
+                    || point_near_ellipse(p, &self.bounds, stroke_tol, true)
             }
             ElementKind::Line { .. } | ElementKind::Arrow { .. } | ElementKind::Freedraw { .. } => {
                 let pts = self.absolute_points();
@@ -368,12 +367,6 @@ impl Element {
             ElementKind::Text { .. } => self.bounds.inflate(tol, tol).contains(p),
         }
     }
-}
-
-fn near_rect_border(p: WPoint, b: &WBounds, tol: f64) -> bool {
-    let within = b.inflate(tol, tol).contains(p);
-    let outside_inner = !b.inflate(-tol, -tol).contains(p);
-    within && outside_inner
 }
 
 pub fn diamond_polygon(b: &WBounds) -> Vec<WPoint> {
@@ -465,10 +458,13 @@ mod tests {
             WBounds::new(0.0, 0.0, 100.0, 50.0),
             rect_style(),
         );
-        // No fill: interior is not a hit, border is.
-        assert!(!el.hit_test(WPoint::new(50.0, 25.0), 1.0));
+        // Interior is a hit even without fill, so a click anywhere on the
+        // shape selects/moves it (Excalidraw behavior).
+        assert!(el.hit_test(WPoint::new(50.0, 25.0), 1.0));
         assert!(el.hit_test(WPoint::new(1.0, 25.0), 1.0));
-        // With fill: interior hits.
+        // Outside the shape is not a hit.
+        assert!(!el.hit_test(WPoint::new(200.0, 200.0), 1.0));
+        // With fill: same behavior.
         el.style.background = Some(0xff0000);
         assert!(el.hit_test(WPoint::new(50.0, 25.0), 1.0));
     }
@@ -481,8 +477,8 @@ mod tests {
             rect_style(),
         );
         assert!(el.hit_test(WPoint::new(50.0, 1.0), 1.5)); // top border
-        assert!(!el.hit_test(WPoint::new(50.0, 50.0), 1.0)); // center, no fill
-        assert!(!el.hit_test(WPoint::new(0.0, 0.0), 1.0)); // corner outside
+        assert!(el.hit_test(WPoint::new(50.0, 50.0), 1.0)); // center, selectable
+        assert!(!el.hit_test(WPoint::new(-5.0, -5.0), 1.0)); // outside bounds
     }
 
     #[test]

@@ -1381,6 +1381,51 @@ impl Render for BoardView {
         let focus = self.focus_handle.clone();
         let editing = self.editing.is_some();
 
+        // Compute the canvas cursor BEFORE constructing the canvas element so
+        // it can be applied to the canvas's own hitbox (GPUI picks the cursor
+        // from the topmost element under the pointer; setting it on the outer
+        // div alone is overridden by the canvas's default).
+        let cursor = match (&self.drag, self.tool) {
+            (DragState::Panning { .. }, _) => CursorStyle::OpenHand,
+            (DragState::Moving { .. }, _) => CursorStyle::ClosedHand,
+            (DragState::Resizing { handle, .. }, _) => match handle {
+                crate::render::Handle::N | crate::render::Handle::S => CursorStyle::ResizeUpDown,
+                crate::render::Handle::E | crate::render::Handle::W => CursorStyle::ResizeLeftRight,
+                crate::render::Handle::Nw | crate::render::Handle::Se => {
+                    CursorStyle::ResizeUpLeftDownRight
+                }
+                crate::render::Handle::Ne | crate::render::Handle::Sw => {
+                    CursorStyle::ResizeUpRightDownLeft
+                }
+            },
+            (_, ActiveTool::Hand) => CursorStyle::OpenHand,
+            (_, ActiveTool::Select) => {
+                if let Some(h) = self.hover_handle {
+                    match h {
+                        crate::render::Handle::N | crate::render::Handle::S => {
+                            CursorStyle::ResizeUpDown
+                        }
+                        crate::render::Handle::E | crate::render::Handle::W => {
+                            CursorStyle::ResizeLeftRight
+                        }
+                        crate::render::Handle::Nw | crate::render::Handle::Se => {
+                            CursorStyle::ResizeUpLeftDownRight
+                        }
+                        crate::render::Handle::Ne | crate::render::Handle::Sw => {
+                            CursorStyle::ResizeUpRightDownLeft
+                        }
+                    }
+                } else if self.hover_over_element {
+                    CursorStyle::OpenHand
+                } else {
+                    CursorStyle::Arrow
+                }
+            }
+            (_, ActiveTool::Text) => CursorStyle::IBeam,
+            (_, ActiveTool::Eraser) => CursorStyle::PointingHand,
+            _ => CursorStyle::Crosshair,
+        };
+
         let canvas_el = canvas(
             {
                 let this = this.clone();
@@ -1432,50 +1477,8 @@ impl Render for BoardView {
             },
         )
         .absolute()
-        .inset_0();
-
-        let cursor = match (&self.drag, self.tool) {
-            (DragState::Panning { .. }, _) => CursorStyle::OpenHand,
-            (DragState::Moving { .. }, _) => CursorStyle::ClosedHand,
-            (DragState::Resizing { handle, .. }, _) => match handle {
-                crate::render::Handle::N | crate::render::Handle::S => CursorStyle::ResizeUpDown,
-                crate::render::Handle::E | crate::render::Handle::W => CursorStyle::ResizeLeftRight,
-                crate::render::Handle::Nw | crate::render::Handle::Se => {
-                    CursorStyle::ResizeUpLeftDownRight
-                }
-                crate::render::Handle::Ne | crate::render::Handle::Sw => {
-                    CursorStyle::ResizeUpRightDownLeft
-                }
-            },
-            (_, ActiveTool::Hand) => CursorStyle::OpenHand,
-            (_, ActiveTool::Select) => {
-                // Hint the action under the cursor: resize handle, movable
-                // element, or plain arrow (marquee) on empty canvas.
-                if let Some(h) = self.hover_handle {
-                    match h {
-                        crate::render::Handle::N | crate::render::Handle::S => {
-                            CursorStyle::ResizeUpDown
-                        }
-                        crate::render::Handle::E | crate::render::Handle::W => {
-                            CursorStyle::ResizeLeftRight
-                        }
-                        crate::render::Handle::Nw | crate::render::Handle::Se => {
-                            CursorStyle::ResizeUpLeftDownRight
-                        }
-                        crate::render::Handle::Ne | crate::render::Handle::Sw => {
-                            CursorStyle::ResizeUpRightDownLeft
-                        }
-                    }
-                } else if self.hover_over_element {
-                    CursorStyle::OpenHand
-                } else {
-                    CursorStyle::Arrow
-                }
-            }
-            (_, ActiveTool::Text) => CursorStyle::IBeam,
-            (_, ActiveTool::Eraser) => CursorStyle::PointingHand,
-            _ => CursorStyle::Crosshair,
-        };
+        .inset_0()
+        .cursor(cursor);
 
         div()
             .key_context(if editing { "Editor" } else { "Board" })
