@@ -37,6 +37,7 @@ pub struct EditingState {
     pub session: TextEditSession,
     pub font_size: f64,
     pub wrap_width: Option<f64>,
+    pub min_height: Option<f64>,
     /// True when the text element was created by this editing session.
     pub is_new: bool,
 }
@@ -191,9 +192,9 @@ impl BoardView {
         let Some(el) = self.scene.get(element_id) else {
             return;
         };
-        let (text, font_size, wrap_width) = match &el.kind {
-            ElementKind::Text { text, font_size, wrap_width } => {
-                (text.clone(), *font_size, *wrap_width)
+        let (text, font_size, wrap_width, min_height) = match &el.kind {
+            ElementKind::Text { text, font_size, wrap_width, min_height } => {
+                (text.clone(), *font_size, *wrap_width, *min_height)
             }
             _ => return,
         };
@@ -202,6 +203,7 @@ impl BoardView {
             session: TextEditSession::new(&text),
             font_size,
             wrap_width,
+            min_height,
             is_new,
         });
         cx.notify();
@@ -228,7 +230,7 @@ impl BoardView {
                 if !ed.is_new {
                     self.history.record(&self.scene);
                 }
-                let (w, h) = measure_text(&text, ed.font_size, ed.wrap_width, window);
+                let (w, h) = measure_text(&text, ed.font_size, ed.wrap_width, ed.min_height, window);
                 if let Some(el) = self.scene.get_mut(id) {
                     if let ElementKind::Text { text: t, .. } = &mut el.kind {
                         *t = text.clone();
@@ -662,23 +664,27 @@ impl BoardView {
                 );
                 for original in &originals {
                     let mut scaled = original.clone();
-                    if let ElementKind::Text { font_size, wrap_width, .. } = &mut scaled.kind {
+                    if let ElementKind::Text { font_size, wrap_width, min_height, .. } = &mut scaled.kind {
                         // Text resize is handle-aware:
                         //  - corner: scale font (and wrap width) uniformly
                         //  - horizontal edge (E/W): change wrap width, keep font
-                        //  - vertical edge (N/S): scale font, keep wrap width
+                        //  - vertical edge (N/S): change frame height (min_height),
+                        //    keep font size and wrap width — text keeps its
+                        //    layout; extra height is blank space below the text.
                         if is_corner {
                             let scale = (sx.abs() + sy.abs()) / 2.0;
                             *font_size = (*font_size * scale.max(0.05)).clamp(4.0, 400.0);
                             if let Some(w) = wrap_width {
                                 *w = (*w * scale).max(4.0);
                             }
+                            *min_height = min_height.map(|h| (h * scale).max(4.0));
                         } else if is_horizontal_edge {
                             // Enable/update wrapping at the new width.
                             *wrap_width = Some(new_bounds.w.max(8.0));
                         } else {
-                            // Vertical edge: scale font, keep wrap width.
-                            *font_size = (*font_size * sy.abs().max(0.05)).clamp(4.0, 400.0);
+                            // Vertical edge: set manual height, font & width
+                            // unchanged.
+                            *min_height = Some(new_bounds.h.max(*font_size * LINE_HEIGHT));
                         }
                         // Position the element at the new top-left; width/height
                         // will be recomputed by pending_measure.
@@ -1406,13 +1412,13 @@ impl Render for BoardView {
             let pending = std::mem::take(&mut self.pending_measure);
             for id in pending {
                 let info = self.scene.get(id).and_then(|el| match &el.kind {
-                    ElementKind::Text { text, font_size, wrap_width } => {
-                        Some((text.clone(), *font_size, *wrap_width))
+                    ElementKind::Text { text, font_size, wrap_width, min_height } => {
+                        Some((text.clone(), *font_size, *wrap_width, *min_height))
                     }
                     _ => None,
                 });
-                if let Some((text, font_size, wrap_width)) = info {
-                    let (w, h) = measure_text(&text, font_size, wrap_width, window);
+                if let Some((text, font_size, wrap_width, min_height)) = info {
+                    let (w, h) = measure_text(&text, font_size, wrap_width, min_height, window);
                     if let Some(el) = self.scene.get_mut(id) {
                         el.bounds.w = w.max(1.0);
                         el.bounds.h = h.max(1.0);

@@ -203,11 +203,13 @@ fn wrap_segment(
 }
 
 /// Measure a text element's world-space size (max line width, total height).
-/// Uses a zoom of 1 so results are in world units.
+/// Uses a zoom of 1 so results are in world units. When `min_height` is set,
+/// the returned height is at least that value.
 pub fn measure_text(
     text: &str,
     font_size_world: f64,
     wrap_width: Option<f64>,
+    min_height: Option<f64>,
     window: &Window,
 ) -> (f64, f64) {
     let camera = Camera {
@@ -221,7 +223,9 @@ pub fn measure_text(
         .iter()
         .map(|l| l.width.to_f64())
         .fold(0.0f64, f64::max);
-    (max_width, lines.len() as f64 * line_height.to_f64())
+    let content_height = lines.len() as f64 * line_height.to_f64();
+    let height = min_height.map_or(content_height, |mh| content_height.max(mh));
+    (max_width, height)
 }
 
 /// The eight resize handles of a selection box, in screen space.

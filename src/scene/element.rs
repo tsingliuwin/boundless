@@ -201,6 +201,11 @@ pub enum ElementKind {
         /// None = no wrapping (natural width).
         #[serde(default)]
         wrap_width: Option<f64>,
+        /// Manual minimum height in world units. When set, the element's
+        /// height is at least this (extra space is blank below the text).
+        /// None = height determined by content.
+        #[serde(default)]
+        min_height: Option<f64>,
     },
 }
 
@@ -256,6 +261,7 @@ impl Element {
                 text,
                 font_size: DEFAULT_FONT_SIZE,
                 wrap_width: None,
+                min_height: None,
             },
             WBounds::new(origin.x, origin.y, 0.0, DEFAULT_FONT_SIZE * LINE_HEIGHT),
             style,
@@ -279,6 +285,13 @@ impl Element {
     pub fn wrap_width(&self) -> Option<f64> {
         match &self.kind {
             ElementKind::Text { wrap_width, .. } => *wrap_width,
+            _ => None,
+        }
+    }
+
+    pub fn min_height(&self) -> Option<f64> {
+        match &self.kind {
+            ElementKind::Text { min_height, .. } => *min_height,
             _ => None,
         }
     }
