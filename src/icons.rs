@@ -285,13 +285,12 @@ pub fn stroke_width_icon(c: Hsla, width: f32) -> impl IntoElement {
         |_b, _w, _cx| (),
         move |bounds, _, window, _cx| {
             let mut b = stroked(width);
+            // Draw in absolute screen coordinates (no extra translate).
             let y = f32::from(bounds.origin.y) + f32::from(bounds.size.height) * 0.5;
             let x0 = f32::from(bounds.origin.x) + 3.0;
             let x1 = f32::from(bounds.origin.x) + f32::from(bounds.size.width) - 3.0;
             b.move_to(point(px(x0), px(y)));
             b.line_to(point(px(x1), px(y)));
-            b.translate(bounds.origin);
-            let _ = (x0, x1);
             if let Ok(path) = b.build() {
                 window.paint_path(path, c);
             }
