@@ -1,0 +1,34 @@
+[package]
+name = "boundless"
+version = "0.1.0"
+edition = "2021"
+description = "A boundless Excalidraw-style whiteboard built on GPUI, with OpenAI-compatible AI generation"
+
+[dependencies]
+gpui = "0.2.2"
+ropey = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rough_piet = "0.13"
+roughr = "0.12"
+euclid = "0.22"
+kurbo = "0.11"
+uuid = { version = "1", features = ["v4", "serde"] }
+anyhow = "1"
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "stream",
+] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+futures = "0.3"
+futures-util = "0.3"
+dirs = "6"
+rfd = "0.15"
+
+[profile.dev]
+# GPUI is large; keep local codegen fast while iterating.
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

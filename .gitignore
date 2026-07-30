@@ -1,0 +1,14 @@
+# Rust build artifacts
+/target/
+
+# Debug logs and transient screenshots
+*.log
+screenshot*.png
+shot-*.png
+crop*.png
+*shot-panel.png
+*panel.png
+shot-*.png
+
+# ZCode session artifacts
+.zcode/
