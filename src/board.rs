@@ -59,6 +59,10 @@ pub struct BoardView {
     /// Text elements whose bounds need precise (re)measurement, done during
     /// the next render where a `&Window` is available.
     pending_measure: Vec<ElementId>,
+    /// Cached hover state (updated on mouse move) used to pick a cursor that
+    /// hints the available action: move over an element, resize over a handle.
+    hover_over_element: bool,
+    hover_handle: Option<crate::render::Handle>,
 }
 
 impl BoardView {
@@ -82,6 +86,8 @@ impl BoardView {
             focus_handle,
             ai_panel: None,
             pending_measure: Vec::new(),
+            hover_over_element: false,
+            hover_handle: None,
         }
     }
 
@@ -536,7 +542,39 @@ impl BoardView {
         // mutating the scene/history.
         let drag = std::mem::take(&mut self.drag);
         match drag {
-            DragState::Idle => {}
+            DragState::Idle => {
+                // Hover detection: which element/handle is under the cursor?
+                // Used by render() to pick a move/resize cursor that hints the
+                // available action.
+                let new_handle = if !self.selection.is_empty()
+                    && self.tool == ActiveTool::Select
+                {
+                    if let Some(bounds) = self.selection_bounds_world() {
+                        let screen_bounds = self.world_bounds_to_screen(bounds);
+                        crate::render::handle_rects(screen_bounds)
+                            .into_iter()
+                            .find(|(_, rect)| rect.contains(&event.position))
+                            .map(|(h, _)| h)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let new_over_element = new_handle.is_none()
+                    && self.tool == ActiveTool::Select
+                    && self
+                        .scene
+                        .hit_test(world, self.hit_tolerance())
+                        .is_some();
+                if new_over_element != self.hover_over_element || new_handle != self.hover_handle
+                {
+                    self.hover_over_element = new_over_element;
+                    self.hover_handle = new_handle;
+                    cx.notify();
+                }
+                self.drag = DragState::Idle;
+            }
             DragState::Panning { mut last_screen } => {
                 let dx = event.position.x - last_screen.x;
                 let dy = event.position.y - last_screen.y;
@@ -1398,8 +1436,42 @@ impl Render for BoardView {
 
         let cursor = match (&self.drag, self.tool) {
             (DragState::Panning { .. }, _) => CursorStyle::OpenHand,
+            (DragState::Moving { .. }, _) => CursorStyle::ClosedHand,
+            (DragState::Resizing { handle, .. }, _) => match handle {
+                crate::render::Handle::N | crate::render::Handle::S => CursorStyle::ResizeUpDown,
+                crate::render::Handle::E | crate::render::Handle::W => CursorStyle::ResizeLeftRight,
+                crate::render::Handle::Nw | crate::render::Handle::Se => {
+                    CursorStyle::ResizeUpLeftDownRight
+                }
+                crate::render::Handle::Ne | crate::render::Handle::Sw => {
+                    CursorStyle::ResizeUpRightDownLeft
+                }
+            },
             (_, ActiveTool::Hand) => CursorStyle::OpenHand,
-            (_, ActiveTool::Select) => CursorStyle::Arrow,
+            (_, ActiveTool::Select) => {
+                // Hint the action under the cursor: resize handle, movable
+                // element, or plain arrow (marquee) on empty canvas.
+                if let Some(h) = self.hover_handle {
+                    match h {
+                        crate::render::Handle::N | crate::render::Handle::S => {
+                            CursorStyle::ResizeUpDown
+                        }
+                        crate::render::Handle::E | crate::render::Handle::W => {
+                            CursorStyle::ResizeLeftRight
+                        }
+                        crate::render::Handle::Nw | crate::render::Handle::Se => {
+                            CursorStyle::ResizeUpLeftDownRight
+                        }
+                        crate::render::Handle::Ne | crate::render::Handle::Sw => {
+                            CursorStyle::ResizeUpRightDownLeft
+                        }
+                    }
+                } else if self.hover_over_element {
+                    CursorStyle::OpenHand
+                } else {
+                    CursorStyle::Arrow
+                }
+            }
             (_, ActiveTool::Text) => CursorStyle::IBeam,
             (_, ActiveTool::Eraser) => CursorStyle::PointingHand,
             _ => CursorStyle::Crosshair,
