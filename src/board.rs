@@ -648,6 +648,12 @@ impl BoardView {
                 for original in &originals {
                     let mut scaled = original.clone();
                     scaled.rescale(sx, sy, pivot);
+                    // Text bounds are determined by font_size; queue a precise
+                    // re-measure so the frame tracks the actual text extent
+                    // instead of the linear scale estimate.
+                    if scaled.is_text() {
+                        self.pending_measure.push(original.id);
+                    }
                     if let Some(el) = self.scene.get_mut(original.id) {
                         *el = scaled;
                     }

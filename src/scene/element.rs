@@ -297,10 +297,20 @@ impl Element {
     /// Scale the element so its bounds become `target`, where `target` is
     /// derived from `original_bounds` of the whole selection.
     pub fn rescale(&mut self, sx: f64, sy: f64, pivot: WPoint) {
-        self.bounds.x = pivot.x + (self.bounds.x - pivot.x) * sx;
-        self.bounds.y = pivot.y + (self.bounds.y - pivot.y) * sy;
-        self.bounds.w *= sx.abs();
-        self.bounds.h *= sy.abs();
+        // Text has no independent width/height — both are determined by the
+        // font size — so scale it uniformly (average of sx/sy) to avoid the
+        // selection frame shrinking below the text when dragging an edge.
+        let is_text = matches!(self.kind, ElementKind::Text { .. });
+        let (esx, esy) = if is_text {
+            let s = (sx.abs() + sy.abs()) / 2.0;
+            (s, s)
+        } else {
+            (sx.abs(), sy.abs())
+        };
+        self.bounds.x = pivot.x + (self.bounds.x - pivot.x) * esx;
+        self.bounds.y = pivot.y + (self.bounds.y - pivot.y) * esy;
+        self.bounds.w *= esx;
+        self.bounds.h *= esy;
         match &mut self.kind {
             ElementKind::Line { points }
             | ElementKind::Arrow { points, .. }
@@ -311,7 +321,7 @@ impl Element {
                 }
             }
             ElementKind::Text { font_size, .. } => {
-                *font_size = (*font_size * sy.abs().max(0.05)).clamp(4.0, 400.0);
+                *font_size = (*font_size * esx.max(0.05)).clamp(4.0, 400.0);
             }
             _ => {}
         }
@@ -537,5 +547,24 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn text_rescale_uses_uniform_scale() {
+        // Dragging only the right edge (sx=0.5, sy=1) must still change the
+        // font size uniformly — otherwise the frame shrinks below the text.
+        let mut t = Element::new_text(WPoint::new(0.0, 0.0), "abc".into(), rect_style());
+        let orig_w = t.bounds.w;
+        t.rescale(0.5, 1.0, WPoint::new(0.0, 0.0));
+        // font_size scales by the average (0.5+1.0)/2 = 0.75
+        match t.kind {
+            ElementKind::Text { font_size, .. } => {
+                assert!((font_size - DEFAULT_FONT_SIZE * 0.75).abs() < 1e-9);
+            }
+            _ => panic!(),
+        }
+        // bounds.w scales by the same uniform factor (not sx alone), so the
+        // frame never becomes narrower than the (rescaled) text.
+        assert!((t.bounds.w - orig_w * 0.75).abs() < 1e-9);
     }
 }
