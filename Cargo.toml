@@ -26,6 +26,11 @@ futures-util = "0.3"
 dirs = "6"
 rfd = "0.15"
 
+# Windows application icon embedding (see build.rs). Pinned to the version that
+# already exists in Cargo.lock so we don't introduce a new dependency.
+[build-dependencies]
+embed-resource = "=3.0.11"
+
 [profile.dev]
 # GPUI is large; keep local codegen fast while iterating.
 opt-level = 1

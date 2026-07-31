@@ -1,0 +1,8 @@
+// Windows application icon resource.
+//
+// GPUI's Windows backend loads the window icon by integer resource id 1
+// (LoadImageW with PCWSTR(1) in src/platform/windows/platform.rs), so the
+// icon MUST be declared with the numeric id `1` to show up in the taskbar,
+// alt-tab, and the window title bar. Keeping the icon next to the source as
+// a relative path means `rc.exe` resolves it from this file's directory.
+1 ICON "icon.ico"
