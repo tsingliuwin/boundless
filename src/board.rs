@@ -798,46 +798,50 @@ impl BoardView {
         match std::mem::take(&mut self.drag) {
             DragState::Drawing { start } => {
                 // Click without drag creates a default-sized shape; a drag
-                // commits the draft.
-                if self.draft.is_none() {
+                // commits the draft. The Text tool skips this default-draft
+                // creation — a plain click makes a natural-width text box.
+                if self.tool != ActiveTool::Text && self.draft.is_none() {
                     let size = 120.0;
                     let end = WPoint::new(start.x + size, start.y + size * 0.75);
                     self.update_draft(start, end, false);
                 }
                 if self.tool == ActiveTool::Text {
-                    // Text tool: turn the dragged box into a text element
-                    // (wrap_width + min_height from the box) and start editing.
-                    if let Some(draft) = self.draft.take() {
-                        let b = draft.bounds;
-                        let dragged = start.distance(WPoint::new(b.right(), b.bottom())) > 8.0;
-                        self.history.record(&self.scene);
-                        let mut el =
-                            Element::new_text(WPoint::new(b.x, b.y), String::new(), self.style.clone());
-                        if dragged {
-                            if let ElementKind::Text {
-                                font_size,
-                                wrap_width,
-                                min_height,
-                                ..
-                            } = &mut el.kind
-                            {
-                                // Size the default font to fill the box height:
-                                // a single line is font_size * LINE_HEIGHT, so
-                                // font_size = box_height / LINE_HEIGHT fills it.
-                                *font_size = (b.h / LINE_HEIGHT).clamp(8.0, 200.0);
-                                // Wrap width must be wide enough to hold at
-                                // least a couple of characters, otherwise the
-                                // text wraps every character (vertical layout).
-                                *wrap_width = Some(b.w.max(*font_size * 2.0).max(20.0));
-                                *min_height = Some(b.h);
-                            }
+                    // Decide drag vs click by the actual release position, not
+                    // the draft bounds (which may be absent for a click).
+                    let dragged = start.distance(world) > 8.0;
+                    self.history.record(&self.scene);
+                    let el = if dragged {
+                        // Use the dragged draft bounds; size font to box height.
+                        let b = self.draft.as_ref().map(|d| d.bounds).unwrap_or_else(|| {
+                            WBounds::from_corners(start, world)
+                        });
+                        let mut el = Element::new_text(
+                            WPoint::new(b.x, b.y),
+                            String::new(),
+                            self.style.clone(),
+                        );
+                        if let ElementKind::Text {
+                            font_size,
+                            wrap_width,
+                            min_height,
+                            ..
+                        } = &mut el.kind
+                        {
+                            *font_size = (b.h / LINE_HEIGHT).clamp(8.0, 200.0);
+                            *wrap_width = Some(b.w.max(*font_size * 2.0).max(20.0));
+                            *min_height = Some(b.h);
                         }
-                        let id = self.scene.add(el);
-                        self.pending_measure.push(id);
-                        self.mark_dirty();
-                        self.selection = vec![id];
-                        self.start_editing(id, true, cx);
-                    }
+                        el
+                    } else {
+                        // Plain click: natural-width text box (no wrapping).
+                        Element::new_text(start, String::new(), self.style.clone())
+                    };
+                    self.draft = None; // discard the dashed preview
+                    let id = self.scene.add(el);
+                    self.pending_measure.push(id);
+                    self.mark_dirty();
+                    self.selection = vec![id];
+                    self.start_editing(id, true, cx);
                 } else if let Some(mut el) = self.draft.take() {
                     if matches!(el.kind, ElementKind::Line { .. } | ElementKind::Arrow { .. })
                         && world.distance(start) < 1e-6
