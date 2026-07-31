@@ -13,7 +13,7 @@ use crate::history::History;
 use crate::render::rough::{color_u32, paths_for_element, ReadyPath};
 use crate::render::{dot_grid, handle_rects, measure_text, shape_text, ShapedTextLine};
 use crate::scene::{
-    Element, ElementId, ElementKind, ElementStyle, Scene, SceneFile, WBounds, WPoint,
+    Element, ElementId, ElementKind, ElementStyle, Scene, SceneFile, StrokeStyle, WBounds, WPoint,
     DEFAULT_FONT_SIZE, LINE_HEIGHT,
 };
 use crate::text::{utf16_to_utf8, utf8_to_utf16, TextEditSession};
@@ -436,13 +436,10 @@ impl BoardView {
                 if let Some(id) = hit.filter(|id| {
                     self.scene.get(*id).is_some_and(|e| e.is_text())
                 }) {
-                                    self.start_editing(id, false, cx);
+                    self.start_editing(id, false, cx);
                 } else {
-                    self.history.record(&self.scene);
-                    let el = Element::new_text(world, String::new(), self.style.clone());
-                    let id = self.scene.add(el);
-                    self.mark_dirty();
-                                    self.start_editing(id, true, cx);
+                    // Drag to size the text box first; release to edit.
+                    self.drag = DragState::Drawing { start: world };
                 }
             }
             ActiveTool::Eraser => {
@@ -780,6 +777,14 @@ impl BoardView {
                 end_arrowhead: true,
                 start_arrowhead: false,
             }),
+            // Text tool: show a dashed rectangle as the box being sized.
+            ActiveTool::Text => {
+                let mut style = self.style.clone();
+                style.stroke_style = StrokeStyle::Dashed;
+                style.roughness = 0.0;
+                self.draft = Some(Element::new(ElementKind::Rectangle, bounds, style));
+                return;
+            }
             _ => None,
         };
         if let Some(kind) = kind {
@@ -799,7 +804,28 @@ impl BoardView {
                     let end = WPoint::new(start.x + size, start.y + size * 0.75);
                     self.update_draft(start, end, false);
                 }
-                if let Some(mut el) = self.draft.take() {
+                if self.tool == ActiveTool::Text {
+                    // Text tool: turn the dragged box into a text element
+                    // (wrap_width + min_height from the box) and start editing.
+                    if let Some(draft) = self.draft.take() {
+                        let b = draft.bounds;
+                        let dragged = start.distance(WPoint::new(b.right(), b.bottom())) > 8.0;
+                        self.history.record(&self.scene);
+                        let mut el =
+                            Element::new_text(WPoint::new(b.x, b.y), String::new(), self.style.clone());
+                        if dragged {
+                            if let ElementKind::Text { wrap_width, min_height, .. } = &mut el.kind {
+                                *wrap_width = Some(b.w.max(20.0));
+                                *min_height = Some(b.h.max(DEFAULT_FONT_SIZE * LINE_HEIGHT));
+                            }
+                        }
+                        let id = self.scene.add(el);
+                        self.pending_measure.push(id);
+                        self.mark_dirty();
+                        self.selection = vec![id];
+                        self.start_editing(id, true, cx);
+                    }
+                } else if let Some(mut el) = self.draft.take() {
                     if matches!(el.kind, ElementKind::Line { .. } | ElementKind::Arrow { .. })
                         && world.distance(start) < 1e-6
                     {
@@ -1437,7 +1463,11 @@ impl Render for BoardView {
         // it can be applied to the canvas's own hitbox (GPUI picks the cursor
         // from the topmost element under the pointer; setting it on the outer
         // div alone is overridden by the canvas's default).
-        let cursor = match (&self.drag, self.tool) {
+        let cursor = if self.editing.is_some() {
+            // While editing text, always show the text caret cursor.
+            CursorStyle::IBeam
+        } else {
+            match (&self.drag, self.tool) {
             (DragState::Panning { .. }, _) => CursorStyle::OpenHand,
             (DragState::Moving { .. }, _) => CursorStyle::PointingHand,
             (DragState::Resizing { handle, .. }, _) => match handle {
@@ -1472,6 +1502,7 @@ impl Render for BoardView {
             (_, ActiveTool::Text) => CursorStyle::IBeam,
             (_, ActiveTool::Eraser) => CursorStyle::PointingHand,
             _ => CursorStyle::Crosshair,
+            }
         };
 
         let canvas_el = canvas(
