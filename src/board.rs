@@ -825,7 +825,10 @@ impl BoardView {
                                 // a single line is font_size * LINE_HEIGHT, so
                                 // font_size = box_height / LINE_HEIGHT fills it.
                                 *font_size = (b.h / LINE_HEIGHT).clamp(8.0, 200.0);
-                                *wrap_width = Some(b.w.max(20.0));
+                                // Wrap width must be wide enough to hold at
+                                // least a couple of characters, otherwise the
+                                // text wraps every character (vertical layout).
+                                *wrap_width = Some(b.w.max(*font_size * 2.0).max(20.0));
                                 *min_height = Some(b.h);
                             }
                         }
