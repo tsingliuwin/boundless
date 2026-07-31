@@ -9,8 +9,8 @@ use gpui::{
 use crate::camera::Camera;
 use crate::scene::{WBounds, WPoint, LINE_HEIGHT};
 
-/// Font family name for the hand-drawn text style (Caveat, embedded).
-pub const HANDWRITTEN_FONT: &str = "Caveat";
+/// Font family name for the hand-drawn text style (Patrick Hand, embedded).
+pub const HANDWRITTEN_FONT: &str = "Patrick Hand";
 /// Font family for the plain (system UI) text style.
 pub const SYSTEM_FONT: &str = ".SystemUIFont";
 
@@ -22,12 +22,11 @@ pub fn canvas_font() -> Font {
 
 /// Build a font for the given family with CJK fallback to the system font.
 pub fn canvas_font_with(family: &str) -> Font {
-    let mut f = gpui::font(family.to_string());
-    // Ensure CJK characters still resolve when using a Latin-only font.
-    f.fallbacks = Some(gpui::FontFallbacks::from_fonts(vec![
-        SYSTEM_FONT.to_string(),
-    ]));
-    f
+    // Use the family directly; GPUI's text system resolves it. CJK fallback
+    // is handled by the platform's default fallback chain when a glyph is
+    // missing (setting explicit FontFallbacks broke Caveat resolution on
+    // Windows, so we rely on the platform chain instead).
+    gpui::font(family.to_string())
 }
 
 pub const GRID_SPACING: f64 = 20.0;
