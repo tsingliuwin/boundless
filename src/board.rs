@@ -814,9 +814,19 @@ impl BoardView {
                         let mut el =
                             Element::new_text(WPoint::new(b.x, b.y), String::new(), self.style.clone());
                         if dragged {
-                            if let ElementKind::Text { wrap_width, min_height, .. } = &mut el.kind {
+                            if let ElementKind::Text {
+                                font_size,
+                                wrap_width,
+                                min_height,
+                                ..
+                            } = &mut el.kind
+                            {
+                                // Size the default font to fill the box height:
+                                // a single line is font_size * LINE_HEIGHT, so
+                                // font_size = box_height / LINE_HEIGHT fills it.
+                                *font_size = (b.h / LINE_HEIGHT).clamp(8.0, 200.0);
                                 *wrap_width = Some(b.w.max(20.0));
-                                *min_height = Some(b.h.max(DEFAULT_FONT_SIZE * LINE_HEIGHT));
+                                *min_height = Some(b.h);
                             }
                         }
                         let id = self.scene.add(el);
