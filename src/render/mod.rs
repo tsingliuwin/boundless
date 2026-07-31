@@ -20,13 +20,19 @@ pub fn canvas_font() -> Font {
     gpui::font(HANDWRITTEN_FONT)
 }
 
-/// Build a font for the given family with CJK fallback to the system font.
+/// Build a font for the given family with CJK fallback to a handwriting-
+/// style system font (KaiTi 楷体 on Windows) so Chinese text also has a
+/// hand-drawn look. Latin glyphs come from the primary family (Patrick Hand).
 pub fn canvas_font_with(family: &str) -> Font {
-    // Use the family directly; GPUI's text system resolves it. CJK fallback
-    // is handled by the platform's default fallback chain when a glyph is
-    // missing (setting explicit FontFallbacks broke Caveat resolution on
-    // Windows, so we rely on the platform chain instead).
-    gpui::font(family.to_string())
+    let mut f = gpui::font(family.to_string());
+    // KaiTi (楷体) is a brush-style system font shipped with Windows; it
+    // gives Chinese characters a hand-written feel. Microsoft YaHei is the
+    // fallback if KaiTi isn't installed.
+    f.fallbacks = Some(gpui::FontFallbacks::from_fonts(vec![
+        "KaiTi".to_string(),
+        "Microsoft YaHei".to_string(),
+    ]));
+    f
 }
 
 pub const GRID_SPACING: f64 = 20.0;
