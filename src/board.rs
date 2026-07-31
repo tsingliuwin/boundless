@@ -1509,7 +1509,9 @@ impl Render for BoardView {
                     CursorStyle::Arrow
                 }
             }
-            (_, ActiveTool::Text) => CursorStyle::IBeam,
+            // Text tool: crosshair while sizing a box (editing shows IBeam via
+            // the early branch above).
+            (_, ActiveTool::Text) => CursorStyle::Crosshair,
             (_, ActiveTool::Eraser) => CursorStyle::PointingHand,
             _ => CursorStyle::Crosshair,
             }
