@@ -176,6 +176,16 @@ impl Default for ElementStyle {
 pub const DEFAULT_FONT_SIZE: f64 = 20.0;
 pub const LINE_HEIGHT: f64 = 1.25;
 
+/// Horizontal alignment of text within its box (bound label or wrapped box).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextAlign {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ElementKind {
@@ -209,6 +219,14 @@ pub enum ElementKind {
         /// None = height determined by content.
         #[serde(default)]
         min_height: Option<f64>,
+        /// The shape this text labels (Excalidraw-style bound text): the
+        /// label is centered on the container, follows it when moved, and
+        /// is removed with it. None = standalone text.
+        #[serde(default)]
+        container_id: Option<ElementId>,
+        /// Horizontal alignment within the text box.
+        #[serde(default)]
+        text_align: TextAlign,
     },
 }
 
@@ -271,6 +289,8 @@ impl Element {
                 font_family: default_font_family(),
                 wrap_width: None,
                 min_height: None,
+                container_id: None,
+                text_align: TextAlign::Left,
             },
             WBounds::new(origin.x, origin.y, 0.0, DEFAULT_FONT_SIZE * LINE_HEIGHT),
             style,
@@ -289,6 +309,30 @@ impl Element {
 
     pub fn is_text(&self) -> bool {
         matches!(self.kind, ElementKind::Text { .. })
+    }
+
+    /// True for shapes that can carry a bound text label.
+    pub fn is_container(&self) -> bool {
+        matches!(
+            self.kind,
+            ElementKind::Rectangle | ElementKind::Ellipse | ElementKind::Diamond
+        )
+    }
+
+    /// The container this text is bound to, if it is a label.
+    pub fn container_id(&self) -> Option<ElementId> {
+        match &self.kind {
+            ElementKind::Text { container_id, .. } => *container_id,
+            _ => None,
+        }
+    }
+
+    /// Horizontal alignment of a text element (Left for non-text).
+    pub fn text_align(&self) -> TextAlign {
+        match &self.kind {
+            ElementKind::Text { text_align, .. } => *text_align,
+            _ => TextAlign::Left,
+        }
     }
 
     pub fn wrap_width(&self) -> Option<f64> {
@@ -570,6 +614,32 @@ mod tests {
         let json = serde_json::to_string_pretty(&elements).unwrap();
         let back: Vec<Element> = serde_json::from_str(&json).unwrap();
         assert_eq!(elements, back);
+    }
+
+    #[test]
+    fn text_container_id_serde() {
+        // Bound label: container_id round-trips.
+        let mut label = Element::new_text(WPoint::new(0.0, 0.0), "标签".into(), rect_style());
+        let container = Element::new(
+            ElementKind::Rectangle,
+            WBounds::new(0.0, 0.0, 100.0, 80.0),
+            rect_style(),
+        );
+        if let ElementKind::Text { container_id, .. } = &mut label.kind {
+            *container_id = Some(container.id);
+        }
+        let json = serde_json::to_string(&label).unwrap();
+        let back: Element = serde_json::from_str(&json).unwrap();
+        assert_eq!(label, back);
+        assert_eq!(back.container_id(), Some(container.id));
+
+        // Old scene files have no container_id / text_align: they must
+        // default to None / Left.
+        let legacy = r#"{"id":"00000000-0000-0000-0000-000000000001","x":0.0,"y":0.0,"w":10.0,"h":25.0,"seed":1,"stroke":0,"background":null,"stroke_width":2.0,"roughness":0.0,"stroke_style":"solid","opacity":1.0,"kind":"text","text":"旧","font_size":20.0}"#;
+        let parsed: Element = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.is_text());
+        assert_eq!(parsed.container_id(), None);
+        assert_eq!(parsed.text_align(), TextAlign::Left);
     }
 
     #[test]

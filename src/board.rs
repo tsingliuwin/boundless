@@ -13,8 +13,8 @@ use crate::history::History;
 use crate::render::rough::{color_u32, paths_for_element, ReadyPath};
 use crate::render::{dot_grid, handle_rects, measure_text, shape_text, ShapedTextLine};
 use crate::scene::{
-    Element, ElementId, ElementKind, ElementStyle, Scene, SceneFile, StrokeStyle, WBounds, WPoint,
-    DEFAULT_FONT_SIZE, LINE_HEIGHT,
+    Element, ElementId, ElementKind, ElementStyle, Scene, SceneFile, StrokeStyle, TextAlign,
+    WBounds, WPoint, DEFAULT_FONT_SIZE, LINE_HEIGHT,
 };
 use crate::text::{utf16_to_utf8, utf8_to_utf16, TextEditSession};
 use crate::tools::{ActiveTool, DragState};
@@ -39,6 +39,9 @@ pub struct EditingState {
     pub font_family: String,
     pub wrap_width: Option<f64>,
     pub min_height: Option<f64>,
+    /// Container the edited text is bound to (label); None = standalone.
+    pub container_id: Option<ElementId>,
+    pub text_align: TextAlign,
     /// True when the text element was created by this editing session.
     pub is_new: bool,
 }
@@ -50,6 +53,13 @@ pub struct BoardView {
     drag: DragState,
     pub selection: Vec<ElementId>,
     pub style: ElementStyle,
+    /// Default font size for newly created text. Updated whenever the user
+    /// picks a size in the style bar (Excalidraw-style "last used wins").
+    text_font_size: f64,
+    /// Default font family for newly created text.
+    text_font_family: String,
+    /// Default alignment for newly created text.
+    text_align: TextAlign,
     history: History,
     editing: Option<EditingState>,
     draft: Option<Element>,
@@ -79,6 +89,9 @@ impl BoardView {
             drag: DragState::Idle,
             selection: Vec::new(),
             style: ElementStyle::default(),
+            text_font_size: DEFAULT_FONT_SIZE,
+            text_font_family: crate::render::HANDWRITTEN_FONT.to_string(),
+            text_align: TextAlign::Left,
             history: History::new(),
             editing: None,
             draft: None,
@@ -132,13 +145,34 @@ impl BoardView {
         cx.notify();
     }
 
+    /// Remove an element; bound labels of a removed container go with it.
+    fn remove_element(&mut self, id: ElementId) {
+        self.scene.remove(id);
+        let labels: Vec<ElementId> = self
+            .scene
+            .elements
+            .iter()
+            .filter_map(|e| match &e.kind {
+                ElementKind::Text {
+                    container_id: Some(cid),
+                    ..
+                } if *cid == id => Some(e.id),
+                _ => None,
+            })
+            .collect();
+        for lid in labels {
+            self.scene.remove(lid);
+        }
+    }
+
     fn delete_selection(&mut self, cx: &mut Context<Self>) {
         if self.selection.is_empty() {
             return;
         }
         self.history.record(&self.scene);
-        for id in self.selection.drain(..) {
-            self.scene.remove(id);
+        let ids: Vec<ElementId> = self.selection.drain(..).collect();
+        for id in ids {
+            self.remove_element(id);
         }
         self.mark_dirty();
         cx.notify();
@@ -166,9 +200,15 @@ impl BoardView {
         if self.editing.is_some() {
             // Esc commits the edit; switch to Select and select a freshly
             // created text element so it can be moved/styled immediately.
+            // A bound label selects its container instead.
             if let Some(new_id) = self.commit_editing(window, cx) {
                 self.tool = ActiveTool::Select;
-                self.selection = vec![new_id];
+                let target = self
+                    .scene
+                    .get(new_id)
+                    .and_then(|e| e.container_id())
+                    .unwrap_or(new_id);
+                self.selection = vec![target];
                 cx.notify();
             }
             return;
@@ -193,12 +233,13 @@ impl BoardView {
         let Some(el) = self.scene.get(element_id) else {
             return;
         };
-        let (text, font_size, font_family, wrap_width, min_height) = match &el.kind {
-            ElementKind::Text { text, font_size, font_family, wrap_width, min_height } => {
-                (text.clone(), *font_size, font_family.clone(), *wrap_width, *min_height)
-            }
-            _ => return,
-        };
+        let (text, font_size, font_family, wrap_width, min_height, container_id, text_align) =
+            match &el.kind {
+                ElementKind::Text { text, font_size, font_family, wrap_width, min_height, container_id, text_align } => {
+                    (text.clone(), *font_size, font_family.clone(), *wrap_width, *min_height, *container_id, *text_align)
+                }
+                _ => return,
+            };
         self.editing = Some(EditingState {
             element_id,
             session: TextEditSession::new(&text),
@@ -206,9 +247,53 @@ impl BoardView {
             font_family,
             wrap_width,
             min_height,
+            container_id,
+            text_align,
             is_new,
         });
         cx.notify();
+    }
+
+    /// Double-click on a shape (or text-tool click on one): edit the shape's
+    /// bound text label, creating and centering one on first use
+    /// (Excalidraw-style labeled shapes).
+    fn edit_container_label(&mut self, container_id: ElementId, cx: &mut Context<Self>) {
+        // Edit the existing label if the shape already has one.
+        let existing = self.scene.elements.iter().find_map(|e| match &e.kind {
+            ElementKind::Text {
+                container_id: Some(cid),
+                ..
+            } if *cid == container_id => Some(e.id),
+            _ => None,
+        });
+        if let Some(id) = existing {
+            self.selection = vec![id];
+            self.start_editing(id, false, cx);
+            return;
+        }
+        let Some(cb) = self.scene.get(container_id).map(|c| c.bounds) else {
+            return;
+        };
+        let mut el = self.new_text_element(WPoint::new(cb.x, cb.y), String::new());
+        if let ElementKind::Text {
+            wrap_width,
+            container_id: cid,
+            text_align,
+            ..
+        } = &mut el.kind
+        {
+            *wrap_width = Some(cb.w.max(10.0));
+            *cid = Some(container_id);
+            // Labels are centered on their container by default.
+            *text_align = TextAlign::Center;
+        }
+        place_label(&mut el.bounds, cb, TextAlign::Center);
+        self.history.record(&self.scene);
+        let id = self.scene.add(el);
+        self.pending_measure.push(id);
+        self.mark_dirty();
+        self.selection = vec![id];
+        self.start_editing(id, true, cx);
     }
 
     /// Commit the in-progress text edit. Returns the id of the element if it
@@ -232,15 +317,41 @@ impl BoardView {
                 if !ed.is_new {
                     self.history.record(&self.scene);
                 }
-                let (w, h) = measure_text(&text, ed.font_size, ed.wrap_width, ed.min_height, &ed.font_family, window);
+                let (mut w, h) = measure_text(&text, ed.font_size, ed.wrap_width, ed.min_height, &ed.font_family, window);
+                // Standalone wrapped boxes keep their wrap width (selection
+                // frame matches the editing outline); bound labels hug their
+                // content width so centering is true centering.
+                if ed.container_id.is_none() {
+                    if let Some(ww) = ed.wrap_width {
+                        w = ww.max(w);
+                    }
+                }
+                let cb = ed
+                    .container_id
+                    .and_then(|cid| self.scene.get(cid))
+                    .map(|c| c.bounds);
                 if let Some(el) = self.scene.get_mut(id) {
                     if let ElementKind::Text { text: t, .. } = &mut el.kind {
                         *t = text.clone();
                     }
                     el.bounds.w = w.max(1.0);
                     el.bounds.h = h.max(1.0);
+                    // A bound label keeps its alignment on the container.
+                    if let Some(cb) = cb {
+                        place_label(&mut el.bounds, cb, ed.text_align);
+                    }
                 }
                 self.mark_dirty();
+            }
+        }
+        // A committed bound label must not stay selected on its own — labels
+        // aren't independently selectable; select the container instead.
+        if let Some(cid) = ed.container_id {
+            if self.selection.contains(&id) {
+                self.selection.retain(|s| *s != id);
+                if self.scene.get(cid).is_some() && !self.selection.contains(&cid) {
+                    self.selection.push(cid);
+                }
             }
         }
         cx.notify();
@@ -250,6 +361,66 @@ impl BoardView {
             Some(id)
         } else {
             None
+        }
+    }
+
+    /// Create a text element using the board's current defaults (style,
+    /// font size, font family, alignment).
+    fn new_text_element(&self, origin: WPoint, text: String) -> Element {
+        let mut el = Element::new_text(origin, text, self.style.clone());
+        if let ElementKind::Text {
+            font_size,
+            font_family,
+            text_align,
+            ..
+        } = &mut el.kind
+        {
+            *font_size = self.text_font_size;
+            *font_family = self.text_font_family.clone();
+            *text_align = self.text_align;
+        }
+        el.bounds.h = self.text_font_size * LINE_HEIGHT;
+        el
+    }
+
+    /// Text elements the style bar currently controls: selected text
+    /// elements plus the bound labels of selected containers.
+    fn panel_text_ids(&self) -> Vec<ElementId> {
+        let mut ids: Vec<ElementId> = Vec::new();
+        for id in &self.selection {
+            if self.scene.get(*id).is_some_and(|e| e.is_text()) {
+                ids.push(*id);
+            }
+        }
+        for el in &self.scene.elements {
+            if let Some(cid) = el.container_id() {
+                if self.selection.contains(&cid) && !ids.contains(&el.id) {
+                    ids.push(el.id);
+                }
+            }
+        }
+        ids
+    }
+
+    /// Elements the shape-style buttons (stroke width, roughness) act on:
+    /// the selection itself — or the containers when only bound labels are
+    /// selected, since stroke width / roughness don't affect text.
+    fn panel_shape_ids(&self) -> Vec<ElementId> {
+        let bound_labels_only = !self.selection.is_empty()
+            && self.selection.iter().all(|id| {
+                self.scene.get(*id).is_some_and(|e| {
+                    e.container_id()
+                        .is_some_and(|cid| self.scene.get(cid).is_some())
+                })
+            });
+        if bound_labels_only {
+            self.selection
+                .iter()
+                .filter_map(|id| self.scene.get(*id))
+                .filter_map(|e| e.container_id())
+                .collect()
+        } else {
+            self.selection.clone()
         }
     }
 
@@ -273,15 +444,15 @@ impl BoardView {
             WPoint::new(c.x - 150.0, c.y - 40.0)
         });
         self.history.record(&self.scene);
-        let mut el = Element::new_text(origin, text, self.style.clone());
+        let mut el = self.new_text_element(origin, text);
         // Rough estimate; render() refines with the real text system.
         let lines = el.text().map(|t| t.lines().count()).unwrap_or(1).max(1);
         let max_chars = el
             .text()
             .map(|t| t.lines().map(|l| l.chars().count()).max().unwrap_or(1))
             .unwrap_or(1);
-        el.bounds.w = (max_chars as f64 * DEFAULT_FONT_SIZE).max(1.0);
-        el.bounds.h = lines as f64 * DEFAULT_FONT_SIZE * LINE_HEIGHT;
+        el.bounds.w = (max_chars as f64 * self.text_font_size).max(1.0);
+        el.bounds.h = lines as f64 * self.text_font_size * LINE_HEIGHT;
         let id = self.scene.add(el);
         self.pending_measure.push(id);
         self.selection = vec![id];
@@ -407,9 +578,16 @@ impl BoardView {
             }
             // Committing on outside-click: if a brand-new text element was
             // just created, switch to Select and select it (Excalidraw style).
+            // A bound label selects its container instead — labels aren't
+            // independently selectable.
             if let Some(new_id) = self.commit_editing(window, cx) {
                 self.tool = ActiveTool::Select;
-                self.selection = vec![new_id];
+                let target = self
+                    .scene
+                    .get(new_id)
+                    .and_then(|e| e.container_id())
+                    .unwrap_or(new_id);
+                self.selection = vec![target];
                 cx.notify();
                 return;
             }
@@ -423,32 +601,47 @@ impl BoardView {
             }
             ActiveTool::Select => self.select_down(event, world, cx),
             ActiveTool::Rectangle | ActiveTool::Diamond | ActiveTool::Ellipse => {
-                self.drag = DragState::Drawing { start: world };
+                self.drag = DragState::Drawing {
+                    start: world,
+                    seed: crate::scene::new_seed(),
+                };
             }
             ActiveTool::Arrow | ActiveTool::Line => {
-                self.drag = DragState::Drawing { start: world };
+                self.drag = DragState::Drawing {
+                    start: world,
+                    seed: crate::scene::new_seed(),
+                };
             }
             ActiveTool::Pen => {
                 self.drag = DragState::Freedraw {
                     points: vec![world],
+                    seed: crate::scene::new_seed(),
                 };
             }
             ActiveTool::Text => {
                 let hit = self.scene.hit_test(world, self.hit_tolerance());
-                if let Some(id) = hit.filter(|id| {
-                    self.scene.get(*id).is_some_and(|e| e.is_text())
-                }) {
+                let is_text =
+                    hit.is_some_and(|id| self.scene.get(id).is_some_and(|e| e.is_text()));
+                let is_container =
+                    hit.is_some_and(|id| self.scene.get(id).is_some_and(|e| e.is_container()));
+                if let Some(id) = hit.filter(|_| is_text) {
                     self.start_editing(id, false, cx);
+                } else if let Some(id) = hit.filter(|_| is_container) {
+                    // Text tool on a shape edits its label (Excalidraw).
+                    self.edit_container_label(id, cx);
                 } else {
                     // Drag to size the text box first; release to edit.
-                    self.drag = DragState::Drawing { start: world };
+                    self.drag = DragState::Drawing {
+                        start: world,
+                        seed: crate::scene::new_seed(),
+                    };
                 }
             }
             ActiveTool::Eraser => {
                 let mut removed = false;
                 if let Some(id) = self.scene.hit_test(world, self.hit_tolerance()) {
                     self.history.record(&self.scene);
-                    self.scene.remove(id);
+                    self.remove_element(id);
                     self.selection.retain(|s| *s != id);
                     removed = true;
                     self.mark_dirty();
@@ -487,7 +680,43 @@ impl BoardView {
         }
 
         // 2. element hit test.
-        if let Some(id) = self.scene.hit_test(world, self.hit_tolerance()) {
+        let hit = self.scene.hit_test(world, self.hit_tolerance());
+        {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::fs::OpenOptions::new().create(true).append(true).open("hit.log").unwrap(),
+                "select_down: world={:?} hit={:?} sel_bounds={:?}",
+                world,
+                hit,
+                self.selection_bounds_world()
+            );
+        }
+        // Remember when the raw hit is a bound label: a single click on the
+        // label of an *already-selected* container edits it (Excalidraw).
+        let label_hit = hit.and_then(|id| {
+            let e = self.scene.get(id)?;
+            let cid = e.container_id()?;
+            Some((id, cid))
+        });
+        // Clicks on a bound label act on its container: labels aren't
+        // independently selectable with the Select tool (Excalidraw);
+        // double-clicking the container edits the label.
+        let hit = hit.map(|id| {
+            self.scene
+                .get(id)
+                .and_then(|e| e.container_id())
+                .unwrap_or(id)
+        });
+        if let Some(id) = hit {
+            if event.click_count == 1 && !event.modifiers.shift {
+                if let Some((label_id, cid)) = label_hit {
+                    if cid == id && self.selection.contains(&cid) {
+                        self.selection = vec![label_id];
+                        self.start_editing(label_id, false, cx);
+                        return;
+                    }
+                }
+            }
             let already = self.selection.contains(&id);
             if event.modifiers.shift {
                 if already {
@@ -498,13 +727,17 @@ impl BoardView {
             } else if !already {
                 self.selection = vec![id];
             }
-            // Double-click on a text element starts editing.
-            if event.click_count == 2
-                && self.scene.get(id).is_some_and(|e| e.is_text())
-                && !event.modifiers.shift
-            {
-                self.start_editing(id, false, cx);
-                return;
+            // Double-click on a text element starts editing; on a shape it
+            // edits the shape's bound label (creating one if needed).
+            if event.click_count == 2 && !event.modifiers.shift {
+                if self.scene.get(id).is_some_and(|e| e.is_text()) {
+                    self.start_editing(id, false, cx);
+                    return;
+                }
+                if self.scene.get(id).is_some_and(|e| e.is_container()) {
+                    self.edit_container_label(id, cx);
+                    return;
+                }
             }
             self.drag = DragState::Moving {
                 last_world: world,
@@ -588,12 +821,12 @@ impl BoardView {
                 self.drag = DragState::Panning { last_screen };
                 cx.notify();
             }
-            DragState::Drawing { start } => {
-                self.update_draft(start, world, event.modifiers.shift);
-                self.drag = DragState::Drawing { start };
+            DragState::Drawing { start, seed } => {
+                self.update_draft(start, world, event.modifiers.shift, seed);
+                self.drag = DragState::Drawing { start, seed };
                 cx.notify();
             }
-            DragState::Freedraw { mut points } => {
+            DragState::Freedraw { mut points, seed } => {
                 let min_dist = 2.0 / self.camera.zoom;
                 if points
                     .last()
@@ -602,7 +835,7 @@ impl BoardView {
                     points.push(world);
                     cx.notify();
                 }
-                self.drag = DragState::Freedraw { points };
+                self.drag = DragState::Freedraw { points, seed };
             }
             DragState::Moving {
                 mut last_world,
@@ -619,6 +852,16 @@ impl BoardView {
                     for id in &self.selection {
                         if let Some(el) = self.scene.get_mut(*id) {
                             el.translate(dx, dy);
+                        }
+                    }
+                    // Bound labels follow their containers (they are not
+                    // part of the selection themselves).
+                    let sel = self.selection.clone();
+                    for el in &mut self.scene.elements {
+                        if let Some(cid) = el.container_id() {
+                            if sel.contains(&cid) && !sel.contains(&el.id) {
+                                el.translate(dx, dy);
+                            }
                         }
                     }
                     last_world = world;
@@ -701,6 +944,27 @@ impl BoardView {
                         *el = scaled;
                     }
                 }
+                // Bound labels of resized containers re-wrap to the new
+                // container width; pending_measure then re-measures and
+                // re-centers them.
+                let resized_ids: Vec<ElementId> = originals.iter().map(|o| o.id).collect();
+                let container_bounds: Vec<(ElementId, WBounds)> = resized_ids
+                    .iter()
+                    .filter_map(|id| self.scene.get(*id).map(|c| (*id, c.bounds)))
+                    .collect();
+                for el in &mut self.scene.elements {
+                    if resized_ids.contains(&el.id) {
+                        continue;
+                    }
+                    let Some(cid) = el.container_id() else { continue };
+                    let Some((_, cb)) = container_bounds.iter().find(|(id, _)| *id == cid) else {
+                        continue;
+                    };
+                    if let ElementKind::Text { wrap_width, .. } = &mut el.kind {
+                        *wrap_width = Some(cb.w.max(10.0));
+                        self.pending_measure.push(el.id);
+                    }
+                }
                 self.drag = DragState::Resizing {
                     handle,
                     original_bounds,
@@ -736,7 +1000,7 @@ impl BoardView {
                         self.history.record(&self.scene);
                         removed_any = true;
                     }
-                    self.scene.remove(id);
+                    self.remove_element(id);
                     self.selection.retain(|s| *s != id);
                     self.mark_dirty();
                     cx.notify();
@@ -746,7 +1010,10 @@ impl BoardView {
         }
     }
 
-    fn update_draft(&mut self, start: WPoint, current: WPoint, constrain: bool) {
+    /// Update the in-progress draft shape. The `seed` comes from the drag
+    /// state and stays constant for the whole drag, so the rough jitter of
+    /// the draft doesn't re-randomize every frame.
+    fn update_draft(&mut self, start: WPoint, current: WPoint, constrain: bool, seed: u64) {
         let mut end = current;
         if constrain {
             // Shift: squares / circles / straight lines.
@@ -780,17 +1047,25 @@ impl BoardView {
                 start_arrowhead: false,
             }),
             // Text tool: show a dashed rectangle as the box being sized.
+            // The font size is fixed (style-bar default), so the box height
+            // is exactly one line — the drag only sets the wrap width.
             ActiveTool::Text => {
                 let mut style = self.style.clone();
                 style.stroke_style = StrokeStyle::Dashed;
                 style.roughness = 0.0;
-                self.draft = Some(Element::new(ElementKind::Rectangle, bounds, style));
+                let one_line =
+                    WBounds::new(bounds.x, bounds.y, bounds.w, self.text_font_size * LINE_HEIGHT);
+                let mut draft = Element::new(ElementKind::Rectangle, one_line, style);
+                draft.seed = seed;
+                self.draft = Some(draft);
                 return;
             }
             _ => None,
         };
         if let Some(kind) = kind {
-            self.draft = Some(Element::new(kind, bounds, self.style.clone()));
+            let mut draft = Element::new(kind, bounds, self.style.clone());
+            draft.seed = seed;
+            self.draft = Some(draft);
         }
     }
 
@@ -798,14 +1073,14 @@ impl BoardView {
         let _ = window;
         let world = self.to_world(event.position);
         match std::mem::take(&mut self.drag) {
-            DragState::Drawing { start } => {
+            DragState::Drawing { start, seed } => {
                 // Click without drag creates a default-sized shape; a drag
                 // commits the draft. The Text tool skips this default-draft
                 // creation — a plain click makes a natural-width text box.
                 if self.tool != ActiveTool::Text && self.draft.is_none() {
                     let size = 120.0;
                     let end = WPoint::new(start.x + size, start.y + size * 0.75);
-                    self.update_draft(start, end, false);
+                    self.update_draft(start, end, false, seed);
                 }
                 if self.tool == ActiveTool::Text {
                     // Decide drag vs click by the actual release position, not
@@ -813,30 +1088,20 @@ impl BoardView {
                     let dragged = start.distance(world) > 8.0;
                     self.history.record(&self.scene);
                     let el = if dragged {
-                        // Use the dragged draft bounds; size font to box height.
+                        // The drag fixes only the wrap width. The font size
+                        // comes from the style-bar default; the box height
+                        // starts at one line and grows with the content.
                         let b = self.draft.as_ref().map(|d| d.bounds).unwrap_or_else(|| {
                             WBounds::from_corners(start, world)
                         });
-                        let mut el = Element::new_text(
-                            WPoint::new(b.x, b.y),
-                            String::new(),
-                            self.style.clone(),
-                        );
-                        if let ElementKind::Text {
-                            font_size,
-                            wrap_width,
-                            min_height,
-                            ..
-                        } = &mut el.kind
-                        {
-                            *font_size = (b.h / LINE_HEIGHT).clamp(8.0, 200.0);
-                            *wrap_width = Some(b.w.max(*font_size * 2.0).max(20.0));
-                            *min_height = Some(b.h);
+                        let mut el = self.new_text_element(WPoint::new(b.x, b.y), String::new());
+                        if let ElementKind::Text { wrap_width, .. } = &mut el.kind {
+                            *wrap_width = Some(b.w.max(self.text_font_size * 2.0).max(20.0));
                         }
                         el
                     } else {
                         // Plain click: natural-width text box (no wrapping).
-                        Element::new_text(start, String::new(), self.style.clone())
+                        self.new_text_element(start, String::new())
                     };
                     self.draft = None; // discard the dashed preview
                     let id = self.scene.add(el);
@@ -861,18 +1126,22 @@ impl BoardView {
                     }
                 }
             }
-            DragState::Freedraw { points } => {
+            DragState::Freedraw { points, seed } => {
                 if points.len() >= 2 {
                     self.history.record(&self.scene);
-                    let el = Element::from_absolute_points(
+                    let mut el = Element::from_absolute_points(
                         |points| ElementKind::Freedraw { points },
                         points,
                         self.style.clone(),
                     );
-                    let id = self.scene.add(el);
-                    self.selection = vec![id];
+                    // Reuse the drag seed so the committed stroke looks
+                    // exactly like the draft shown while drawing.
+                    el.seed = seed;
+                    self.scene.add(el);
                     self.mark_dirty();
-                    self.tool = ActiveTool::Select;
+                    // Keep the pen active and don't select the stroke
+                    // (Excalidraw behavior): the user can continue writing
+                    // the next stroke immediately.
                 }
             }
             _ => {}
@@ -1003,21 +1272,89 @@ impl BoardView {
         }
     }
 
+    /// Screen-space origin of the text being edited. A bound label is
+    /// centered in its container using the *live* content size, so the text
+    /// stays centered while typing. Pass `content` (width, height in screen
+    /// px) when the caller already computed it to avoid re-shaping.
+    fn editing_origin(
+        &self,
+        el: &Element,
+        ed: &EditingState,
+        content: Option<(Pixels, Pixels)>,
+        window: &Window,
+    ) -> Point<Pixels> {
+        let base = |this: &Self| {
+            this.camera
+                .world_to_screen(WPoint::new(el.bounds.x, el.bounds.y), this.canvas_origin())
+        };
+        let Some(cid) = ed.container_id else {
+            return base(self);
+        };
+        let Some(cb) = self.scene.get(cid).map(|c| c.bounds) else {
+            return base(self);
+        };
+        let (w, h) = match content {
+            Some(v) => v,
+            None => {
+                let text = ed.session.text();
+                let color = color_u32(0x000000, 1.0);
+                let (lines, line_height) = shape_text(
+                    &text,
+                    ed.font_size,
+                    &self.camera,
+                    color,
+                    ed.wrap_width,
+                    &ed.font_family,
+                    window,
+                );
+                let w = lines.iter().map(|l| l.width).fold(px(0.0), |a, b| a.max(b));
+                (w, line_height * lines.len() as f32)
+            }
+        };
+        let tl = self
+            .camera
+            .world_to_screen(WPoint::new(cb.x, cb.y), self.canvas_origin());
+        let center = self.camera.world_to_screen(
+            WPoint::new(cb.x + cb.w * 0.5, cb.y + cb.h * 0.5),
+            self.canvas_origin(),
+        );
+        let x = match ed.text_align {
+            TextAlign::Left => tl.x,
+            TextAlign::Center => center.x - w / 2.0,
+            TextAlign::Right => tl.x + self.camera.scale(cb.w) - w,
+        };
+        point(x, center.y - h / 2.0)
+    }
+
+    /// Box width used for line alignment while editing: the wrap width for
+    /// standalone wrapped text; the content width otherwise (bound labels).
+    fn editing_box_width(&self, ed: &EditingState, lines: &[ShapedTextLine]) -> Pixels {
+        let content_w = lines
+            .iter()
+            .map(|l| l.width)
+            .fold(px(0.0), |a, b| a.max(b));
+        match (ed.wrap_width, ed.container_id) {
+            (Some(ww), None) => self.camera.scale(ww).max(content_w),
+            _ => content_w,
+        }
+    }
+
     /// Map a screen point to a char offset in the currently-edited text.
     fn char_index_for_screen(&self, screen: Point<Pixels>, window: &Window) -> Option<usize> {
         let ed = self.editing.as_ref()?;
         let el = self.scene.get(ed.element_id)?;
-        let world = self.to_world(screen);
         let text = ed.session.text();
         let color = color_u32(0x000000, 1.0);
         let (lines, line_height) = shape_text(&text, ed.font_size, &self.camera, color, ed.wrap_width, &ed.font_family, window);
         if lines.is_empty() {
             return Some(0);
         }
-        let rel_y = (world.y - el.bounds.y) * self.camera.zoom;
+        let origin = self.editing_origin(el, ed, None, window);
+        let offsets = line_offsets(&lines, self.editing_box_width(ed, &lines), ed.text_align);
+        let rel_y = (screen.y - origin.y).to_f64();
         let line_idx = ((rel_y / line_height.to_f64()).floor() as isize)
             .clamp(0, lines.len() as isize - 1) as usize;
-        let rel_x = px(((world.x - el.bounds.x) * self.camera.zoom) as f32);
+        let rel_x = screen.x - (origin.x + offsets[line_idx]);
         let line = &lines[line_idx];
         let byte_in_line = line
             .line
@@ -1044,9 +1381,8 @@ impl BoardView {
             return None;
         }
         let byte = ed.session.rope.char_to_byte(char_off);
-        let origin =
-            self.camera
-                .world_to_screen(WPoint::new(el.bounds.x, el.bounds.y), self.canvas_origin());
+        let origin = self.editing_origin(el, ed, None, window);
+        let offsets = line_offsets(&lines, self.editing_box_width(ed, &lines), ed.text_align);
         for (i, line) in lines.iter().enumerate() {
             let in_line = byte >= line.byte_range.start
                 && (byte <= line.byte_range.end || i == lines.len() - 1);
@@ -1055,7 +1391,7 @@ impl BoardView {
                     .line
                     .x_for_index((byte - line.byte_range.start).min(line.byte_range.len()));
                 return Some((
-                    point(origin.x + x, origin.y + line_height * i as f32),
+                    point(origin.x + offsets[i] + x, origin.y + line_height * i as f32),
                     line_height,
                 ));
             }
@@ -1067,6 +1403,17 @@ impl BoardView {
 fn relative_points(start: WPoint, end: WPoint, bounds: WBounds) -> Vec<WPoint> {
     let origin = WPoint::new(bounds.x, bounds.y);
     vec![start - origin, end - origin]
+}
+
+/// Position a bound label on its container (keeping its size): horizontal
+/// placement follows `align`, vertical placement is always centered.
+fn place_label(b: &mut WBounds, container: WBounds, align: TextAlign) {
+    b.x = match align {
+        TextAlign::Left => container.x,
+        TextAlign::Center => container.x + (container.w - b.w) * 0.5,
+        TextAlign::Right => container.x + container.w - b.w,
+    };
+    b.y = container.y + (container.h - b.h) * 0.5;
 }
 
 // ---------------------------------------------------------------------
@@ -1184,15 +1531,36 @@ impl EntityInputHandler for BoardView {
 
 struct TextPaintItem {
     lines: Vec<ShapedTextLine>,
+    /// Per-line horizontal offset within the box (text alignment).
+    line_offsets: Vec<Pixels>,
     origin: Point<Pixels>,
     line_height: Pixels,
     bounds: Bounds<Pixels>,
     background: Option<Hsla>,
 }
 
+/// Per-line x offset of each shaped line inside a box of `box_width`,
+/// following the text alignment.
+fn line_offsets(lines: &[ShapedTextLine], box_width: Pixels, align: TextAlign) -> Vec<Pixels> {
+    lines
+        .iter()
+        .map(|l| {
+            let slack = (box_width - l.width).max(px(0.0));
+            match align {
+                TextAlign::Left => px(0.0),
+                TextAlign::Center => slack / 2.0,
+                TextAlign::Right => slack,
+            }
+        })
+        .collect()
+}
+
 struct EditingPaint {
     item: TextPaintItem,
     text_bounds: Bounds<Pixels>,
+    /// Visible text-box frame drawn around the text being edited; None for
+    /// bound labels (the container outline is the frame).
+    frame_quad: Option<PaintQuad>,
     selection_quads: Vec<PaintQuad>,
     marked_quads: Vec<PaintQuad>,
     caret_quad: Option<PaintQuad>,
@@ -1255,8 +1623,11 @@ impl BoardView {
                             self.camera.scale(el.bounds.h.max(1.0)),
                         ),
                     };
+                    let line_offsets =
+                        line_offsets(&lines, screen_bounds.size.width, el.text_align());
                     texts.push(TextPaintItem {
                         lines,
+                        line_offsets,
                         origin: screen_origin,
                         line_height,
                         bounds: screen_bounds,
@@ -1273,21 +1644,29 @@ impl BoardView {
         if let Some(draft) = &self.draft {
             paths.extend(paths_for_element(draft, &self.camera, origin));
         }
-        if let DragState::Freedraw { points } = &self.drag {
+        if let DragState::Freedraw { points, seed } = &self.drag {
             if points.len() >= 2 {
-                let draft = Element::from_absolute_points(
+                let mut draft = Element::from_absolute_points(
                     |points| ElementKind::Freedraw { points },
                     points.clone(),
                     self.style.clone(),
                 );
+                // Stable seed for the whole drag: without it the rough
+                // jitter re-randomizes every frame and the line "swims".
+                draft.seed = *seed;
                 paths.extend(paths_for_element(&draft, &self.camera, origin));
             }
         }
 
-        // Selection overlay.
+        // Selection overlay. Hidden while text editing: the edited element
+        // is in the selection, and the editing frame already highlights it —
+        // drawing both would show two overlapping boxes.
         let mut selection_outline = None;
         let mut handle_quads = Vec::new();
-        if !self.selection.is_empty() && matches!(self.tool, ActiveTool::Select) {
+        if !self.selection.is_empty()
+            && matches!(self.tool, ActiveTool::Select)
+            && self.editing.is_none()
+        {
             if let Some(bounds) = self.selection_bounds_world() {
                 let screen = self.world_bounds_to_screen(bounds);
                 // Pad the selection frame to visually enclose rough hand-drawn
@@ -1337,7 +1716,7 @@ impl BoardView {
         }
 
         // Editing session paint.
-        let editing = self.build_editing_paint(origin, window);
+        let editing = self.build_editing_paint(window);
 
         BoardPaint {
             grid,
@@ -1350,15 +1729,25 @@ impl BoardView {
         }
     }
 
-    fn build_editing_paint(&self, canvas_origin: Point<Pixels>, window: &Window) -> Option<EditingPaint> {
+    fn build_editing_paint(&self, window: &Window) -> Option<EditingPaint> {
         let ed = self.editing.as_ref()?;
         let el = self.scene.get(ed.element_id)?;
         let text = ed.session.text();
         let color = color_u32(el.style.stroke, el.style.opacity);
         let (lines, line_height) = shape_text(&text, ed.font_size, &self.camera, color, ed.wrap_width, &ed.font_family, window);
-        let origin = self
-            .camera
-            .world_to_screen(WPoint::new(el.bounds.x, el.bounds.y), canvas_origin);
+        // Live content size; bound labels center themselves on the container.
+        let content_w = lines
+            .iter()
+            .map(|l| l.width)
+            .fold(px(0.0), |a, b| a.max(b));
+        let mut content_h = line_height * lines.len() as f32;
+        if let Some(mh) = ed.min_height {
+            content_h = content_h.max(self.camera.scale(mh));
+        }
+        let origin = self.editing_origin(el, ed, Some((content_w, content_h)), window);
+        // Box width used for line alignment (see text_bounds below).
+        let box_w = self.editing_box_width(ed, &lines);
+        let offsets = line_offsets(&lines, box_w, ed.text_align);
 
         let sel_color = color_u32(SELECTION_COLOR, 0.35);
         let mark_color = color_u32(SELECTION_COLOR, 1.0);
@@ -1382,7 +1771,10 @@ impl BoardView {
                     if x1 > x0 {
                         selection_quads.push(fill(
                             Bounds {
-                                origin: point(origin.x + x0, origin.y + line_height * i as f32),
+                                origin: point(
+                                    origin.x + offsets[i] + x0,
+                                    origin.y + line_height * i as f32,
+                                ),
                                 size: size(x1 - x0, line_height),
                             },
                             sel_color,
@@ -1410,7 +1802,7 @@ impl BoardView {
                     marked_quads.push(fill(
                         Bounds {
                             origin: point(
-                                origin.x + x0,
+                                origin.x + offsets[i] + x0,
                                 origin.y + line_height * (i as f32 + 1.0) - px(2.0),
                             ),
                             size: size((x1 - x0).max(px(2.0)), px(1.5)),
@@ -1437,23 +1829,43 @@ impl BoardView {
             None
         };
 
+        // Live bounds computed from the current session text (the scene
+        // element's bounds only update on commit). A standalone wrapped box
+        // keeps its wrap width so the wrapping boundary is visible; a bound
+        // label hugs its content since it's centered on the container.
         let text_bounds = Bounds {
             origin,
-            size: size(
-                self.camera.scale(el.bounds.w.max(1.0)),
-                self.camera.scale(el.bounds.h.max(1.0)),
-            ),
+            size: size(box_w.max(px(1.0)), content_h.max(px(1.0))),
         };
+        // Visible text-box frame while typing, padded a little like
+        // Excalidraw's editing outline. A bound label doesn't need one —
+        // the container's own outline serves as the frame.
+        let pad = px(4.0);
+        let frame_quad = (ed.container_id.is_none()).then(|| {
+            outline(
+                Bounds {
+                    origin: point(origin.x - pad, origin.y - pad),
+                    size: size(
+                        text_bounds.size.width + pad * 2.0,
+                        text_bounds.size.height + pad * 2.0,
+                    ),
+                },
+                color_u32(SELECTION_COLOR, 1.0),
+                BorderStyle::Dashed,
+            )
+        });
 
         Some(EditingPaint {
             item: TextPaintItem {
                 lines,
+                line_offsets: offsets,
                 origin,
                 line_height,
                 bounds: text_bounds,
                 background: el.style.background.map(|c| color_u32(c, el.style.opacity)),
             },
             text_bounds,
+            frame_quad,
             selection_quads,
             marked_quads,
             caret_quad,
@@ -1473,16 +1885,32 @@ impl Render for BoardView {
             let pending = std::mem::take(&mut self.pending_measure);
             for id in pending {
                 let info = self.scene.get(id).and_then(|el| match &el.kind {
-                    ElementKind::Text { text, font_size, font_family, wrap_width, min_height } => {
+                    ElementKind::Text { text, font_size, font_family, wrap_width, min_height, .. } => {
                         Some((text.clone(), *font_size, font_family.clone(), *wrap_width, *min_height))
                     }
                     _ => None,
                 });
                 if let Some((text, font_size, font_family, wrap_width, min_height)) = info {
-                    let (w, h) = measure_text(&text, font_size, wrap_width, min_height, &font_family, window);
+                    let (mut w, h) = measure_text(&text, font_size, wrap_width, min_height, &font_family, window);
+                    let cid = self.scene.get(id).and_then(|el| el.container_id());
+                    // Standalone wrapped boxes keep their wrap width; bound
+                    // labels hug their content width (see commit_editing).
+                    if cid.is_none() {
+                        if let Some(ww) = wrap_width {
+                            w = ww.max(w);
+                        }
+                    }
+                    let cb = cid
+                        .and_then(|cid| self.scene.get(cid))
+                        .map(|c| c.bounds);
                     if let Some(el) = self.scene.get_mut(id) {
                         el.bounds.w = w.max(1.0);
                         el.bounds.h = h.max(1.0);
+                        // A bound label keeps its alignment on the container.
+                        if let Some(cb) = cb {
+                            let align = el.text_align();
+                            place_label(&mut el.bounds, cb, align);
+                        }
                     }
                 }
             }
@@ -1562,6 +1990,9 @@ impl Render for BoardView {
                         paint_text_item(item, window, cx);
                     }
                     if let Some(ed) = &paint.editing {
+                        if let Some(q) = &ed.frame_quad {
+                            window.paint_quad(q.clone());
+                        }
                         for q in &ed.selection_quads {
                             window.paint_quad(q.clone());
                         }
@@ -1647,7 +2078,7 @@ fn paint_text_item(item: &TextPaintItem, window: &mut Window, cx: &mut App) {
     }
     for (i, line) in item.lines.iter().enumerate() {
         let origin = point(
-            item.origin.x,
+            item.origin.x + item.line_offsets.get(i).copied().unwrap_or(px(0.0)),
             item.origin.y + item.line_height * i as f32,
         );
         let _ = line.line.paint(origin, item.line_height, window, cx);
@@ -1662,7 +2093,9 @@ const STROKE_COLORS: [u32; 5] = [0x1e1e1e, 0xe03131, 0x2f9e44, 0x1971c2, 0xf08c0
 const BG_COLORS: [Option<u32>; 5] = [None, Some(0xffc9c9), Some(0xb2f2bb), Some(0xa5d8ff), Some(0xffec99)];
 const STROKE_WIDTHS: [(f64, f32); 3] = [(1.0, 1.0), (2.0, 2.0), (4.0, 4.0)];
 const ROUGHNESSES: [f32; 3] = [0.0, 1.0, 2.0];
-const TEXT_SIZES: [(f64, &str); 4] = [(16.0, "小"), (20.0, "中"), (28.0, "大"), (40.0, "特大")];
+/// Font size presets: (font size in world units, glyph icon size in px).
+/// The button icon is an "A" drawn at increasing sizes, Excalidraw-style.
+const TEXT_SIZES: [(f64, f32); 4] = [(16.0, 10.0), (24.0, 13.0), (36.0, 16.0), (56.0, 19.0)];
 
 const ICON_ACTIVE: u32 = 0x1a5fd7;
 const ICON_NORMAL: u32 = 0x3b3b3b;
@@ -1696,6 +2129,41 @@ fn bar_button(label: &'static str, active: bool) -> Stateful<Div> {
         .child(label);
     if active {
         b = b.bg(rgb(0xdce8ff)).text_color(rgb(0x1a5fd7));
+    } else {
+        b = b.hover(|s| s.bg(rgb(0xf1f0ee)));
+    }
+    b
+}
+
+/// A square button whose icon is a text glyph (e.g. "A" / "Aa") drawn at a
+/// given pixel size, optionally in a specific font family. Used for the
+/// font size / font family pickers, where the glyph itself is the preview.
+fn glyph_button(
+    id: impl Into<gpui::ElementId>,
+    active: bool,
+    glyph_px: f32,
+    text: &'static str,
+    font_family: Option<&'static str>,
+) -> Stateful<Div> {
+    let mut glyph = div()
+        .text_size(px(glyph_px))
+        .line_height(px(glyph_px + 4.0))
+        .child(text);
+    if let Some(family) = font_family {
+        glyph = glyph.font_family(family);
+    }
+    let mut b = div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .size_7()
+        .rounded_md()
+        .cursor_pointer()
+        .text_color(color_u32(if active { ICON_ACTIVE } else { ICON_NORMAL }, 1.0))
+        .child(glyph);
+    if active {
+        b = b.bg(rgb(0xdce8ff));
     } else {
         b = b.hover(|s| s.bg(rgb(0xf1f0ee)));
     }
@@ -1751,12 +2219,42 @@ impl BoardView {
         cx.notify();
     }
 
-    /// Apply a change to the font_size of selected text elements, then
-    /// re-measure their bounds.
-    fn apply_style_to_text(&mut self, apply: impl Fn(&mut f64), cx: &mut Context<Self>) {
-        if !self.selection.is_empty() {
+    /// Apply a shape-only style change (stroke width, roughness). Targets
+    /// the selection — or the containers when only bound labels are
+    /// selected, so a shape can be restyled while its label is edited.
+    fn apply_shape_style(
+        &mut self,
+        apply: impl Fn(&mut ElementStyle) + Copy,
+        cx: &mut Context<Self>,
+    ) {
+        apply(&mut self.style);
+        let targets = self.panel_shape_ids();
+        if !targets.is_empty() {
             self.history.record(&self.scene);
-            for id in self.selection.clone() {
+            for id in &targets {
+                if let Some(el) = self.scene.get_mut(*id) {
+                    apply(&mut el.style);
+                    el.seed = crate::scene::new_seed();
+                }
+            }
+            self.mark_dirty();
+        }
+        cx.notify();
+    }
+
+    /// Apply a change to the font_size of the text elements the style bar
+    /// controls (selected text + labels of selected containers), then
+    /// re-measure their bounds. Also updates the default for new text and
+    /// the live editing session, so the change is visible while typing.
+    fn apply_style_to_text(&mut self, apply: impl Fn(&mut f64), cx: &mut Context<Self>) {
+        apply(&mut self.text_font_size);
+        if let Some(ed) = &mut self.editing {
+            apply(&mut ed.font_size);
+        }
+        let targets = self.panel_text_ids();
+        if !targets.is_empty() {
+            self.history.record(&self.scene);
+            for id in targets {
                 if let Some(el) = self.scene.get_mut(id) {
                     if let ElementKind::Text { font_size, .. } = &mut el.kind {
                         apply(font_size);
@@ -1769,19 +2267,59 @@ impl BoardView {
         cx.notify();
     }
 
-    /// Toggle the font family of selected text elements between the
-    /// handwritten Caveat and the system UI font.
-    fn toggle_text_font(&mut self, cx: &mut Context<Self>) {
-        if !self.selection.is_empty() {
+    /// Set the font family for new text, the live editing session, and any
+    /// selected text elements that don't already use it.
+    fn set_text_font(&mut self, family: &str, cx: &mut Context<Self>) {
+        self.text_font_family = family.to_string();
+        if let Some(ed) = &mut self.editing {
+            ed.font_family = family.to_string();
+        }
+        // Only touch elements that actually change, so repeated clicks on
+        // the active family don't pollute the undo history.
+        let targets: Vec<ElementId> = self
+            .panel_text_ids()
+            .into_iter()
+            .filter(|id| {
+                self.scene.get(*id).is_some_and(
+                    |e| matches!(&e.kind, ElementKind::Text { font_family, .. } if font_family != family),
+                )
+            })
+            .collect();
+        if !targets.is_empty() {
             self.history.record(&self.scene);
-            for id in self.selection.clone() {
+            for id in targets {
                 if let Some(el) = self.scene.get_mut(id) {
                     if let ElementKind::Text { font_family, .. } = &mut el.kind {
-                        *font_family = if *font_family == crate::render::HANDWRITTEN_FONT {
-                            crate::render::SYSTEM_FONT.to_string()
-                        } else {
-                            crate::render::HANDWRITTEN_FONT.to_string()
-                        };
+                        *font_family = family.to_string();
+                        self.pending_measure.push(id);
+                    }
+                }
+            }
+            self.mark_dirty();
+        }
+        cx.notify();
+    }
+
+    /// Set the horizontal alignment for new text, the live editing session,
+    /// and the text elements the style bar controls (selected text plus
+    /// labels of selected containers).
+    fn set_text_align(&mut self, align: TextAlign, cx: &mut Context<Self>) {
+        self.text_align = align;
+        if let Some(ed) = &mut self.editing {
+            ed.text_align = align;
+        }
+        let targets: Vec<ElementId> = self
+            .panel_text_ids()
+            .into_iter()
+            .filter(|id| self.scene.get(*id).is_some_and(|e| e.text_align() != align))
+            .collect();
+        if !targets.is_empty() {
+            self.history.record(&self.scene);
+            for id in targets {
+                if let Some(el) = self.scene.get_mut(id) {
+                    if let ElementKind::Text { text_align, .. } = &mut el.kind {
+                        *text_align = align;
+                        // Re-measure repositions bound labels.
                         self.pending_measure.push(id);
                     }
                 }
@@ -1874,16 +2412,53 @@ impl BoardView {
 
     fn render_style_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let weak = cx.weak_entity();
-        let show = self.tool.is_drawing() || !self.selection.is_empty();
-        // Stroke width / roughness only affect shapes (not text). Hide them
-        // when the selection contains only text elements to avoid the
-        // impression that styling "doesn't work" on text.
+        let text_tool = self.tool == ActiveTool::Text;
+        let show = self.tool.is_drawing() || text_tool || !self.selection.is_empty();
+        // Diagnostic: log the style bar state each render (first 30 frames).
+        {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static N: AtomicUsize = AtomicUsize::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n < 30 {
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::fs::OpenOptions::new().create(true).append(true).open("stylebar.log").unwrap(),
+                    "[{}] show={} only_text={} sel={} tool={:?} editing={}",
+                    n, show, !self.selection.is_empty() && self.selection.iter().all(|id| self.scene.get(*id).is_some_and(|e| e.is_text())),
+                    self.selection.len(), self.tool, self.editing.is_some()
+                );
+            }
+        }
+        // Text options show when: the Text tool is active, a container tool
+        // is active (presetting the label style before drawing), the
+        // selection is only text, or a single container is selected (they
+        // then apply to its bound label, or the defaults for a future one).
         let only_text = !self.selection.is_empty()
             && self
                 .selection
                 .iter()
                 .all(|id| self.scene.get(*id).is_some_and(|e| e.is_text()));
-        let show_shape_options = self.tool.is_drawing() || !only_text;
+        let container_tool = matches!(
+            self.tool,
+            ActiveTool::Rectangle | ActiveTool::Ellipse | ActiveTool::Diamond
+        );
+        let single_container = self.selection.len() == 1
+            && self
+                .scene
+                .get(self.selection[0])
+                .is_some_and(|e| e.is_container());
+        let show_text_options = text_tool || container_tool || only_text || single_container;
+        // Shape options hide in text-only contexts — except when the
+        // selected text is bound label(s): then they apply to the container,
+        // so a shape shows *all* options even while its label is edited.
+        let bound_labels_only = !self.selection.is_empty()
+            && self.selection.iter().all(|id| {
+                self.scene.get(*id).is_some_and(|e| {
+                    e.container_id()
+                        .is_some_and(|cid| self.scene.get(cid).is_some())
+                })
+            });
+        let show_shape_options = (!text_tool && !only_text) || bound_labels_only;
 
         let mut bar = bar_container().flex_col().items_start().gap_2().p_2();
 
@@ -1947,18 +2522,50 @@ impl BoardView {
         }
         bar = bar.child(row);
 
-        // Text-only options: font size presets + handwriting toggle.
-        if only_text {
+        // Text options: font size presets + font family + alignment, shown
+        // as glyph icons. With no selection (Text tool active) the buttons
+        // reflect and change the defaults applied to newly created text;
+        // with a container selected they apply to its bound label.
+        if show_text_options {
+            use crate::icons as ic;
+            // The text the buttons act on: selected text + labels of
+            // selected containers.
+            let panel_ids = self.panel_text_ids();
+            // Current font size: first target text element, else the
+            // default for new text. Dragged/resized text can have any size,
+            // so highlight the *closest* preset rather than exact matches.
+            let current_size = panel_ids
+                .iter()
+                .filter_map(|id| self.scene.get(*id))
+                .find_map(|e| match &e.kind {
+                    ElementKind::Text { font_size, .. } => Some(*font_size),
+                    _ => None,
+                })
+                .unwrap_or(self.text_font_size);
+            let nearest_size = TEXT_SIZES
+                .iter()
+                .map(|(s, _)| *s)
+                .min_by(|a, b| {
+                    (a - current_size)
+                        .abs()
+                        .partial_cmp(&(b - current_size).abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap_or(self.text_font_size);
             let mut row = div().flex().flex_row().gap_1();
-            for (size, label) in TEXT_SIZES {
+            for (ix, (size, glyph_px)) in TEXT_SIZES.iter().enumerate() {
                 let weak = weak.clone();
-                let active = self
-                    .selection
-                    .iter()
-                    .filter_map(|id| self.scene.get(*id))
-                    .any(|e| matches!(&e.kind, ElementKind::Text { font_size, .. } if (*font_size - size).abs() < 1e-6));
+                let size = *size;
+                let active = (size - nearest_size).abs() < 1e-6;
                 row = row.child(
-                    bar_button(label, active).on_click(move |_, _, cx| {
+                    glyph_button(
+                        gpui::ElementId::named_usize("fs", ix),
+                        active,
+                        *glyph_px,
+                        "A",
+                        None,
+                    )
+                    .on_click(move |_, _, cx| {
                         weak.update(cx, |this, cx| {
                             this.apply_style_to_text(|fs| *fs = size, cx)
                         })
@@ -1968,22 +2575,77 @@ impl BoardView {
             }
             bar = bar.child(row);
 
-            // Handwriting toggle.
-            let weak_hw = weak.clone();
-            let handwritten = self
-                .selection
+            // Font family: handwritten vs regular, each button previewed in
+            // its own font.
+            let family_active = |family: &str| {
+                if panel_ids.is_empty() {
+                    self.text_font_family == family
+                } else {
+                    panel_ids
+                        .iter()
+                        .filter_map(|id| self.scene.get(*id))
+                        .any(|e| e.font_family() == family)
+                }
+            };
+            let mut row = div().flex().flex_row().gap_1();
+            for (ix, family) in [
+                crate::render::HANDWRITTEN_FONT,
+                crate::render::SYSTEM_FONT,
+            ]
+            .iter()
+            .enumerate()
+            {
+                let weak = weak.clone();
+                let family = *family;
+                let active = family_active(family);
+                row = row.child(
+                    glyph_button(
+                        gpui::ElementId::named_usize("ff", ix),
+                        active,
+                        15.0,
+                        "Aa",
+                        Some(family),
+                    )
+                    .on_click(move |_, _, cx| {
+                        weak.update(cx, |this, cx| this.set_text_font(family, cx))
+                            .ok();
+                    }),
+                );
+            }
+            bar = bar.child(row);
+
+            // Alignment: left / center / right.
+            let align_active = |a: TextAlign| {
+                if panel_ids.is_empty() {
+                    self.text_align == a
+                } else {
+                    panel_ids
+                        .iter()
+                        .filter_map(|id| self.scene.get(*id))
+                        .any(|e| e.text_align() == a)
+                }
+            };
+            let mut row = div().flex().flex_row().gap_1();
+            for (ix, a) in [TextAlign::Left, TextAlign::Center, TextAlign::Right]
                 .iter()
-                .filter_map(|id| self.scene.get(*id))
-                .any(|e| e.font_family() == crate::render::HANDWRITTEN_FONT);
-            bar = bar.child(
-                bar_button("手写", handwritten).on_click(move |_, _, cx| {
-                    weak_hw
-                        .update(cx, |this, cx| {
-                            this.toggle_text_font(cx)
-                        })
-                        .ok();
-                }),
-            );
+                .enumerate()
+            {
+                let weak = weak.clone();
+                let a = *a;
+                let active = align_active(a);
+                row = row.child(
+                    bar_icon_button(
+                        gpui::ElementId::named_usize("al", ix),
+                        active,
+                        ic::align_icon(icon_color(active), a),
+                    )
+                    .on_click(move |_, _, cx| {
+                        weak.update(cx, |this, cx| this.set_text_align(a, cx))
+                            .ok();
+                    }),
+                );
+            }
+            bar = bar.child(row);
         }
 
         // Stroke width (shapes only): three lines of increasing thickness.
@@ -2001,7 +2663,7 @@ impl BoardView {
                     )
                     .on_click(move |_, _, cx| {
                         weak.update(cx, |this, cx| {
-                            this.apply_style_to_selection(|s| s.stroke_width = width, cx)
+                            this.apply_shape_style(|s| s.stroke_width = width, cx)
                         })
                         .ok();
                     }),
@@ -2022,7 +2684,7 @@ impl BoardView {
                     )
                     .on_click(move |_, _, cx| {
                         weak.update(cx, |this, cx| {
-                            this.apply_style_to_selection(|s| s.roughness = roughness, cx)
+                            this.apply_shape_style(|s| s.roughness = roughness, cx)
                         })
                         .ok();
                     }),

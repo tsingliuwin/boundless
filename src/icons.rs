@@ -330,3 +330,20 @@ pub fn roughness_icon(c: Hsla, roughness: f32) -> impl IntoElement {
     )
     .size_full()
 }
+
+/// Text alignment icon: three horizontal bars aligned to the given side.
+pub fn align_icon(c: Hsla, align: crate::scene::TextAlign) -> impl IntoElement {
+    use crate::scene::TextAlign;
+    icon(c, move |b| {
+        for (i, len) in [14.0f32, 9.0, 14.0].iter().enumerate() {
+            let y = 5.0 + i as f32 * 5.0;
+            let (x0, x1) = match align {
+                TextAlign::Left => (3.0, 3.0 + len),
+                TextAlign::Center => (10.0 - len / 2.0, 10.0 + len / 2.0),
+                TextAlign::Right => (17.0 - len, 17.0),
+            };
+            b.move_to(point(px(x0), px(y)));
+            b.line_to(point(px(x1), px(y)));
+        }
+    })
+}

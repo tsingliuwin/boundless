@@ -82,10 +82,15 @@ pub enum DragState {
     /// Panning the camera (hand tool / middle mouse).
     Panning { last_screen: Point<Pixels> },
     /// Drawing a shape/line/arrow from `start`; the draft element is stored
-    /// separately on the board.
-    Drawing { start: WPoint },
-    /// Freehand stroke in progress.
-    Freedraw { points: Vec<WPoint> },
+    /// separately on the board. The `seed` is generated once at drag start
+    /// and reused for every draft frame: rough hand-drawn jitter is seeded,
+    /// so a fresh seed per frame would make the draft visibly "swim".
+    Drawing { start: WPoint, seed: u64 },
+    /// Freehand stroke in progress. The `seed` is generated once at drag
+    /// start and reused for every draft frame (and the committed stroke):
+    /// rough hand-drawn jitter is seeded, so a fresh seed per frame would
+    /// make the whole line visibly "swim" while drawing.
+    Freedraw { points: Vec<WPoint>, seed: u64 },
     /// Moving the current selection.
     Moving {
         last_world: WPoint,
