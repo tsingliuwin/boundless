@@ -289,6 +289,7 @@ impl Element {
         }
     }
 
+    #[allow(dead_code)]
     pub fn min_height(&self) -> Option<f64> {
         match &self.kind {
             ElementKind::Text { min_height, .. } => *min_height,
