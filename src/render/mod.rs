@@ -9,10 +9,25 @@ use gpui::{
 use crate::camera::Camera;
 use crate::scene::{WBounds, WPoint, LINE_HEIGHT};
 
-/// Font used for canvas text elements. ".SystemUIFont" resolves to the
-/// platform UI font which also covers CJK via GPUI's fallback chain.
+/// Font family name for the hand-drawn text style (Caveat, embedded).
+pub const HANDWRITTEN_FONT: &str = "Caveat";
+/// Font family for the plain (system UI) text style.
+pub const SYSTEM_FONT: &str = ".SystemUIFont";
+
+/// Font used for canvas text elements. Defaults to the hand-drawn Caveat;
+/// CJK glyphs fall back to the system UI font via GPUI's fallback chain.
 pub fn canvas_font() -> Font {
-    gpui::font(".SystemUIFont")
+    gpui::font(HANDWRITTEN_FONT)
+}
+
+/// Build a font for the given family with CJK fallback to the system font.
+pub fn canvas_font_with(family: &str) -> Font {
+    let mut f = gpui::font(family.to_string());
+    // Ensure CJK characters still resolve when using a Latin-only font.
+    f.fallbacks = Some(gpui::FontFallbacks::from_fonts(vec![
+        SYSTEM_FONT.to_string(),
+    ]));
+    f
 }
 
 pub const GRID_SPACING: f64 = 20.0;
@@ -85,12 +100,13 @@ pub fn shape_text(
     camera: &Camera,
     color: Hsla,
     wrap_width_world: Option<f64>,
+    font_family: &str,
     window: &Window,
 ) -> (Vec<ShapedTextLine>, Pixels) {
     let font_size = camera.scale(font_size_world).max(px(1.0));
     let line_height = font_size * LINE_HEIGHT as f32;
     let wrap_px = wrap_width_world.map(|w| camera.scale(w).max(px(1.0)));
-    let font = canvas_font();
+    let font = canvas_font_with(font_family);
     let text_system = window.text_system();
 
     let shape_one = |s: &str| {
@@ -210,6 +226,7 @@ pub fn measure_text(
     font_size_world: f64,
     wrap_width: Option<f64>,
     min_height: Option<f64>,
+    font_family: &str,
     window: &Window,
 ) -> (f64, f64) {
     let camera = Camera {
@@ -217,8 +234,15 @@ pub fn measure_text(
         y: 0.0,
         zoom: 1.0,
     };
-    let (lines, line_height) =
-        shape_text(text, font_size_world, &camera, gpui::hsla(0., 0., 0., 1.), wrap_width, window);
+    let (lines, line_height) = shape_text(
+        text,
+        font_size_world,
+        &camera,
+        gpui::hsla(0., 0., 0., 1.),
+        wrap_width,
+        font_family,
+        window,
+    );
     let max_width = lines
         .iter()
         .map(|l| l.width.to_f64())

@@ -36,6 +36,7 @@ pub struct EditingState {
     pub element_id: ElementId,
     pub session: TextEditSession,
     pub font_size: f64,
+    pub font_family: String,
     pub wrap_width: Option<f64>,
     pub min_height: Option<f64>,
     /// True when the text element was created by this editing session.
@@ -192,9 +193,9 @@ impl BoardView {
         let Some(el) = self.scene.get(element_id) else {
             return;
         };
-        let (text, font_size, wrap_width, min_height) = match &el.kind {
-            ElementKind::Text { text, font_size, wrap_width, min_height } => {
-                (text.clone(), *font_size, *wrap_width, *min_height)
+        let (text, font_size, font_family, wrap_width, min_height) = match &el.kind {
+            ElementKind::Text { text, font_size, font_family, wrap_width, min_height } => {
+                (text.clone(), *font_size, font_family.clone(), *wrap_width, *min_height)
             }
             _ => return,
         };
@@ -202,6 +203,7 @@ impl BoardView {
             element_id,
             session: TextEditSession::new(&text),
             font_size,
+            font_family,
             wrap_width,
             min_height,
             is_new,
@@ -230,7 +232,7 @@ impl BoardView {
                 if !ed.is_new {
                     self.history.record(&self.scene);
                 }
-                let (w, h) = measure_text(&text, ed.font_size, ed.wrap_width, ed.min_height, window);
+                let (w, h) = measure_text(&text, ed.font_size, ed.wrap_width, ed.min_height, &ed.font_family, window);
                 if let Some(el) = self.scene.get_mut(id) {
                     if let ElementKind::Text { text: t, .. } = &mut el.kind {
                         *t = text.clone();
@@ -1008,7 +1010,7 @@ impl BoardView {
         let world = self.to_world(screen);
         let text = ed.session.text();
         let color = color_u32(0x000000, 1.0);
-        let (lines, line_height) = shape_text(&text, ed.font_size, &self.camera, color, ed.wrap_width, window);
+        let (lines, line_height) = shape_text(&text, ed.font_size, &self.camera, color, ed.wrap_width, &ed.font_family, window);
         if lines.is_empty() {
             return Some(0);
         }
@@ -1037,7 +1039,7 @@ impl BoardView {
     ) -> Option<(Point<Pixels>, Pixels)> {
         let text = ed.session.text();
         let color = color_u32(0x000000, 1.0);
-        let (lines, line_height) = shape_text(&text, ed.font_size, &self.camera, color, ed.wrap_width, window);
+        let (lines, line_height) = shape_text(&text, ed.font_size, &self.camera, color, ed.wrap_width, &ed.font_family, window);
         if lines.is_empty() {
             return None;
         }
@@ -1184,6 +1186,8 @@ struct TextPaintItem {
     lines: Vec<ShapedTextLine>,
     origin: Point<Pixels>,
     line_height: Pixels,
+    bounds: Bounds<Pixels>,
+    background: Option<Hsla>,
 }
 
 struct EditingPaint {
@@ -1237,16 +1241,26 @@ impl BoardView {
             match &el.kind {
                 ElementKind::Text { text, font_size, .. } => {
                     let color = color_u32(el.style.stroke, el.style.opacity);
+                    let bg = el.style.background.map(|c| color_u32(c, el.style.opacity));
                     let (lines, line_height) =
-                        shape_text(text, *font_size, &self.camera, color, el.wrap_width(), window);
+                        shape_text(text, *font_size, &self.camera, color, el.wrap_width(), el.font_family(), window);
                     let screen_origin = self.camera.world_to_screen(
                         WPoint::new(el.bounds.x, el.bounds.y),
                         origin,
                     );
+                    let screen_bounds = Bounds {
+                        origin: screen_origin,
+                        size: size(
+                            self.camera.scale(el.bounds.w.max(1.0)),
+                            self.camera.scale(el.bounds.h.max(1.0)),
+                        ),
+                    };
                     texts.push(TextPaintItem {
                         lines,
                         origin: screen_origin,
                         line_height,
+                        bounds: screen_bounds,
+                        background: bg,
                     });
                 }
                 _ => {
@@ -1341,7 +1355,7 @@ impl BoardView {
         let el = self.scene.get(ed.element_id)?;
         let text = ed.session.text();
         let color = color_u32(el.style.stroke, el.style.opacity);
-        let (lines, line_height) = shape_text(&text, ed.font_size, &self.camera, color, ed.wrap_width, window);
+        let (lines, line_height) = shape_text(&text, ed.font_size, &self.camera, color, ed.wrap_width, &ed.font_family, window);
         let origin = self
             .camera
             .world_to_screen(WPoint::new(el.bounds.x, el.bounds.y), canvas_origin);
@@ -1436,6 +1450,8 @@ impl BoardView {
                 lines,
                 origin,
                 line_height,
+                bounds: text_bounds,
+                background: el.style.background.map(|c| color_u32(c, el.style.opacity)),
             },
             text_bounds,
             selection_quads,
@@ -1457,13 +1473,13 @@ impl Render for BoardView {
             let pending = std::mem::take(&mut self.pending_measure);
             for id in pending {
                 let info = self.scene.get(id).and_then(|el| match &el.kind {
-                    ElementKind::Text { text, font_size, wrap_width, min_height } => {
-                        Some((text.clone(), *font_size, *wrap_width, *min_height))
+                    ElementKind::Text { text, font_size, font_family, wrap_width, min_height } => {
+                        Some((text.clone(), *font_size, font_family.clone(), *wrap_width, *min_height))
                     }
                     _ => None,
                 });
-                if let Some((text, font_size, wrap_width, min_height)) = info {
-                    let (w, h) = measure_text(&text, font_size, wrap_width, min_height, window);
+                if let Some((text, font_size, font_family, wrap_width, min_height)) = info {
+                    let (w, h) = measure_text(&text, font_size, wrap_width, min_height, &font_family, window);
                     if let Some(el) = self.scene.get_mut(id) {
                         el.bounds.w = w.max(1.0);
                         el.bounds.h = h.max(1.0);
@@ -1625,6 +1641,10 @@ impl Render for BoardView {
 }
 
 fn paint_text_item(item: &TextPaintItem, window: &mut Window, cx: &mut App) {
+    // Background fill (behind the text) if the element has a background color.
+    if let Some(bg) = item.background {
+        window.paint_quad(fill(item.bounds, bg));
+    }
     for (i, line) in item.lines.iter().enumerate() {
         let origin = point(
             item.origin.x,
@@ -1642,6 +1662,7 @@ const STROKE_COLORS: [u32; 5] = [0x1e1e1e, 0xe03131, 0x2f9e44, 0x1971c2, 0xf08c0
 const BG_COLORS: [Option<u32>; 5] = [None, Some(0xffc9c9), Some(0xb2f2bb), Some(0xa5d8ff), Some(0xffec99)];
 const STROKE_WIDTHS: [(f64, f32); 3] = [(1.0, 1.0), (2.0, 2.0), (4.0, 4.0)];
 const ROUGHNESSES: [f32; 3] = [0.0, 1.0, 2.0];
+const TEXT_SIZES: [(f64, &str); 4] = [(16.0, "小"), (20.0, "中"), (28.0, "大"), (40.0, "特大")];
 
 const ICON_ACTIVE: u32 = 0x1a5fd7;
 const ICON_NORMAL: u32 = 0x3b3b3b;
@@ -1723,6 +1744,46 @@ impl BoardView {
                 if let Some(el) = self.scene.get_mut(*id) {
                     apply(&mut el.style);
                     el.seed = crate::scene::new_seed();
+                }
+            }
+            self.mark_dirty();
+        }
+        cx.notify();
+    }
+
+    /// Apply a change to the font_size of selected text elements, then
+    /// re-measure their bounds.
+    fn apply_style_to_text(&mut self, apply: impl Fn(&mut f64), cx: &mut Context<Self>) {
+        if !self.selection.is_empty() {
+            self.history.record(&self.scene);
+            for id in self.selection.clone() {
+                if let Some(el) = self.scene.get_mut(id) {
+                    if let ElementKind::Text { font_size, .. } = &mut el.kind {
+                        apply(font_size);
+                        self.pending_measure.push(id);
+                    }
+                }
+            }
+            self.mark_dirty();
+        }
+        cx.notify();
+    }
+
+    /// Toggle the font family of selected text elements between the
+    /// handwritten Caveat and the system UI font.
+    fn toggle_text_font(&mut self, cx: &mut Context<Self>) {
+        if !self.selection.is_empty() {
+            self.history.record(&self.scene);
+            for id in self.selection.clone() {
+                if let Some(el) = self.scene.get_mut(id) {
+                    if let ElementKind::Text { font_family, .. } = &mut el.kind {
+                        *font_family = if *font_family == crate::render::HANDWRITTEN_FONT {
+                            crate::render::SYSTEM_FONT.to_string()
+                        } else {
+                            crate::render::HANDWRITTEN_FONT.to_string()
+                        };
+                        self.pending_measure.push(id);
+                    }
                 }
             }
             self.mark_dirty();
@@ -1885,6 +1946,45 @@ impl BoardView {
             }));
         }
         bar = bar.child(row);
+
+        // Text-only options: font size presets + handwriting toggle.
+        if only_text {
+            let mut row = div().flex().flex_row().gap_1();
+            for (size, label) in TEXT_SIZES {
+                let weak = weak.clone();
+                let active = self
+                    .selection
+                    .iter()
+                    .filter_map(|id| self.scene.get(*id))
+                    .any(|e| matches!(&e.kind, ElementKind::Text { font_size, .. } if (*font_size - size).abs() < 1e-6));
+                row = row.child(
+                    bar_button(label, active).on_click(move |_, _, cx| {
+                        weak.update(cx, |this, cx| {
+                            this.apply_style_to_text(|fs| *fs = size, cx)
+                        })
+                        .ok();
+                    }),
+                );
+            }
+            bar = bar.child(row);
+
+            // Handwriting toggle.
+            let weak_hw = weak.clone();
+            let handwritten = self
+                .selection
+                .iter()
+                .filter_map(|id| self.scene.get(*id))
+                .any(|e| e.font_family() == crate::render::HANDWRITTEN_FONT);
+            bar = bar.child(
+                bar_button("手写", handwritten).on_click(move |_, _, cx| {
+                    weak_hw
+                        .update(cx, |this, cx| {
+                            this.toggle_text_font(cx)
+                        })
+                        .ok();
+                }),
+            );
+        }
 
         // Stroke width (shapes only): three lines of increasing thickness.
         if show_shape_options {

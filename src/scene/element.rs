@@ -197,6 +197,9 @@ pub enum ElementKind {
     Text {
         text: String,
         font_size: f64,
+        /// Font family name ("Caveat" hand-drawn, ".SystemUIFont" plain).
+        #[serde(default = "default_font_family")]
+        font_family: String,
         /// Max line width in world units; when set, lines wrap at this width.
         /// None = no wrapping (natural width).
         #[serde(default)]
@@ -211,6 +214,11 @@ pub enum ElementKind {
 
 fn default_true() -> bool {
     true
+}
+
+/// Default font family for new text elements (hand-drawn Caveat).
+fn default_font_family() -> String {
+    crate::render::HANDWRITTEN_FONT.to_string()
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -260,6 +268,7 @@ impl Element {
             ElementKind::Text {
                 text,
                 font_size: DEFAULT_FONT_SIZE,
+                font_family: default_font_family(),
                 wrap_width: None,
                 min_height: None,
             },
@@ -294,6 +303,13 @@ impl Element {
         match &self.kind {
             ElementKind::Text { min_height, .. } => *min_height,
             _ => None,
+        }
+    }
+
+    pub fn font_family(&self) -> &str {
+        match &self.kind {
+            ElementKind::Text { font_family, .. } => font_family,
+            _ => crate::render::SYSTEM_FONT,
         }
     }
 

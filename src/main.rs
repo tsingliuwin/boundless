@@ -20,6 +20,13 @@ use gpui::*;
 
 fn main() {
     Application::new().run(|cx: &mut App| {
+        // Register the embedded Caveat handwriting font so text elements can
+        // use a hand-drawn look (Latin glyphs; CJK falls back to system UI).
+        let caveat: &'static [u8] = include_bytes!("../assets/fonts/Caveat.ttf");
+        if let Err(e) = cx.text_system().add_fonts(vec![std::borrow::Cow::Borrowed(caveat)]) {
+            eprintln!("failed to load Caveat font: {e}");
+        }
+
         // Tool bindings are single letters, so they must be disabled while a
         // text field (AI panel) has focus: the "Board && !TextInput"
         // predicate evaluates against the whole dispatch path.
