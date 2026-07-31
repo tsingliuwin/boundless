@@ -682,8 +682,10 @@ impl BoardView {
                             // Enable/update wrapping at the new width.
                             *wrap_width = Some(new_bounds.w.max(8.0));
                         } else {
-                            // Vertical edge: set manual height, font & width
-                            // unchanged.
+                            // Vertical edge (N/S): font size unchanged; width
+                            // reverts to fit content (drop wrap_width) and only
+                            // the frame height follows the drag.
+                            *wrap_width = None;
                             *min_height = Some(new_bounds.h.max(*font_size * LINE_HEIGHT));
                         }
                         // Position the element at the new top-left; width/height
