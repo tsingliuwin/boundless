@@ -9,8 +9,8 @@ use gpui::{
 use crate::camera::Camera;
 use crate::scene::{WBounds, WPoint, LINE_HEIGHT};
 
-/// Font family name for the hand-drawn text style (Patrick Hand, embedded).
-pub const HANDWRITTEN_FONT: &str = "Patrick Hand";
+/// Font family name for the hand-drawn text style (Excalifont, embedded).
+pub const HANDWRITTEN_FONT: &str = "Excalifont";
 /// Font family for the plain (system UI) text style.
 pub const SYSTEM_FONT: &str = ".SystemUIFont";
 

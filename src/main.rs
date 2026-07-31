@@ -20,11 +20,12 @@ use gpui::*;
 
 fn main() {
     Application::new().run(|cx: &mut App| {
-        // Register the embedded Patrick Hand handwriting font so text elements
-        // can use a hand-drawn look (Latin glyphs; CJK falls back to system UI).
-        let font_bytes: &'static [u8] = include_bytes!("../assets/fonts/PatrickHand.ttf");
+        // Register the embedded Excalifont handwriting font (Excalidraw's
+        // default) so text elements use a hand-drawn look for Latin glyphs;
+        // CJK falls back to the system KaiTi font via FontFallbacks.
+        let font_bytes: &'static [u8] = include_bytes!("../assets/fonts/Excalifont.ttf");
         if let Err(e) = cx.text_system().add_fonts(vec![std::borrow::Cow::Borrowed(font_bytes)]) {
-            eprintln!("failed to load Patrick Hand font: {e}");
+            eprintln!("failed to load Excalifont: {e}");
         }
 
         // Tool bindings are single letters, so they must be disabled while a
