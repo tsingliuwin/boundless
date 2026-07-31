@@ -1443,12 +1443,11 @@ impl Render for BoardView {
             (DragState::Resizing { handle, .. }, _) => match handle {
                 crate::render::Handle::N | crate::render::Handle::S => CursorStyle::ResizeUpDown,
                 crate::render::Handle::E | crate::render::Handle::W => CursorStyle::ResizeLeftRight,
-                crate::render::Handle::Nw | crate::render::Handle::Se => {
-                    CursorStyle::ResizeUpLeftDownRight
-                }
-                crate::render::Handle::Ne | crate::render::Handle::Sw => {
-                    CursorStyle::ResizeUpRightDownLeft
-                }
+                // Diagonal handles: GPUI's Windows backend doesn't map
+                // ResizeUpLeftDownRight/ResizeUpRightDownLeft (they fall back
+                // to Arrow). Use PointingHand so at least the cursor changes
+                // and hints the handle is interactive.
+                _ => CursorStyle::PointingHand,
             },
             (_, ActiveTool::Hand) => CursorStyle::OpenHand,
             (_, ActiveTool::Select) => {
@@ -1460,12 +1459,9 @@ impl Render for BoardView {
                         crate::render::Handle::E | crate::render::Handle::W => {
                             CursorStyle::ResizeLeftRight
                         }
-                        crate::render::Handle::Nw | crate::render::Handle::Se => {
-                            CursorStyle::ResizeUpLeftDownRight
-                        }
-                        crate::render::Handle::Ne | crate::render::Handle::Sw => {
-                            CursorStyle::ResizeUpRightDownLeft
-                        }
+                        // Diagonal handles fall back to a pointing hand (see
+                        // the Resizing branch comment for why).
+                        _ => CursorStyle::PointingHand,
                     }
                 } else if self.hover_over_element {
                     CursorStyle::PointingHand
