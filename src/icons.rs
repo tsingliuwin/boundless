@@ -277,6 +277,34 @@ pub fn ai(c: Hsla) -> impl IntoElement {
 }
 
 // ---------------------------------------------------------------------
+// Zoom bar icons
+// ---------------------------------------------------------------------
+
+/// Fit to screen: an outer viewport rectangle with inward corner brackets,
+/// the conventional "fit content to view" affordance.
+pub fn zoom_fit(c: Hsla) -> impl IntoElement {
+    icon(c, |b| {
+        // Outer frame.
+        b.mv(3.0, 4.0);
+        b.ln(17.0, 4.0);
+        b.ln(17.0, 16.0);
+        b.ln(3.0, 16.0);
+        b.cp();
+        // Inward corner brackets hinting "shrink to fit".
+        b.mv(6.0, 7.0);
+        b.ln(6.0, 10.0);
+        b.ln(9.0, 10.0);
+        b.mv(14.0, 7.0);
+        b.ln(14.0, 10.0);
+        b.ln(11.0, 10.0);
+        b.mv(6.0, 13.0);
+        b.ln(9.0, 13.0);
+        b.mv(14.0, 13.0);
+        b.ln(11.0, 13.0);
+    })
+}
+
+// ---------------------------------------------------------------------
 // Stroke-width visualization (replaces "细/中/粗" text)
 // ---------------------------------------------------------------------
 
@@ -345,5 +373,33 @@ pub fn align_icon(c: Hsla, align: crate::scene::TextAlign) -> impl IntoElement {
             b.move_to(point(px(x0), px(y)));
             b.line_to(point(px(x1), px(y)));
         }
+    })
+}
+
+/// Send icon: a paper-plane / upward arrow inside a circle. Used for the chat
+/// input's send button.
+pub fn send(c: Hsla) -> impl IntoElement {
+    icon(c, |b| {
+        // Upward arrow (the "send" affordance).
+        b.mv(10.0, 4.0);
+        b.ln(5.0, 9.0);
+        b.ln(2.5, 9.0);
+        b.mv(10.0, 4.0);
+        b.ln(10.0, 16.0);
+        // Arrowhead.
+        b.mv(10.0, 4.0);
+        b.ln(15.0, 9.0);
+        b.ln(12.5, 9.0);
+    })
+}
+
+/// Stop icon: a filled square, used when a stream is in progress.
+pub fn stop(c: Hsla) -> impl IntoElement {
+    icon(c, |b| {
+        b.mv(6.0, 6.0);
+        b.ln(14.0, 6.0);
+        b.ln(14.0, 14.0);
+        b.ln(6.0, 14.0);
+        b.cp();
     })
 }

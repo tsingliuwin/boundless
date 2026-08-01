@@ -6,6 +6,7 @@ mod board;
 mod camera;
 mod history;
 mod icons;
+mod platform;
 mod render;
 mod scene;
 mod text;
