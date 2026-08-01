@@ -682,37 +682,45 @@ impl Render for AiPanel {
                 .flex_col()
                 .gap_1()
                 .w_full()
-                .px_3()
-                .py_2()
-                .bg(rgb(0xffffff))
-                .border_1()
-                .border_color(rgb(0xe9e8e5))
-                .rounded_lg();
+                .px_1()
+                .py_1();
 
-            // While no content has arrived yet, show a compact "thinking…"
-            // line inside the same bubble.
+            // While no content has arrived yet, show "🤖 思考中…" with a bot icon.
             let has_content =
                 !s.reasoning.is_empty() || !s.tool_calls.is_empty() || !s.buffer.is_empty();
             if !has_content {
                 step = step.child(
                     div()
+                        .flex()
+                        .flex_row()
+                        .gap_1()
+                        .items_center()
                         .text_xs()
                         .text_color(rgb(0x999999))
-                        .child("思考中…"),
+                        .child(
+                            div()
+                                .w(px(14.0))
+                                .h(px(14.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(gpui_component::Icon::new(IconName::Bot)),
+                        )
+                        .child(div().child("思考中…")),
                 );
             }
 
             // Reasoning / thinking panel: auto-expanded while streaming
-            // (reasoning_active), auto-collapsed after. The user can manually
-            // toggle it at any time — their choice takes priority until the
-            // next stream starts. Capped height so it can't fill the area.
+            // (reasoning_active), auto-collapsed after. The toggle arrow is at
+            // the END of the header and hidden by default, shown on hover.
             if !s.reasoning.is_empty() {
-                // Determine open state: user override wins, else auto (active).
                 let reasoning_open = self.reasoning_user_open.unwrap_or(s.reasoning_active);
                 let reasoning_text = s.reasoning.clone();
-                // Clickable header.
+                // Clickable header: 🤖 icon + "思考过程" on the left, ▾/▸ arrow
+                // on the right (hidden until hover).
                 let header = div()
                     .id("reasoning-toggle")
+                    .group("reasoning-header")
                     .flex()
                     .flex_row()
                     .gap_1()
@@ -721,8 +729,26 @@ impl Render for AiPanel {
                     .text_color(rgb(0x888888))
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(0xf5f5f5)).rounded_md())
-                    .child(div().child(if reasoning_open { "▾" } else { "▸" }))
+                    .child(
+                        div()
+                            .w(px(14.0))
+                            .h(px(14.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(gpui_component::Icon::new(IconName::Bot)),
+                    )
                     .child(div().child("思考过程"))
+                    .child(
+                        // Toggle arrow — hidden by default, shown on hover of
+                        // the header group.
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x888888))
+                            .opacity(0.0)
+                            .group_hover("reasoning-header", |s| s.opacity(1.0))
+                            .child(if reasoning_open { "▾" } else { "▸" }),
+                    )
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.reasoning_user_open =
                             Some(!this.reasoning_user_open.unwrap_or(false));
@@ -1017,12 +1043,8 @@ impl AiPanel {
                 .flex_col()
                 .gap_1()
                 .w_full()
-                .px_3()
-                .py_2()
-                .bg(rgb(0xffffff))
-                .border_1()
-                .border_color(rgb(0xe9e8e5))
-                .rounded_lg();
+                .px_1()
+                .py_1();
 
             // Reasoning panel (collapsed by default after completion).
             if let Some(reasoning_text) = reasoning {
@@ -1030,6 +1052,7 @@ impl AiPanel {
                     self.reasoning_user_open.unwrap_or(false);
                 let header = div()
                     .id("reasoning-toggle-done")
+                    .group("reasoning-header-done")
                     .flex()
                     .flex_row()
                     .gap_1()
@@ -1038,8 +1061,24 @@ impl AiPanel {
                     .text_color(rgb(0x888888))
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(0xf5f5f5)).rounded_md())
-                    .child(div().child(if reasoning_open { "▾" } else { "▸" }))
+                    .child(
+                        div()
+                            .w(px(14.0))
+                            .h(px(14.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(gpui_component::Icon::new(IconName::Bot)),
+                    )
                     .child(div().child("思考过程"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x888888))
+                            .opacity(0.0)
+                            .group_hover("reasoning-header-done", |s| s.opacity(1.0))
+                            .child(if reasoning_open { "▾" } else { "▸" }),
+                    )
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.reasoning_user_open =
                             Some(!this.reasoning_user_open.unwrap_or(false));
@@ -1121,17 +1160,15 @@ fn message_bubble(
             .child(content)
             .bg(rgb(0xdce8ff))
     } else {
+        // AI messages: plain text, no card background/border — content flows
+        // naturally (reasoning → tools → text) without a visual container.
         div()
-            .px_3()
-            .py_2()
-            .rounded_lg()
+            .px_1()
+            .py_1()
             .text_sm()
             .w_full()
             .min_w_0()
             .child(content)
-            .bg(rgb(0xffffff))
-            .border_1()
-            .border_color(rgb(0xe9e8e5))
     };
     let mut col = div().flex().flex_col().gap_1();
     // User messages: bubble aligns right (items_end prevents the default
