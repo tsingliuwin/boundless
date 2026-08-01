@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use gpui::prelude::*;
 use gpui::*;
 
+use crate::ai::canvas_ops::{CanvasOp, CanvasStyle};
 use crate::ai::panel::AiPanel;
 use crate::camera::Camera;
 use crate::history::History;
@@ -76,6 +77,18 @@ pub struct BoardView {
     /// hints the available action: move over an element, resize over a handle.
     hover_over_element: bool,
     hover_handle: Option<crate::render::Handle>,
+    /// True while a temporary pen stroke is in progress (Shift + left-drag from
+    /// any non-Pen tool). The current tool is left untouched, so releasing the
+    /// mouse returns to it — Excalidraw's "hold a modifier to sketch" gesture.
+    temp_pen: bool,
+    /// True while a temporary canvas pan is in progress (Ctrl + left-drag from
+    /// any tool). Like temp_pen, the active tool is left untouched so releasing
+    /// the mouse returns to it.
+    temp_pan: bool,
+    /// Last-known keyboard modifier state, updated on every mouse move so the
+    /// render-time cursor can hint the pending gesture (Ctrl => pan hand,
+    /// Shift => pen crosshair) before the button is pressed.
+    modifiers: Modifiers,
 }
 
 impl BoardView {
@@ -104,6 +117,9 @@ impl BoardView {
             pending_measure: Vec::new(),
             hover_over_element: false,
             hover_handle: None,
+            temp_pen: false,
+            temp_pan: false,
+            modifiers: Modifiers::default(),
         }
     }
 
@@ -460,12 +476,114 @@ impl BoardView {
         cx.notify();
     }
 
-    /// Content of the first selected text element, if any.
-    pub fn selected_text_content(&self) -> Option<String> {
-        self.selection
-            .iter()
-            .find_map(|id| self.scene.get(*id))
-            .and_then(|el| el.text().map(str::to_string))
+    /// Apply a single AI drawing operation: translate the op into an element,
+    /// record it to history (so it's undoable), add it to the scene, and — for
+    /// text — queue it for precise remeasure during the next render. This is
+    /// the main-thread entry point driven by the AI agent's tool calls.
+    pub fn apply_canvas_op(&mut self, op: CanvasOp, cx: &mut Context<Self>) {
+        // Merge the op's optional style over the board's current style so that
+        // omitted fields inherit "last used wins" — the same behavior as a
+        // hand-drawn shape.
+        let style = self.style.clone();
+        let styled = |s: CanvasStyle| CanvasStyle::merge_into(s, style);
+
+        // Where to center the viewport-relative origin (used only to extend a
+        // bounds-less op; box/text ops carry absolute coordinates already).
+        let _center_world = self.viewport_center_world();
+
+        // History is recorded once per op, so each AI-drawn element is an
+        // independent undo step.
+        self.history.record(&self.scene);
+
+        match op {
+            CanvasOp::Rectangle { x, y, w, h, style } => {
+                let el = Element::new(ElementKind::Rectangle, WBounds::new(x, y, w, h), styled(style));
+                self.scene.add(el);
+            }
+            CanvasOp::Ellipse { x, y, w, h, style } => {
+                let el = Element::new(ElementKind::Ellipse, WBounds::new(x, y, w, h), styled(style));
+                self.scene.add(el);
+            }
+            CanvasOp::Diamond { x, y, w, h, style } => {
+                let el = Element::new(ElementKind::Diamond, WBounds::new(x, y, w, h), styled(style));
+                self.scene.add(el);
+            }
+            CanvasOp::Line { points, style } => {
+                let pts: Vec<WPoint> = points.into_iter().map(Into::into).collect();
+                if pts.len() >= 2 {
+                    let el = Element::from_absolute_points(
+                        |p| ElementKind::Line { points: p },
+                        pts,
+                        styled(style),
+                    );
+                    self.scene.add(el);
+                }
+            }
+            CanvasOp::Arrow {
+                points,
+                start_arrowhead,
+                end_arrowhead,
+                style,
+            } => {
+                let pts: Vec<WPoint> = points.into_iter().map(Into::into).collect();
+                if pts.len() >= 2 {
+                    let el = Element::from_absolute_points(
+                        |p| ElementKind::Arrow {
+                            points: p,
+                            start_arrowhead,
+                            end_arrowhead,
+                        },
+                        pts,
+                        styled(style),
+                    );
+                    self.scene.add(el);
+                }
+            }
+            CanvasOp::Text {
+                x,
+                y,
+                text,
+                font_size,
+                align,
+                style,
+            } => {
+                let fs = font_size.unwrap_or(self.text_font_size).max(4.0);
+                let ta = align.map(Into::into).unwrap_or(self.text_align);
+                let mut el = Element::new_text(WPoint::new(x, y), text, styled(style));
+                if let ElementKind::Text {
+                    font_size: ref mut fs2,
+                    text_align: ref mut ta2,
+                    ..
+                } = el.kind
+                {
+                    *fs2 = fs;
+                    *ta2 = ta;
+                }
+                // Rough estimate; render() refines with the real text system,
+                // matching how insert_ai_text pre-sizes a new text element.
+                let lines = el.text().map(|t| t.lines().count()).unwrap_or(1).max(1);
+                let max_chars = el
+                    .text()
+                    .map(|t| t.lines().map(|l| l.chars().count()).max().unwrap_or(1))
+                    .unwrap_or(1);
+                el.bounds.w = (max_chars as f64 * fs).max(1.0);
+                el.bounds.h = lines as f64 * fs * LINE_HEIGHT;
+                let id = self.scene.add(el);
+                self.pending_measure.push(id);
+            }
+        }
+        self.mark_dirty();
+        cx.notify();
+    }
+
+    /// World-space point at the center of the visible canvas. Kept for future
+    /// auto-layout use; box/text ops currently carry absolute coordinates.
+    fn viewport_center_world(&self) -> WPoint {
+        let center_screen = point(
+            self.canvas_bounds.origin.x + self.canvas_bounds.size.width * 0.5,
+            self.canvas_bounds.origin.y + self.canvas_bounds.size.height * 0.5,
+        );
+        self.camera.screen_to_world(center_screen, self.canvas_origin())
     }
 
     // ------------------------------------------------------------------
@@ -477,6 +595,99 @@ impl BoardView {
             self.ai_panel = Some(cx.new(|cx| AiPanel::new(weak, cx)));
         }
         cx.notify();
+    }
+
+    /// Current AI panel width (its live, user-resizable value), or the default
+    /// if the panel is closed. Used to offset the toolbar / zoom bar so they
+    /// never sit under the panel.
+    fn ai_panel_width(&self, cx: &mut Context<Self>) -> f32 {
+        self.ai_panel
+            .as_ref()
+            .map(|p| p.read(cx).width())
+            .unwrap_or(crate::ai::panel::DEFAULT_WIDTH)
+    }
+
+    /// The cursor the canvas should show right now. Centralized so both the
+    /// render path and the on-modifiers-changed handler agree on it (the latter
+    /// forces an immediate cursor update on Windows; see platform::refresh_cursor).
+    fn cursor_style(&self) -> CursorStyle {
+        if self.editing.is_some() {
+            // While editing text, always show the text caret cursor.
+            return CursorStyle::IBeam;
+        }
+        match (&self.drag, self.tool) {
+            // A temporary (Shift-drag) freehand stroke is in progress: show the
+            // same crosshair the Pen tool uses.
+            (DragState::Freedraw { .. }, _) if self.temp_pen => CursorStyle::Crosshair,
+            // A temporary (Ctrl-drag) canvas pan is in progress: show a hand.
+            (DragState::Panning { .. }, _) if self.temp_pan => CursorStyle::PointingHand,
+            // Hover hint while idle: holding Shift will sketch (crosshair) and
+            // holding Ctrl will pan (hand), so reflect the pending gesture.
+            (DragState::Idle, _) if self.modifiers.shift && self.tool != ActiveTool::Pen => {
+                CursorStyle::Crosshair
+            }
+            (DragState::Idle, _) if (self.modifiers.control || self.modifiers.platform)
+                && self.tool != ActiveTool::Hand =>
+            {
+                CursorStyle::PointingHand
+            }
+            // GPUI's Windows backend doesn't implement OpenHand (it falls
+            // back to the plain arrow), so use PointingHand which maps to
+            // IDC_HAND there. Panning is a "grabbing" gesture; using the
+            // hand cursor is the best available hint on Windows.
+            (DragState::Panning { .. }, _) => CursorStyle::PointingHand,
+            (DragState::Moving { .. }, _) => CursorStyle::PointingHand,
+            (DragState::Resizing { handle, .. }, _) => match handle {
+                crate::render::Handle::N | crate::render::Handle::S => CursorStyle::ResizeUpDown,
+                crate::render::Handle::E | crate::render::Handle::W => CursorStyle::ResizeLeftRight,
+                // Diagonal handles: GPUI's Windows backend doesn't map
+                // ResizeUpLeftDownRight/ResizeUpRightDownLeft (they fall back
+                // to Arrow). Use PointingHand so at least the cursor changes
+                // and hints the handle is interactive.
+                _ => CursorStyle::PointingHand,
+            },
+            // Hand tool: OpenHand isn't implemented on Windows (see the
+            // Panning comment above), so use PointingHand to get a hand cursor.
+            (_, ActiveTool::Hand) => CursorStyle::PointingHand,
+            (_, ActiveTool::Select) => {
+                if let Some(h) = self.hover_handle {
+                    match h {
+                        crate::render::Handle::N | crate::render::Handle::S => {
+                            CursorStyle::ResizeUpDown
+                        }
+                        crate::render::Handle::E | crate::render::Handle::W => {
+                            CursorStyle::ResizeLeftRight
+                        }
+                        // Diagonal handles fall back to a pointing hand (see
+                        // the Resizing branch comment for why).
+                        _ => CursorStyle::PointingHand,
+                    }
+                } else if self.hover_over_element {
+                    CursorStyle::PointingHand
+                } else {
+                    CursorStyle::Arrow
+                }
+            }
+            // Text tool: crosshair while sizing a box (editing shows IBeam via
+            // the early branch above).
+            (_, ActiveTool::Text) => CursorStyle::Crosshair,
+            (_, ActiveTool::Eraser) => CursorStyle::PointingHand,
+            _ => CursorStyle::Crosshair,
+        }
+    }
+
+    /// The portion of the canvas that is actually visible. The canvas element
+    /// fills the whole window, but the AI panel docks over its right edge, so
+    /// when the panel is open the drawable region excludes the panel width.
+    /// Zoom reset / fit / button-zoom should anchor on *this* rect (not the
+    /// full window) so they behave relative to what the user can actually see.
+    fn viewport_bounds(&self, cx: &mut Context<Self>) -> Bounds<Pixels> {
+        let mut b = self.canvas_bounds;
+        if self.ai_panel.is_some() {
+            let panel_w = self.ai_panel_width(cx);
+            b.size.width = (b.size.width - px(panel_w)).max(px(1.0));
+        }
+        b
     }
 
     // ------------------------------------------------------------------
@@ -538,18 +749,20 @@ impl BoardView {
     // zoom actions
 
     fn zoom_by(&mut self, factor: f64, cx: &mut Context<Self>) {
+        let vp = self.viewport_bounds(cx);
         let center = point(
-            self.canvas_bounds.origin.x + self.canvas_bounds.size.width * 0.5,
-            self.canvas_bounds.origin.y + self.canvas_bounds.size.height * 0.5,
+            vp.origin.x + vp.size.width * 0.5,
+            vp.origin.y + vp.size.height * 0.5,
         );
         self.camera.zoom_at(factor, center, self.canvas_origin());
         cx.notify();
     }
 
     fn zoom_reset(&mut self, cx: &mut Context<Self>) {
+        let vp = self.viewport_bounds(cx);
         let center = point(
-            self.canvas_bounds.origin.x + self.canvas_bounds.size.width * 0.5,
-            self.canvas_bounds.origin.y + self.canvas_bounds.size.height * 0.5,
+            vp.origin.x + vp.size.width * 0.5,
+            vp.origin.y + vp.size.height * 0.5,
         );
         let factor = 1.0 / self.camera.zoom;
         self.camera.zoom_at(factor, center, self.canvas_origin());
@@ -588,6 +801,34 @@ impl BoardView {
                     .and_then(|e| e.container_id())
                     .unwrap_or(new_id);
                 self.selection = vec![target];
+                cx.notify();
+                return;
+            }
+        }
+
+        // Modifier + left-drag gestures work from ANY tool (except while editing
+        // text, where the keystrokes belong to the input field). The active tool
+        // is never changed, so releasing the mouse returns to it.
+        let ctrl = event.modifiers.control || event.modifiers.platform;
+        let shift = event.modifiers.shift;
+        if self.editing.is_none() {
+            if shift && self.tool != ActiveTool::Pen {
+                // Shift + left-drag: temporary freehand stroke (Excalidraw's
+                // "hold to sketch"). Reuses the Pen tool's drag path.
+                self.temp_pen = true;
+                self.drag = DragState::Freedraw {
+                    points: vec![world],
+                    seed: crate::scene::new_seed(),
+                };
+                cx.notify();
+                return;
+            } else if ctrl && self.tool != ActiveTool::Hand {
+                // Ctrl + left-drag: temporarily pan the canvas (like the Hand
+                // tool) without leaving the current tool.
+                self.temp_pan = true;
+                self.drag = DragState::Panning {
+                    last_screen: event.position,
+                };
                 cx.notify();
                 return;
             }
@@ -775,6 +1016,11 @@ impl BoardView {
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        // Track modifier state so render() can hint the pending gesture cursor
+        // (Ctrl => pan hand, Shift => pen crosshair) while hovering, before any
+        // button is pressed.
+        let modifiers_changed = self.modifiers != event.modifiers;
+        self.modifiers = event.modifiers;
         let world = self.to_world(event.position);
         // Take the drag state out to avoid borrowing conflicts while
         // mutating the scene/history.
@@ -805,7 +1051,9 @@ impl BoardView {
                         .scene
                         .hit_test(world, self.hit_tolerance())
                         .is_some();
-                if new_over_element != self.hover_over_element || new_handle != self.hover_handle
+                if new_over_element != self.hover_over_element
+                    || new_handle != self.hover_handle
+                    || modifiers_changed
                 {
                     self.hover_over_element = new_over_element;
                     self.hover_handle = new_handle;
@@ -1146,6 +1394,11 @@ impl BoardView {
             }
             _ => {}
         }
+        // End any temporary modifier-drag gesture (Shift=sketch, Ctrl=pan): the
+        // current tool was never changed, so clearing the flags returns the
+        // editor to it.
+        self.temp_pen = false;
+        self.temp_pan = false;
         cx.notify();
     }
 
@@ -1168,7 +1421,12 @@ impl BoardView {
             self.camera
                 .zoom_at(factor, event.position, self.canvas_origin());
         } else if event.modifiers.shift {
-            self.camera.pan_by_screen(delta.y, px(0.0));
+            // Horizontal pan. GPUI's Windows backend already transposes
+            // shift+vertical-wheel into the X axis (delta.x set, delta.y=0),
+            // so pan by delta.x. (delta.y is kept as a fallback for platforms
+            // that don't transpose, e.g. some trackpads.)
+            let dx = if delta.x.to_f64() != 0.0 { delta.x } else { delta.y };
+            self.camera.pan_by_screen(dx, px(0.0));
         } else {
             self.camera.pan_by_screen(delta.x, delta.y);
         }
@@ -1248,6 +1506,26 @@ impl BoardView {
             cx.stop_propagation();
         }
         cx.notify();
+    }
+
+    /// Fires on every modifier change (key down AND key up), so the hover cursor
+    /// and toolbar highlight can react instantly to pressing/releasing Ctrl or
+    /// Shift — without this, modifier state only refreshes on the next mouse
+    /// move, which feels sluggish.
+    fn on_modifiers_changed(
+        &mut self,
+        event: &ModifiersChangedEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.modifiers = event.modifiers;
+        cx.notify();
+        // On Windows the system cursor only refreshes on WM_SETCURSOR (mouse
+        // move), so pressing/releasing Ctrl/Shift wouldn't change the visible
+        // cursor until the mouse next moves. Apply it directly here, in sync
+        // with the highlight that the repaint already draws — both driven by
+        // the same cursor_style() so they can't drift apart.
+        crate::platform::refresh_cursor(window, self.cursor_style());
     }
 
     // ------------------------------------------------------------------
@@ -1924,49 +2202,7 @@ impl Render for BoardView {
         // it can be applied to the canvas's own hitbox (GPUI picks the cursor
         // from the topmost element under the pointer; setting it on the outer
         // div alone is overridden by the canvas's default).
-        let cursor = if self.editing.is_some() {
-            // While editing text, always show the text caret cursor.
-            CursorStyle::IBeam
-        } else {
-            match (&self.drag, self.tool) {
-            (DragState::Panning { .. }, _) => CursorStyle::OpenHand,
-            (DragState::Moving { .. }, _) => CursorStyle::PointingHand,
-            (DragState::Resizing { handle, .. }, _) => match handle {
-                crate::render::Handle::N | crate::render::Handle::S => CursorStyle::ResizeUpDown,
-                crate::render::Handle::E | crate::render::Handle::W => CursorStyle::ResizeLeftRight,
-                // Diagonal handles: GPUI's Windows backend doesn't map
-                // ResizeUpLeftDownRight/ResizeUpRightDownLeft (they fall back
-                // to Arrow). Use PointingHand so at least the cursor changes
-                // and hints the handle is interactive.
-                _ => CursorStyle::PointingHand,
-            },
-            (_, ActiveTool::Hand) => CursorStyle::OpenHand,
-            (_, ActiveTool::Select) => {
-                if let Some(h) = self.hover_handle {
-                    match h {
-                        crate::render::Handle::N | crate::render::Handle::S => {
-                            CursorStyle::ResizeUpDown
-                        }
-                        crate::render::Handle::E | crate::render::Handle::W => {
-                            CursorStyle::ResizeLeftRight
-                        }
-                        // Diagonal handles fall back to a pointing hand (see
-                        // the Resizing branch comment for why).
-                        _ => CursorStyle::PointingHand,
-                    }
-                } else if self.hover_over_element {
-                    CursorStyle::PointingHand
-                } else {
-                    CursorStyle::Arrow
-                }
-            }
-            // Text tool: crosshair while sizing a box (editing shows IBeam via
-            // the early branch above).
-            (_, ActiveTool::Text) => CursorStyle::Crosshair,
-            (_, ActiveTool::Eraser) => CursorStyle::PointingHand,
-            _ => CursorStyle::Crosshair,
-            }
-        };
+        let cursor = self.cursor_style();
 
         let canvas_el = canvas(
             {
@@ -2062,6 +2298,7 @@ impl Render for BoardView {
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .on_key_down(cx.listener(Self::on_key_down))
+            .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .child(canvas_el)
             .child(self.render_toolbar(cx))
             .child(self.render_style_bar(cx))
@@ -2348,9 +2585,23 @@ impl BoardView {
         ];
 
         let mut bar = bar_container();
+        // Whether a modifier is held that would trigger a temporary gesture —
+        // used to highlight Hand (Ctrl) / Pen (Shift) even before the button is
+        // pressed, for immediate visual feedback. Ignored while editing text.
+        let ctrl_held = (self.modifiers.control || self.modifiers.platform)
+            && self.editing.is_none();
+        let shift_held = self.modifiers.shift && self.editing.is_none();
         for (tool, label, icon_fn) in tools {
             let weak = weak.clone();
-            let active = self.tool == tool;
+            // Highlight the tool matching a live gesture: while Ctrl-drag pans
+            // (Hand) or Shift-drag sketches (Pen), the current tool is unchanged
+            // but those tools should look active. Also highlight on the modifier
+            // being merely held, before the drag starts.
+            let active = self.tool == tool
+                || ((self.temp_pan || (ctrl_held && matches!(self.drag, DragState::Idle)))
+                    && tool == ActiveTool::Hand)
+                || ((self.temp_pen || (shift_held && matches!(self.drag, DragState::Idle)))
+                    && tool == ActiveTool::Pen);
             bar = bar.child(
                 bar_icon_button(gpui::ElementId::Name(label.into()), active, icon_fn(icon_color(active)))
                     .on_click(move |_, window, cx| {
@@ -2400,11 +2651,19 @@ impl BoardView {
                     }),
             );
 
+        // Center the toolbar over the *canvas* area. When the AI panel (which
+        // docks to the right) is open, exclude its current width from the
+        // centering region so the toolbar stays visually centered in the
+        // remaining drawable space instead of drifting toward the panel.
+        let panel_width = self.ai_panel_width(cx);
+        let panel_open = self.ai_panel.is_some();
+
         div()
             .absolute()
             .top_3()
             .left_0()
-            .right_0()
+            .when(panel_open, |d| d.right(px(panel_width)))
+            .when(!panel_open, |d| d.right_0())
             .flex()
             .justify_center()
             .child(bar)
@@ -2703,6 +2962,7 @@ impl BoardView {
     }
 
     fn render_zoom_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::icons as ic;
         let weak = cx.weak_entity();
         let percent = format!("{:.0}%", self.camera.zoom * 100.0);
 
@@ -2711,29 +2971,54 @@ impl BoardView {
         let weak_reset = weak.clone();
         let weak_fit = weak.clone();
 
-        div().absolute().bottom_3().right_3().flex().child(
+        // Dock above/below the AI panel rather than under it: when the panel
+        // is open, push the zoom bar to the left of it so it stays visible.
+        // Uses the panel's *current* (possibly user-resized) width.
+        // `right_3` = 12px inset either way.
+        const INSET: f32 = 12.0;
+        let panel_width = self.ai_panel_width(cx);
+        let panel_open = self.ai_panel.is_some();
+
+        div()
+            .absolute()
+            .bottom_3()
+            .when(panel_open, |d| d.right(px(panel_width + INSET)))
+            .when(!panel_open, |d| d.right(px(INSET)))
+            .flex()
+            .child(
             bar_container()
                 .child(bar_button("−", false).on_click(move |_, _, cx| {
                     weak_out.update(cx, |this, cx| this.zoom_by(0.8, cx)).ok();
                 }))
                 .child(
                     div()
+                        .id("zoom-percent")
                         .w_12()
                         .text_center()
                         .text_sm()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(0xf1f0ee)).rounded_md())
+                        // Double-click the percentage to reset zoom to 100%,
+                        // replacing the dedicated reset button (Excalidraw/
+                        // Figma behavior). GPUI has no on_double_click helper,
+                        // so detect it via MouseDownEvent::click_count == 2.
+                        .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+                            if event.click_count >= 2 {
+                                weak_reset.update(cx, |this, cx| this.zoom_reset(cx)).ok();
+                            }
+                        })
                         .child(percent),
                 )
                 .child(bar_button("+", false).on_click(move |_, _, cx| {
                     weak_in.update(cx, |this, cx| this.zoom_by(1.25, cx)).ok();
                 }))
-                .child(bar_button("重置", false).on_click(move |_, _, cx| {
-                    weak_reset.update(cx, |this, cx| this.zoom_reset(cx)).ok();
-                }))
-                .child(bar_button("适应", false).on_click(move |_, _, cx| {
+                .child(
+                    bar_icon_button("zoom-fit", false, ic::zoom_fit(icon_color(false)))
+                        .on_click(move |_, _, cx| {
                     weak_fit
                         .update(cx, |this, cx| {
                             if let Some(bounds) = this.scene.content_bounds() {
-                                let viewport = this.canvas_bounds.size;
+                                let viewport = this.viewport_bounds(cx).size;
                                 this.camera.zoom_to_fit(bounds, viewport);
                                 cx.notify();
                             }

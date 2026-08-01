@@ -2,7 +2,7 @@
 name = "boundless"
 version = "0.1.0"
 edition = "2021"
-description = "A boundless Excalidraw-style whiteboard built on GPUI, with OpenAI-compatible AI generation"
+description = "A boundless Excalidraw-style whiteboard built on GPUI, with a rig-powered AI agent that draws directly onto the canvas"
 
 [dependencies]
 gpui = "0.2.2"
@@ -25,6 +25,26 @@ futures = "0.3"
 futures-util = "0.3"
 dirs = "6"
 rfd = "0.15"
+# rig drives the AI agent: an OpenAI-compatible client, multi-turn tool-calling
+# loop, and streaming. The `derive` feature pulls in `rig-derive` (and schemars)
+# so tool argument types can derive their JSON schema.
+rig-core = { version = "0.38", default-features = false, features = [
+    "derive",
+    "reqwest",
+    "rustls",
+] }
+# JSON-Schema derive for rig tool argument structs (reuses the schemars in the
+# dependency graph that rig-core already pulls in).
+schemars = "1"
+
+# Win32 interop: GPUI updates the *cached* cursor style on a modifier change,
+# but on Windows the system cursor only refreshes on WM_SETCURSOR (mouse move).
+# We set the system cursor directly so holding Ctrl/Shift changes it instantly.
+# Target-gated; no-op on other platforms.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 # Windows application icon embedding (see build.rs). Pinned to the version that
 # already exists in Cargo.lock so we don't introduce a new dependency.

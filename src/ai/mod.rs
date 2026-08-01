@@ -1,5 +1,10 @@
-//! OpenAI-compatible AI capabilities (text generation first).
+//! AI capabilities: a rig-powered drawing agent over an OpenAI-compatible
+//! endpoint, plus the side panel UI that drives it.
 
+pub mod agent;
+pub mod canvas_ops;
 pub mod client;
 pub mod panel;
 pub mod settings;
+pub mod store;
+pub mod tools;
