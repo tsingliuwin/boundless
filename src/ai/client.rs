@@ -20,6 +20,14 @@ use serde::{Deserialize, Serialize};
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// The model's reasoning/thinking text (assistant messages only). Stored
+    /// so the thinking process survives after streaming finishes and can be
+    /// re-expanded by the user. Omitted for user/system messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    /// Tool calls the model made while producing this message (assistant only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<String>,
 }
 
 impl ChatMessage {
@@ -28,6 +36,8 @@ impl ChatMessage {
         Self {
             role: "system".to_string(),
             content: content.into(),
+            reasoning: None,
+            tool_calls: Vec::new(),
         }
     }
 
@@ -35,6 +45,8 @@ impl ChatMessage {
         Self {
             role: "user".to_string(),
             content: content.into(),
+            reasoning: None,
+            tool_calls: Vec::new(),
         }
     }
 
@@ -42,6 +54,8 @@ impl ChatMessage {
         Self {
             role: "assistant".to_string(),
             content: content.into(),
+            reasoning: None,
+            tool_calls: Vec::new(),
         }
     }
 }

@@ -589,10 +589,10 @@ impl BoardView {
     // ------------------------------------------------------------------
     // AI panel
 
-    fn toggle_ai_panel(&mut self, cx: &mut Context<Self>) {
+    fn toggle_ai_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.ai_panel.take().is_none() {
             let weak = cx.weak_entity();
-            self.ai_panel = Some(cx.new(|cx| AiPanel::new(weak, cx)));
+            self.ai_panel = Some(cx.new(|cx| AiPanel::new(weak, window, cx)));
         }
         cx.notify();
     }
@@ -2290,7 +2290,7 @@ impl Render for BoardView {
             .on_action(cx.listener(|this, _: &PenTool, window, cx| this.set_tool(ActiveTool::Pen, window, cx)))
             .on_action(cx.listener(|this, _: &TextTool, window, cx| this.set_tool(ActiveTool::Text, window, cx)))
             .on_action(cx.listener(|this, _: &EraserTool, window, cx| this.set_tool(ActiveTool::Eraser, window, cx)))
-            .on_action(cx.listener(|this, _: &ToggleAi, _window, cx| this.toggle_ai_panel(cx)))
+            .on_action(cx.listener(|this, _: &ToggleAi, window, cx| this.toggle_ai_panel(window, cx)))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_left_down))
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_left_up))
@@ -2646,8 +2646,8 @@ impl BoardView {
             .child(div().w(px(1.0)).h_5().bg(rgb(0xe3e2df)).mx_1())
             .child(
                 bar_icon_button("AI", ai_active, ic::ai(icon_color(ai_active)))
-                    .on_click(move |_, _, cx| {
-                        weak_ai.update(cx, |this, cx| this.toggle_ai_panel(cx)).ok();
+                    .on_click(move |_, window, cx| {
+                        weak_ai.update(cx, |this, cx| this.toggle_ai_panel(window, cx)).ok();
                     }),
             );
 

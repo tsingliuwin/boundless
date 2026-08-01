@@ -18,9 +18,17 @@ use board::{
     ToggleAi, Undo, ZoomIn, ZoomOut, ZoomReset,
 };
 use gpui::*;
+use gpui_component::Root;
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    Application::new()
+        .with_assets(gpui_component_assets::Assets)
+        .run(|cx: &mut App| {
+        // Initialize the gpui-component theme and global state. Must be called
+        // early so Input/Button/etc. have their styling ready before the first
+        // render.
+        gpui_component::init(cx);
+
         // Register the embedded Excalifont handwriting font (Excalidraw's
         // default) so text elements use a hand-drawn look for Latin glyphs;
         // CJK falls back to the system KaiTi font via FontFallbacks.
@@ -29,10 +37,11 @@ fn main() {
             eprintln!("failed to load Excalifont: {e}");
         }
 
-        // Tool bindings are single letters, so they must be disabled while a
-        // text field (AI panel) has focus: the "Board && !TextInput"
-        // predicate evaluates against the whole dispatch path.
-        const CANVAS: &str = "Board && !TextInput";
+        // Tool bindings are single letters, so they must be disabled while an
+        // input field (AI panel) has focus. gpui-component's Input uses the
+        // "Input" key context, so "!Input" prevents tool shortcuts from firing
+        // while typing.
+        const CANVAS: &str = "Board && !Input";
         cx.bind_keys([
             KeyBinding::new("ctrl-z", Undo, Some("Board")),
             KeyBinding::new("ctrl-shift-z", Redo, Some("Board")),
@@ -68,7 +77,13 @@ fn main() {
                 }),
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| BoardView::new(window, cx)),
+            |window, cx| {
+                // Wrap the board in a gpui-component Root so the AI panel's
+                // Input/Button components have theme, focus management, and
+                // overlay layers (notifications/dialogs) available.
+                let view: AnyView = cx.new(|cx| BoardView::new(window, cx)).into();
+                cx.new(|cx| Root::new(view, window, cx))
+            },
         )
         .unwrap();
         cx.activate(true);

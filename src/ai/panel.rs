@@ -1,15 +1,20 @@
 //! AI side panel: settings, chat with SSE streaming, insert-to-canvas.
+//!
+//! Input fields use gpui-component's `InputState`/`Input` (multi-line with
+//! auto-grow, IME, selection, clipboard) instead of a hand-rolled TextField.
 
-use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use futures::StreamExt;
 use gpui::prelude::*;
 use gpui::*;
+use gpui_component::button::Button;
+use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::IconName;
+use gpui_component::Sizable;
 
 use crate::board::BoardView;
-use crate::text::{utf16_to_utf8, utf8_to_utf16};
 
 use super::agent::{AgentEvent, AgentRequest, BoundlessAgent};
 use super::client::ChatMessage;
@@ -18,825 +23,22 @@ use super::store::{
     self, create_session, delete_session, list_sessions, load_messages, SessionMeta,
 };
 
-// ---------------------------------------------------------------------
-// TextField: a minimal single-line input with IME support
-// ---------------------------------------------------------------------
-
-pub struct Submit;
-
-pub struct TextField {
-    text: String,
-    caret: usize, // char offset
-    /// Active selection (char offsets, ordered). None = no selection; the caret
-    /// is the active boundary. Needed so copy/cut/paste/select-all work.
-    selection: Option<Range<usize>>,
-    marked: Option<Range<usize>>,
-    placeholder: &'static str,
-    masked: bool,
-    /// Whether this field supports multiple lines (Shift+Enter inserts a
-    /// newline; plain Enter emits `Submit`). Single-line fields emit `Submit`
-    /// on any Enter.
-    multiline: bool,
-    focus_handle: FocusHandle,
-}
-
-impl EventEmitter<Submit> for TextField {}
-
-impl TextField {
-    pub fn new(placeholder: &'static str, masked: bool, cx: &mut Context<Self>) -> Self {
-        Self::with_multiline(placeholder, masked, false, cx)
-    }
-
-    /// Create a multi-line field (the chat input).
-    pub fn new_multiline(placeholder: &'static str, cx: &mut Context<Self>) -> Self {
-        Self::with_multiline(placeholder, false, true, cx)
-    }
-
-    fn with_multiline(
-        placeholder: &'static str,
-        masked: bool,
-        multiline: bool,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        Self {
-            text: String::new(),
-            caret: 0,
-            selection: None,
-            marked: None,
-            placeholder,
-            masked,
-            multiline,
-            focus_handle: cx.focus_handle(),
-        }
-    }
-
-    pub fn text(&self) -> String {
-        self.text.clone()
-    }
-
-    pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
-        self.text = text.into();
-        self.caret = self.text.chars().count();
-        self.selection = None;
-        self.marked = None;
-        cx.notify();
-    }
-
-    pub fn clear(&mut self, cx: &mut Context<Self>) {
-        self.set_text("", cx);
-    }
-
-    /// Number of display lines for a multi-line field: counts `\n`-separated
-    /// lines (at least 1). Used to size the input box to its content so the
-    /// last line is never clipped by the toolbar.
-    fn line_count(&self) -> usize {
-        if self.masked {
-            return 1;
-        }
-        self.text.split('\n').count().max(1)
-    }
-
-    /// The char range of the active selection, if any. Always normalized
-    /// (start <= end) regardless of selection direction.
-    fn selection_range(&self) -> Option<Range<usize>> {
-        self.selection.as_ref().map(|r| {
-            if r.start <= r.end {
-                r.start..r.end
-            } else {
-                r.end..r.start
-            }
-        })
-    }
-
-    /// Delete the active selection (if any) and return whether anything was
-    /// removed. Leaves `caret` at the deletion point and clears the selection.
-    fn delete_selection(&mut self) -> bool {
-        if let Some(r) = self.selection_range() {
-            let start = self.char_to_byte(r.start);
-            let end = self.char_to_byte(r.end);
-            self.text.replace_range(start..end, "");
-            self.caret = r.start;
-            self.selection = None;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Move the caret one char left, extending the selection (Shift+Left).
-    fn extend_selection_left(&mut self) {
-        let new_caret = self.caret.saturating_sub(1);
-        let prev = self.selection.take();
-        self.selection = match prev {
-            Some(r) => {
-                // Extend the nearer boundary toward the new caret.
-                if r.end == self.caret {
-                    Some(r.start..new_caret)
-                } else {
-                    Some(self.caret..r.start)
-                }
-            }
-            None => Some(new_caret..self.caret),
-        };
-        self.caret = new_caret;
-    }
-
-    /// Move the caret one char right, extending the selection (Shift+Right).
-    fn extend_selection_right(&mut self) {
-        let last = self.text.chars().count();
-        let new_caret = (self.caret + 1).min(last);
-        let prev = self.selection.take();
-        self.selection = match prev {
-            Some(r) => {
-                if r.end == self.caret {
-                    Some(r.start..new_caret)
-                } else {
-                    Some(self.caret..r.start)
-                }
-            }
-            None => Some(self.caret..new_caret),
-        };
-        self.caret = new_caret;
-    }
-
-    /// Insert `s` at the caret, replacing any active selection first.
-    fn insert(&mut self, s: &str) {
-        if !self.delete_selection() {
-            let byte = self.char_to_byte(self.caret);
-            self.text.insert_str(byte, s);
-            self.caret += s.chars().count();
-        } else {
-            // Selection was removed; insert at the (now-collapsed) caret.
-            let byte = self.char_to_byte(self.caret);
-            self.text.insert_str(byte, s);
-            self.caret += s.chars().count();
-        }
-    }
-
-    fn display_text(&self) -> String {
-        if self.masked {
-            "•".repeat(self.text.chars().count())
-        } else {
-            self.text.clone()
-        }
-    }
-
-    fn char_to_byte(&self, char_off: usize) -> usize {
-        self.text
-            .char_indices()
-            .nth(char_off)
-            .map(|(i, _)| i)
-            .unwrap_or(self.text.len())
-    }
-
-    fn byte_to_char(&self, byte_off: usize) -> usize {
-        self.text[..byte_off.min(self.text.len())].chars().count()
-    }
-
-    fn backspace(&mut self) {
-        // Delete the selection if there is one; otherwise the previous char.
-        if !self.delete_selection() && self.caret > 0 {
-            let start = self.char_to_byte(self.caret - 1);
-            let end = self.char_to_byte(self.caret);
-            self.text.replace_range(start..end, "");
-            self.caret -= 1;
-        }
-    }
-
-    fn delete_forward(&mut self) {
-        // Delete the selection if there is one; otherwise the next char.
-        if !self.delete_selection() {
-            let len = self.text.chars().count();
-            if self.caret < len {
-                let start = self.char_to_byte(self.caret);
-                let end = self.char_to_byte(self.caret + 1);
-                self.text.replace_range(start..end, "");
-            }
-        }
-    }
-
-    fn on_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let ctrl = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
-        // Only handle editing control keys; character keys must fall through
-        // so GPUI generates WM_CHAR and routes it to replace_text_in_range.
-        let handled = match event.keystroke.key.as_str() {
-            "left" => {
-                // Shift+arrow extends the selection; plain arrow collapses it.
-                if event.keystroke.modifiers.shift {
-                    self.extend_selection_left();
-                } else {
-                    self.caret = self.caret.saturating_sub(1);
-                    self.selection = None;
-                }
-                true
-            }
-            "right" => {
-                if event.keystroke.modifiers.shift {
-                    self.extend_selection_right();
-                } else {
-                    self.caret = (self.caret + 1).min(self.text.chars().count());
-                    self.selection = None;
-                }
-                true
-            }
-            "home" => {
-                if event.keystroke.modifiers.shift {
-                    self.selection = Some(0..self.caret);
-                } else {
-                    self.selection = None;
-                }
-                self.caret = 0;
-                true
-            }
-            "end" => {
-                let last = self.text.chars().count();
-                if event.keystroke.modifiers.shift {
-                    self.selection = Some(self.caret..last);
-                } else {
-                    self.selection = None;
-                }
-                self.caret = last;
-                true
-            }
-            "backspace" => {
-                self.backspace();
-                true
-            }
-            "delete" => {
-                self.delete_forward();
-                true
-            }
-            "enter" => {
-                if self.multiline && event.keystroke.modifiers.shift {
-                    // Shift+Enter inserts a literal newline in multi-line fields.
-                    self.insert("\n");
-                } else {
-                    // Plain Enter submits (both single- and multi-line). For a
-                    // multi-line field, IME-style newline insertion isn't
-                    // supported via Enter to keep "send" a single key.
-                    cx.emit(Submit);
-                }
-                true
-            }
-            // Select all.
-            "a" if ctrl => {
-                let last = self.text.chars().count();
-                self.selection = Some(0..last);
-                self.caret = last;
-                true
-            }
-            // Copy.
-            "c" if ctrl => {
-                if let Some(r) = self.selection_range() {
-                    let start = self.char_to_byte(r.start);
-                    let end = self.char_to_byte(r.end);
-                    if let Some(slice) = self.text.get(start..end) {
-                        cx.write_to_clipboard(ClipboardItem::new_string(slice.to_string()));
-                    }
-                }
-                true
-            }
-            // Cut.
-            "x" if ctrl => {
-                if let Some(r) = self.selection_range() {
-                    let start = self.char_to_byte(r.start);
-                    let end = self.char_to_byte(r.end);
-                    if let Some(slice) = self.text.get(start..end) {
-                        cx.write_to_clipboard(ClipboardItem::new_string(slice.to_string()));
-                    }
-                    self.selection = Some(r);
-                    self.delete_selection();
-                }
-                true
-            }
-            // Paste.
-            "v" if ctrl => {
-                if let Some(item) = cx.read_from_clipboard() {
-                    if let Some(text) = item.text() {
-                        self.insert(&text);
-                    }
-                }
-                true
-            }
-            _ => false,
-        };
-        if handled {
-            cx.stop_propagation();
-        }
-        cx.notify();
-    }
-}
-
-impl EntityInputHandler for TextField {
-    fn text_for_range(
-        &mut self,
-        range: Range<usize>,
-        _adjusted: &mut Option<Range<usize>>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<String> {
-        let start = utf16_to_utf8(&self.text, range.start);
-        let end = utf16_to_utf8(&self.text, range.end);
-        self.text.get(start..end).map(str::to_string)
-    }
-
-    fn selected_text_range(
-        &mut self,
-        _ignore: bool,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<UTF16Selection> {
-        let utf16 = utf8_to_utf16(&self.text, self.char_to_byte(self.caret));
-        Some(UTF16Selection {
-            range: utf16..utf16,
-            reversed: false,
-        })
-    }
-
-    fn marked_text_range(&self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<Range<usize>> {
-        self.marked.clone().map(|r| {
-            utf8_to_utf16(&self.text, self.char_to_byte(r.start))
-                ..utf8_to_utf16(&self.text, self.char_to_byte(r.end))
-        })
-    }
-
-    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.marked = None;
-        cx.notify();
-    }
-
-    fn replace_text_in_range(
-        &mut self,
-        range: Option<Range<usize>>,
-        text: &str,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let char_range = match range {
-            Some(r) => {
-                let start = self.byte_to_char(utf16_to_utf8(&self.text, r.start));
-                let end = self.byte_to_char(utf16_to_utf8(&self.text, r.end));
-                start..end
-            }
-            // When IME commits a composition it passes None: replace the
-            // current marked (composition) region, not insert at the caret.
-            // Otherwise the marked pinyin would remain alongside the committed
-            // candidate (https://github.com/...).
-            None => self.marked.clone().unwrap_or_else(|| match self.selection_range() {
-                Some(s) => s,
-                None => self.caret..self.caret,
-            }),
-        };
-        // Delete the target range, then insert at its start.
-        let start_byte = self.char_to_byte(char_range.start);
-        let end_byte = self.char_to_byte(char_range.end);
-        self.text.replace_range(start_byte..end_byte, text);
-        self.caret = char_range.start + text.chars().count();
-        self.selection = None;
-        self.marked = None;
-        cx.notify();
-    }
-
-    fn replace_and_mark_text_in_range(
-        &mut self,
-        range: Option<Range<usize>>,
-        new_text: &str,
-        _new_selected: Option<Range<usize>>,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let char_range = match range {
-            Some(r) => {
-                let start = self.byte_to_char(utf16_to_utf8(&self.text, r.start));
-                let end = self.byte_to_char(utf16_to_utf8(&self.text, r.end));
-                start..end
-            }
-            // When IME updates a composition it passes None: replace the
-            // previous marked region with the new composition string.
-            None => self.marked.clone().unwrap_or_else(|| match self.selection_range() {
-                Some(s) => s,
-                None => self.caret..self.caret,
-            }),
-        };
-        let start_byte = self.char_to_byte(char_range.start);
-        let end_byte = self.char_to_byte(char_range.end);
-        self.text.replace_range(start_byte..end_byte, new_text);
-        let mark_start = char_range.start;
-        let mark_end = mark_start + new_text.chars().count();
-        self.marked = Some(mark_start..mark_end);
-        self.caret = mark_end;
-        self.selection = None;
-        cx.notify();
-    }
-
-    fn bounds_for_range(
-        &mut self,
-        _range: Range<usize>,
-        element_bounds: Bounds<Pixels>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<Bounds<Pixels>> {
-        // IME popup anchors near the field; precise caret x would require
-        // re-shaping here, the field is single-line so the field's own
-        // bounds are a reasonable anchor.
-        Some(element_bounds)
-    }
-
-    fn character_index_for_point(
-        &mut self,
-        _point: Point<Pixels>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<usize> {
-        // Click-to-caret is handled by focusing; fine-grained mapping is
-        // unnecessary for a single-line field.
-        Some(utf8_to_utf16(&self.text, self.char_to_byte(self.caret)))
-    }
-}
-
-impl Render for TextField {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let entity = cx.entity();
-        let focus = self.focus_handle.clone();
-        let display = self.display_text();
-        let placeholder = self.placeholder;
-        let multiline = self.multiline;
-        let font_size = px(13.0);
-        let line_height = font_size * 1.4;
-        let caret_byte = if self.masked {
-            "•".len() * self.caret
-        } else {
-            self.char_to_byte(self.caret)
-        };
-        let focused = self.focus_handle.is_focused(window);
-        // Selection byte offsets for the (possibly masked) display text.
-        let sel_bytes = self.selection_range().map(|r| {
-            let s = if self.masked {
-                "•".len() * r.start
-            } else {
-                self.char_to_byte(r.start)
-            };
-            let e = if self.masked {
-                "•".len() * r.end
-            } else {
-                self.char_to_byte(r.end)
-            };
-            s..e
-        });
-
-        let field = canvas(
-            move |bounds, window, _cx| {
-                let is_empty = display.is_empty();
-                let color = if is_empty {
-                    hsla(0., 0., 0.55, 1.)
-                } else {
-                    hsla(0., 0., 0.13, 1.)
-                };
-                let text: SharedString = if is_empty {
-                    placeholder.into()
-                } else {
-                    display.clone().into()
-                };
-
-                if !multiline {
-                    // --- single line (settings fields): unchanged behavior ---
-                    let len = text.len();
-                    let line = window.text_system().shape_line(
-                        text,
-                        font_size,
-                        &[TextRun {
-                            len,
-                            font: gpui::font(".SystemUIFont"),
-                            color,
-                            background_color: None,
-                            underline: None,
-                            strikethrough: None,
-                        }],
-                        None,
-                    );
-                    let caret_x = if is_empty {
-                        px(0.0)
-                    } else {
-                        line.x_for_index(caret_byte)
-                    };
-                    let sel_rect = sel_bytes.clone().map(|r| {
-                        let x0 = line.x_for_index(r.start);
-                        let x1 = line.x_for_index(r.end);
-                        (x0.min(x1), (x1 - x0).abs())
-                    });
-                    FieldLayout::Single {
-                        line,
-                        caret_x,
-                        sel_rect,
-                    }
-                } else {
-                    // --- multi line (chat input): shape each \n-separated line,
-                    //     soft-wrapping long lines at the available width. ---
-                    let inner_w = bounds.size.width - px(16.0); // minus L/R padding
-                    let wrap_px = inner_w.max(px(8.0));
-                    // Split into paragraphs by '\n', then wrap each paragraph.
-                    let mut rows: Vec<RowLayout> = Vec::new();
-                    let mut byte_offset = 0usize;
-                    for para in text.split('\n') {
-                        for seg in wrap_paragraph(para, wrap_px, font_size, color, window) {
-                            let line = window.text_system().shape_line(
-                                if seg.is_empty() { " ".into() } else { seg.clone().into() },
-                                font_size,
-                                &[TextRun {
-                                    len: if seg.is_empty() { 1 } else { seg.len() },
-                                    font: gpui::font(".SystemUIFont"),
-                                    color,
-                                    background_color: None,
-                                    underline: None,
-                                    strikethrough: None,
-                                }],
-                                None,
-                            );
-                            let line = if seg.is_empty() {
-                                line.with_len(0)
-                            } else {
-                                line
-                            };
-                            let row_byte_start = byte_offset;
-                            let row_byte_end = byte_offset + seg.len();
-                            rows.push(RowLayout {
-                                line,
-                                byte_start: row_byte_start,
-                                byte_end: row_byte_end,
-                            });
-                            byte_offset += seg.len();
-                        }
-                        byte_offset += 1; // the '\n'
-                    }
-                    if rows.is_empty() {
-                        // empty text: one zero-width row so the caret renders
-                        let line = window.text_system().shape_line(
-                            " ".into(),
-                            font_size,
-                            &[TextRun {
-                                len: 1,
-                                font: gpui::font(".SystemUIFont"),
-                                color,
-                                background_color: None,
-                                underline: None,
-                                strikethrough: None,
-                            }],
-                            None,
-                        );
-                        rows.push(RowLayout {
-                            line: line.with_len(0),
-                            byte_start: 0,
-                            byte_end: 0,
-                        });
-                    }
-                    // Locate the caret's row and x within it.
-                    let caret_row = rows
-                        .iter()
-                        .position(|r| caret_byte <= r.byte_end)
-                        .unwrap_or(rows.len() - 1);
-                    let row = &rows[caret_row];
-                    let caret_x = if is_empty {
-                        px(0.0)
-                    } else {
-                        let local = caret_byte.saturating_sub(row.byte_start);
-                        row.line.x_for_index(local)
-                    };
-                    // Selection: build per-row highlight rects.
-                    let mut sel_rows: Vec<(usize, Pixels, Pixels)> = Vec::new();
-                    if let Some(r) = sel_bytes.clone() {
-                        let (s, e) = (r.start.min(r.end), r.start.max(r.end));
-                        for (i, row) in rows.iter().enumerate() {
-                            if s >= row.byte_end || e <= row.byte_start {
-                                continue;
-                            }
-                            let xs = row.line.x_for_index(s.saturating_sub(row.byte_start));
-                            let xe = row.line.x_for_index(e.saturating_sub(row.byte_start).min(row.byte_end - row.byte_start));
-                            sel_rows.push((i, xs.min(xe), (xe - xs).abs()));
-                        }
-                    }
-                    FieldLayout::Multi {
-                        rows,
-                        caret_row,
-                        caret_x,
-                        sel_rows,
-                        line_height,
-                    }
-                }
-            },
-            move |bounds, layout, window, cx| {
-                window.handle_input(&focus, ElementInputHandler::new(bounds, entity.clone()), cx);
-                let origin = point(bounds.origin.x + px(8.0), bounds.origin.y + px(6.0));
-                match layout {
-                    FieldLayout::Single {
-                        line,
-                        caret_x,
-                        sel_rect,
-                    } => {
-                        if let Some((sel_x, sel_w)) = sel_rect {
-                            window.paint_quad(fill(
-                                Bounds {
-                                    origin: point(origin.x + sel_x, bounds.origin.y + px(6.0)),
-                                    size: size(sel_w, bounds.size.height - px(12.0)),
-                                },
-                                hsla(0.58, 1.0, 0.78, 1.0),
-                            ));
-                        }
-                        let _ = line.paint(origin, bounds.size.height, window, cx);
-                        if focused {
-                            window.paint_quad(fill(
-                                Bounds {
-                                    origin: point(origin.x + caret_x, bounds.origin.y + px(6.0)),
-                                    size: size(px(1.0), bounds.size.height - px(12.0)),
-                                },
-                                hsla(0., 0., 0.13, 1.),
-                            ));
-                        }
-                    }
-                    FieldLayout::Multi {
-                        rows,
-                        caret_row,
-                        caret_x,
-                        sel_rows,
-                        line_height,
-                    } => {
-                        // Selection backgrounds (per row).
-                        for (i, x, w) in &sel_rows {
-                            let y = origin.y + *i as f32 * line_height;
-                            window.paint_quad(fill(
-                                Bounds {
-                                    origin: point(origin.x + *x, y),
-                                    size: size(*w, line_height),
-                                },
-                                hsla(0.58, 1.0, 0.78, 1.0),
-                            ));
-                        }
-                        for (i, row) in rows.iter().enumerate() {
-                            let y = origin.y + i as f32 * line_height;
-                            let _ = row.line.paint(point(origin.x, y), line_height, window, cx);
-                        }
-                        if focused {
-                            let y = origin.y + caret_row as f32 * line_height;
-                            window.paint_quad(fill(
-                                Bounds {
-                                    origin: point(origin.x + caret_x, y),
-                                    size: size(px(1.0), line_height),
-                                },
-                                hsla(0., 0., 0.13, 1.),
-                            ));
-                        }
-                    }
-                }
-            },
-        );
-
-        // Size the canvas: single-line fills its fixed-height box; multi-line
-        // sizes to its full content height so a scrolling container can scroll
-        // through all lines (size_full would clip overflow and break scroll).
-        let field = if multiline {
-            let content_h = line_height * self.line_count() as f32 + px(2.0);
-            field.w_full().h(content_h)
-        } else {
-            field.size_full()
-        };
-
-        let container = div()
-            .key_context("TextInput")
-            .track_focus(&self.focus_handle)
-            .w_full()
-            .cursor_text()
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
-                this.focus_handle.focus(window);
-                cx.stop_propagation();
-                cx.notify();
-            }))
-            .on_key_down(cx.listener(Self::on_key));
-
-        // The two branches differ in type (`.id` -> Stateful<Div>), so unify
-        // them as AnyElement. The multi-line input grows with its content: the
-        // height is computed from the current line count (min 3, max 8 lines),
-        // and once content exceeds 8 lines the box scrolls internally. This
-        // guarantees the last line is never clipped by the toolbar, because the
-        // box is always tall enough for its content (or capped + scrolling).
-        if multiline {
-            const MIN_LINES: usize = 3;
-            const MAX_LINES: usize = 8;
-            let lines = self.line_count().clamp(MIN_LINES, MAX_LINES);
-            let h = line_height * lines as f32 + px(12.0); // +vertical padding
-            container
-                .id("chat-input")
-                .h(h)
-                .overflow_y_scroll()
-                .px(px(8.0))
-                .pt(px(6.0))
-                .pb(px(6.0))
-                .child(field)
-                .into_any_element()
-        } else {
-            container
-                .h_8()
-                .bg(rgb(0xffffff))
-                .border_1()
-                .border_color(rgb(0xd6d4d0))
-                .rounded_md()
-                .child(field)
-                .into_any_element()
-        }
-    }
-}
-
-/// Pre-rendered geometry for one display row of a multi-line field.
-struct RowLayout {
-    line: ShapedLine,
-    /// Byte range of this row within the full display text (excl. newline).
-    byte_start: usize,
-    byte_end: usize,
-}
-
-/// Distinguishes single- vs multi-line layout produced by the canvas prep
-/// closure, so the paint closure knows how to render.
-enum FieldLayout {
-    Single {
-        line: ShapedLine,
-        caret_x: Pixels,
-        sel_rect: Option<(Pixels, Pixels)>,
-    },
-    Multi {
-        rows: Vec<RowLayout>,
-        caret_row: usize,
-        caret_x: Pixels,
-        sel_rows: Vec<(usize, Pixels, Pixels)>,
-        line_height: Pixels,
-    },
-}
-
-/// Split a paragraph (no newlines) into wrap segments that each fit `wrap_px`,
-/// breaking on spaces when possible. Mirrors render::wrap_segment but returns
-/// owned strings and works on a SharedString-less input.
-fn wrap_paragraph(
-    s: &str,
-    wrap_px: Pixels,
-    font_size: Pixels,
-    color: Hsla,
-    window: &Window,
-) -> Vec<String> {
-    if wrap_px <= px(0.0) || s.is_empty() {
-        return vec![s.to_string()];
-    }
-    let shape = |t: &str| -> Pixels {
-        window
-            .text_system()
-            .shape_line(
-                t.to_string().into(),
-                font_size,
-                &[TextRun {
-                    len: t.len(),
-                    font: gpui::font(".SystemUIFont"),
-                    color,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                }],
-                None,
-            )
-            .width
-    };
-    let chars: Vec<(usize, char)> = s.char_indices().collect();
-    let mut out = Vec::new();
-    let mut start = 0usize;
-    let mut last_space = None;
-    for &(byte_off, ch) in &chars {
-        let candidate = &s[start..byte_off + ch.len_utf8()];
-        if shape(candidate) > wrap_px && byte_off > start {
-            let break_at = last_space.unwrap_or(byte_off);
-            out.push(s[start..break_at].to_string());
-            start = break_at;
-            if s[start..].starts_with(' ') {
-                start += 1;
-            }
-            last_space = None;
-        }
-        if ch == ' ' {
-            last_space = Some(byte_off + 1);
-        }
-    }
-    if start < s.len() {
-        out.push(s[start..].to_string());
-    }
-    if out.is_empty() {
-        out.push(String::new());
-    }
-    out
-}
 
 // ---------------------------------------------------------------------
 // AiPanel
 // ---------------------------------------------------------------------
 
+
 struct StreamingState {
     buffer: String,
     cancel: Arc<AtomicBool>,
-    /// Most recent tool the model called, shown as a live "drawing…" hint.
-    last_tool: Option<String>,
+    /// Accumulated reasoning/thinking text (shown in a collapsible panel).
+    reasoning: String,
+    /// True while the model is actively emitting reasoning deltas. The
+    /// reasoning panel is expanded while this is true, auto-collapsed on Done.
+    reasoning_active: bool,
+    /// Ordered list of tool names the model has called so far, shown as steps.
+    tool_calls: Vec<String>,
     _task: Task<()>,
 }
 
@@ -853,13 +55,24 @@ pub struct AiPanel {
     messages: Vec<ChatMessage>,
     streaming: Option<StreamingState>,
     error: Option<String>,
-    input: Entity<TextField>,
-    base_url_field: Entity<TextField>,
-    api_key_field: Entity<TextField>,
-    model_field: Entity<TextField>,
+    /// Multi-line chat input (auto-grow 3..8 lines).
+    input: Entity<InputState>,
+    /// Settings fields.
+    base_url_input: Entity<InputState>,
+    api_key_input: Entity<InputState>,
+    model_input: Entity<InputState>,
     notice: Option<String>,
     /// Current reasoning-effort selection, mirrored to settings on send.
     reasoning: ReasoningLevel,
+    /// When true, the chat input is cleared at the next render (InputState's
+    /// set_value needs a Window, which is only available in render / event
+    /// handlers that receive one).
+    pending_clear_input: bool,
+    /// User override for the reasoning panel: Some(true/false) = force
+    /// expand/collapse; None = auto (expand while streaming, collapse after).
+    reasoning_user_open: Option<bool>,
+    /// Scroll handle for the messages area, used to auto-scroll to bottom.
+    messages_scroll: ScrollHandle,
     /// Current panel width in px. User-resizable via the left edge handle.
     width: f32,
     _subscriptions: Vec<Subscription>,
@@ -886,21 +99,42 @@ impl Render for ResizeDrag {
 }
 
 impl AiPanel {
-    pub fn new(board: WeakEntity<BoardView>, cx: &mut Context<Self>) -> Self {
+    pub fn new(board: WeakEntity<BoardView>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let settings = AiSettings::load();
 
-        let input = cx.new(|cx| TextField::new_multiline("给 AI 发送消息…", cx));
-        let base_url_field = cx.new(|cx| TextField::new("https://api.openai.com/v1", false, cx));
-        let api_key_field = cx.new(|cx| TextField::new("sk-...", true, cx));
-        let model_field = cx.new(|cx| TextField::new("gpt-4o-mini", false, cx));
-
-        base_url_field.update(cx, |f, cx| f.set_text(settings.base_url.clone(), cx));
-        api_key_field.update(cx, |f, cx| f.set_text(settings.api_key.clone(), cx));
-        model_field.update(cx, |f, cx| f.set_text(settings.model.clone(), cx));
+        // Chat input: multi-line, auto-grow 3..8 lines.
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("给 AI 发送消息…")
+                .multi_line(true)
+                .auto_grow(3, 8)
+        });
+        // Settings inputs: single-line.
+        let base_url_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("https://api.openai.com/v1")
+                .default_value(settings.base_url.clone())
+        });
+        let api_key_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("sk-...")
+                .masked(true)
+                .default_value(settings.api_key.clone())
+        });
+        let model_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("gpt-4o-mini")
+                .default_value(settings.model.clone())
+        });
 
         let mut subscriptions = Vec::new();
-        subscriptions.push(cx.subscribe(&input, |this, _, _: &Submit, cx| {
-            this.send_message(cx);
+        // Enter (without Shift) in the chat input sends the message.
+        subscriptions.push(cx.subscribe(&input, |this, _entity, event: &InputEvent, cx| {
+            if let InputEvent::PressEnter { secondary } = event {
+                if !secondary {
+                    this.send_message(cx);
+                }
+            }
         }));
 
         // Load stored sessions; resume the most recent one if any, else start a
@@ -927,10 +161,13 @@ impl AiPanel {
             streaming: None,
             error: None,
             input,
-            base_url_field,
-            api_key_field,
-            model_field,
+            base_url_input,
+            api_key_input,
+            model_input,
             notice: None,
+            pending_clear_input: false,
+            reasoning_user_open: None,
+            messages_scroll: ScrollHandle::new(),
             width: DEFAULT_WIDTH,
             _subscriptions: subscriptions,
         }
@@ -942,9 +179,9 @@ impl AiPanel {
     }
 
     fn save_settings(&mut self, cx: &mut Context<Self>) {
-        let base_url = self.base_url_field.read(cx).text();
-        let api_key = self.api_key_field.read(cx).text();
-        let model = self.model_field.read(cx).text();
+        let base_url = self.base_url_input.read(cx).value().to_string();
+        let api_key = self.api_key_input.read(cx).value().to_string();
+        let model = self.model_input.read(cx).value().to_string();
         self.settings = AiSettings {
             base_url: if base_url.trim().is_empty() {
                 AiSettings::default().base_url
@@ -985,14 +222,16 @@ impl AiPanel {
         if self.streaming.is_some() {
             return;
         }
-        let text = self.input.read(cx).text();
+        let text = self.input.read(cx).value().to_string();
         let text = text.trim().to_string();
         if text.is_empty() {
             return;
         }
         // Keep settings' reasoning level in sync with the toolbar selection.
         self.settings.reasoning_effort = self.reasoning;
-        self.input.update(cx, |f, cx| f.clear(cx));
+        // Defer clearing the input: InputState::set_value needs a Window,
+        // which subscribe callbacks don't have. The flag is consumed in render.
+        self.pending_clear_input = true;
         self.error = None;
         let msg = ChatMessage::user(text);
         self.persist(&msg);
@@ -1069,7 +308,7 @@ impl AiPanel {
     /// spawned task, applying ops to the board on the main thread.
     fn start_agent(&mut self, cx: &mut Context<Self>) {
         let prompt = match self.messages.last() {
-            Some(ChatMessage { role, content }) if role == "user" => content.clone(),
+            Some(ChatMessage { role, content, .. }) if role == "user" => content.clone(),
             _ => return,
         };
         // Recent history excluding the just-added prompt (the agent takes the
@@ -1097,6 +336,9 @@ impl AiPanel {
     }
 
     fn start_stream_task(&mut self, request: AgentRequest, cx: &mut Context<Self>) {
+        // Reset the user's reasoning-panel toggle so it auto-expands on the
+        // new stream's reasoning, regardless of what they did last time.
+        self.reasoning_user_open = None;
         let mut events = request.events;
         let cancel = request.cancel;
         let board = self.board.clone();
@@ -1109,7 +351,17 @@ impl AiPanel {
                     .update(cx, |panel, cx| match event {
                         AgentEvent::Delta(text) => {
                             if let Some(s) = panel.streaming.as_mut() {
+                                // Text arrives after reasoning ends; mark reasoning done.
+                                s.reasoning_active = false;
                                 s.buffer.push_str(&text);
+                            }
+                            cx.notify();
+                            true
+                        }
+                        AgentEvent::Reasoning(text) => {
+                            if let Some(s) = panel.streaming.as_mut() {
+                                s.reasoning_active = true;
+                                s.reasoning.push_str(&text);
                             }
                             cx.notify();
                             true
@@ -1124,7 +376,8 @@ impl AiPanel {
                         }
                         AgentEvent::ToolCall(name) => {
                             if let Some(s) = panel.streaming.as_mut() {
-                                s.last_tool = Some(name);
+                                s.reasoning_active = false;
+                                s.tool_calls.push(name);
                             }
                             cx.notify();
                             true
@@ -1141,6 +394,13 @@ impl AiPanel {
                         }
                     })
                     .unwrap_or(false);
+                // Auto-scroll the messages area to show the latest content,
+                // whether streaming or just finished. scroll_to_bottom sets a
+                // flag that GPUI consumes during the next paint.
+                this.update(cx, |panel, _cx| {
+                    panel.messages_scroll.scroll_to_bottom();
+                })
+                .ok();
                 if !keep_going {
                     break;
                 }
@@ -1149,7 +409,9 @@ impl AiPanel {
         self.streaming = Some(StreamingState {
             buffer: String::new(),
             cancel,
-            last_tool: None,
+            reasoning: String::new(),
+            reasoning_active: false,
+            tool_calls: Vec::new(),
             _task: task,
         });
     }
@@ -1164,7 +426,15 @@ impl AiPanel {
                 final_text
             };
             if !text.trim().is_empty() {
-                let msg = ChatMessage::assistant(text);
+                let mut msg = ChatMessage::assistant(text);
+                // Preserve the reasoning and tool calls so they survive after
+                // streaming — the user can re-expand the thinking panel.
+                if !s.reasoning.is_empty() {
+                    msg.reasoning = Some(s.reasoning);
+                }
+                if !s.tool_calls.is_empty() {
+                    msg.tool_calls = s.tool_calls;
+                }
                 self.persist(&msg);
                 self.messages.push(msg);
             }
@@ -1196,7 +466,16 @@ impl AiPanel {
 }
 
 impl Render for AiPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Consume the deferred input-clear flag. send_message (called from a
+        // subscribe callback that has no Window) sets it; here we have a Window
+        // so InputState::set_value can run. Clear the flag first to avoid
+        // re-entrancy.
+        if self.pending_clear_input {
+            self.pending_clear_input = false;
+            self.input
+                .update(cx, |s, cx| s.set_value("", window, cx));
+        }
         let streaming = self.streaming.is_some();
 
         // ---- header ----
@@ -1259,9 +538,9 @@ impl Render for AiPanel {
                 .py_2()
                 .border_b_1()
                 .border_color(rgb(0xeeeeec))
-                .child(field_row("Base URL", self.base_url_field.clone()))
-                .child(field_row("API Key", self.api_key_field.clone()))
-                .child(field_row("模型", self.model_field.clone()))
+                .child(field_row("Base URL", self.base_url_input.clone()))
+                .child(field_row("API Key", self.api_key_input.clone()))
+                .child(field_row("模型", self.model_input.clone()))
                 .child(
                     div()
                         .flex()
@@ -1381,7 +660,7 @@ impl Render for AiPanel {
         };
 
         // ---- messages ----
-        let mut messages = div().flex().flex_col().gap_2().p_3();
+        let mut messages = div().flex().flex_col().gap_2().p_3().w_full();
         if self.messages.is_empty() && !streaming {
             messages = messages.child(
                 div()
@@ -1394,28 +673,118 @@ impl Render for AiPanel {
             messages = messages.child(self.render_message(idx, msg, cx));
         }
         if let Some(s) = &self.streaming {
-            // Live "drawing…" status bubble. Show it whenever a tool is active,
-            // even before text streams back, so the user sees the agent working.
-            if let Some(tool) = &s.last_tool {
-                let label = tool_label(tool);
-                let status = div()
+            // A single agent step bubble that evolves as the stream progresses:
+            // "思考中…" → reasoning panel → tool calls → text response. It's
+            // always rendered (no separate "thinking" bubble) so the transition
+            // feels continuous.
+            let mut step = div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .w_full()
+                .px_3()
+                .py_2()
+                .bg(rgb(0xffffff))
+                .border_1()
+                .border_color(rgb(0xe9e8e5))
+                .rounded_lg();
+
+            // While no content has arrived yet, show a compact "thinking…"
+            // line inside the same bubble.
+            let has_content =
+                !s.reasoning.is_empty() || !s.tool_calls.is_empty() || !s.buffer.is_empty();
+            if !has_content {
+                step = step.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x999999))
+                        .child("思考中…"),
+                );
+            }
+
+            // Reasoning / thinking panel: auto-expanded while streaming
+            // (reasoning_active), auto-collapsed after. The user can manually
+            // toggle it at any time — their choice takes priority until the
+            // next stream starts. Capped height so it can't fill the area.
+            if !s.reasoning.is_empty() {
+                // Determine open state: user override wins, else auto (active).
+                let reasoning_open = self.reasoning_user_open.unwrap_or(s.reasoning_active);
+                let reasoning_text = s.reasoning.clone();
+                // Clickable header.
+                let header = div()
+                    .id("reasoning-toggle")
                     .flex()
                     .flex_row()
                     .gap_1()
+                    .items_center()
                     .text_xs()
-                    .text_color(rgb(0x1a5fd7))
-                    .child(div().child("✏️"))
-                    .child(div().child(format!("正在绘制{label}…")));
-                messages = messages.child(status);
+                    .text_color(rgb(0x888888))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(0xf5f5f5)).rounded_md())
+                    .child(div().child(if reasoning_open { "▾" } else { "▸" }))
+                    .child(div().child("思考过程"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.reasoning_user_open =
+                            Some(!this.reasoning_user_open.unwrap_or(false));
+                        cx.notify();
+                    }));
+                step = step.child(header);
+                if reasoning_open {
+                    step = step.child(
+                        div()
+                            .id("reasoning-scroll")
+                            .max_h(px(200.0))
+                            .overflow_y_scroll()
+                            .text_xs()
+                            .text_color(rgb(0x666666))
+                            .py_1()
+                            .child(reasoning_text),
+                    );
+                }
             }
-            let mut body = s.buffer.clone();
-            body.push('▍');
-            messages = messages.child(message_bubble("assistant", body, None));
+
+            // Tool call steps: show each as a labeled tag with a check icon.
+            if !s.tool_calls.is_empty() {
+                let mut tools = div().flex().flex_col().gap_1();
+                for name in &s.tool_calls {
+                    let label = tool_label(name);
+                    tools = tools.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_1()
+                            .items_center()
+                            .text_xs()
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_md()
+                                    .bg(rgb(0xdce8ff))
+                                    .text_color(rgb(0x1a5fd7))
+                                    .child(format!("✏️ {label}")),
+                            )
+                            .child(div().text_color(rgb(0x2f9e44)).child("✓")),
+                    );
+                }
+                step = step.child(tools);
+            }
+
+            // Text response (streaming, with cursor).
+            if !s.buffer.is_empty() {
+                let mut body = s.buffer.clone();
+                body.push('▍');
+                step = step.child(div().text_sm().child(body));
+            }
+
+            messages = messages.child(step);
         }
         let messages_area = div()
             .id("ai-messages")
             .flex_1()
+            .min_w_0()
             .overflow_y_scroll()
+            .track_scroll(&self.messages_scroll)
             .child(messages);
 
         // ---- error bar ----
@@ -1432,9 +801,9 @@ impl Render for AiPanel {
         };
 
         // ---- input area ----
-        // A single bordered box containing the multi-line input (which grows to
-        // fill) and a bottom toolbar row that sits visually *inside* the input
-        // box. The send button is an icon.
+        // A single bordered box containing the multi-line Input (auto-grows) and
+        // a bottom toolbar row inside the box. The send button is an icon via
+        // gpui-component's Button.
         let streaming_now = streaming;
         let model_name = self.settings.model.clone();
         let current_reasoning = self.reasoning;
@@ -1473,28 +842,11 @@ impl Render for AiPanel {
             )));
         }
 
-        // Send/stop icon button.
-        let send_icon_color = if streaming_now {
-            hsla(0., 0., 0.5, 1.)
-        } else {
-            hsla(0.58, 1.0, 0.45, 1.)
-        };
-        let send_btn = div()
-            .id("send-btn")
-            .w(px(24.0))
-            .h(px(24.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_md()
-            .cursor_pointer()
-            .hover(|s| s.bg(rgb(0xefeeec)))
-            .child(if streaming_now {
-                crate::icons::stop(send_icon_color).into_any_element()
-            } else {
-                crate::icons::send(send_icon_color).into_any_element()
-            })
-            .on_click(cx.listener(move |this, _, _, cx| {
+        // Send/stop icon button (gpui-component Button).
+        let send_btn = Button::new("send-btn")
+            .icon(if streaming_now { IconName::Close } else { IconName::ArrowUp })
+            .small()
+            .on_click(cx.listener(move |this, _, _window, cx| {
                 if streaming_now {
                     this.stop_streaming(cx);
                 } else {
@@ -1529,9 +881,8 @@ impl Render for AiPanel {
             .child(send_btn);
 
         // The input box: a single bordered container holding the multi-line
-        // input (which fills the space) and the toolbar pinned to the bottom
-        // *inside* the box. This is what makes the send button sit in the
-        // input's bottom-right corner.
+        // Input (which fills the space) and the toolbar pinned to the bottom
+        // *inside* the box.
         let input_area = div()
             .flex()
             .flex_col()
@@ -1542,7 +893,7 @@ impl Render for AiPanel {
             .border_1()
             .border_color(rgb(0xd6d4d0))
             .rounded_md()
-            .child(self.input.clone())
+            .child(Input::new(&self.input).appearance(false))
             .child(toolbar);
 
         // --- Resizable left edge ---
@@ -1641,6 +992,8 @@ impl AiPanel {
     ) -> impl IntoElement {
         let is_user = msg.role == "user";
         let content = msg.content.clone();
+        let reasoning = msg.reasoning.clone();
+        let tool_calls = msg.tool_calls.clone();
         let insert_button = if !is_user {
             let content = content.clone();
             Some(
@@ -1654,7 +1007,98 @@ impl AiPanel {
             None
         };
         let _ = idx;
-        message_bubble(&msg.role, content, insert_button)
+
+        // For assistant messages with reasoning/tool-calls, render them inside
+        // a step bubble (same style as the streaming step) so the thinking
+        // process and tools survive after streaming completes.
+        if !is_user && (reasoning.is_some() || !tool_calls.is_empty()) {
+            let mut step = div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .w_full()
+                .px_3()
+                .py_2()
+                .bg(rgb(0xffffff))
+                .border_1()
+                .border_color(rgb(0xe9e8e5))
+                .rounded_lg();
+
+            // Reasoning panel (collapsed by default after completion).
+            if let Some(reasoning_text) = reasoning {
+                let reasoning_open =
+                    self.reasoning_user_open.unwrap_or(false);
+                let header = div()
+                    .id("reasoning-toggle-done")
+                    .flex()
+                    .flex_row()
+                    .gap_1()
+                    .items_center()
+                    .text_xs()
+                    .text_color(rgb(0x888888))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(0xf5f5f5)).rounded_md())
+                    .child(div().child(if reasoning_open { "▾" } else { "▸" }))
+                    .child(div().child("思考过程"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.reasoning_user_open =
+                            Some(!this.reasoning_user_open.unwrap_or(false));
+                        cx.notify();
+                    }));
+                step = step.child(header);
+                if reasoning_open {
+                    step = step.child(
+                        div()
+                            .id("reasoning-scroll-done")
+                            .max_h(px(200.0))
+                            .overflow_y_scroll()
+                            .text_xs()
+                            .text_color(rgb(0x666666))
+                            .py_1()
+                            .child(reasoning_text),
+                    );
+                }
+            }
+
+            // Tool call tags.
+            if !tool_calls.is_empty() {
+                let mut tools = div().flex().flex_col().gap_1();
+                for name in &tool_calls {
+                    let label = tool_label(name);
+                    tools = tools.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_1()
+                            .items_center()
+                            .text_xs()
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_md()
+                                    .bg(rgb(0xdce8ff))
+                                    .text_color(rgb(0x1a5fd7))
+                                    .child(format!("✏️ {label}")),
+                            )
+                            .child(div().text_color(rgb(0x2f9e44)).child("✓")),
+                    );
+                }
+                step = step.child(tools);
+            }
+
+            // Text response.
+            step = step.child(div().text_sm().child(content));
+
+            let mut col = div().flex().flex_col().gap_1().items_start();
+            col = col.child(step);
+            if let Some(extra) = insert_button {
+                col = col.child(extra);
+            }
+            return col.into_any_element();
+        }
+
+        message_bubble(&msg.role, content, insert_button).into_any_element()
     }
 }
 
@@ -1664,15 +1108,35 @@ fn message_bubble(
     extra: Option<Stateful<Div>>,
 ) -> Div {
     let is_user = role == "user";
-    let bubble = div()
-        .px_3()
-        .py_2()
-        .rounded_lg()
-        .text_sm()
-        .child(content)
-        .when(is_user, |d| d.bg(rgb(0xdce8ff)))
-        .when(!is_user, |d| d.bg(rgb(0xffffff)).border_1().border_color(rgb(0xe9e8e5)));
+    // User bubbles size to their text width (max ~85% of panel) and align right;
+    // AI bubbles take full width so wrapped text aligns left cleanly.
+    let bubble = if is_user {
+        div()
+            .px_3()
+            .py_2()
+            .rounded_lg()
+            .text_sm()
+            .max_w(px(360.0))
+            .min_w_0()
+            .child(content)
+            .bg(rgb(0xdce8ff))
+    } else {
+        div()
+            .px_3()
+            .py_2()
+            .rounded_lg()
+            .text_sm()
+            .w_full()
+            .min_w_0()
+            .child(content)
+            .bg(rgb(0xffffff))
+            .border_1()
+            .border_color(rgb(0xe9e8e5))
+    };
     let mut col = div().flex().flex_col().gap_1();
+    // User messages: bubble aligns right (items_end prevents the default
+    // stretch that would force the bubble to full width). AI messages: bubble
+    // takes full width (items_start + w_full on the bubble).
     if is_user {
         col = col.items_end();
     } else {
@@ -1685,13 +1149,13 @@ fn message_bubble(
     col
 }
 
-fn field_row(label: &'static str, field: Entity<TextField>) -> Div {
+fn field_row(label: &'static str, field: Entity<InputState>) -> Div {
     div()
         .flex()
         .flex_col()
         .gap_1()
         .child(div().text_xs().text_color(rgb(0x777777)).child(label))
-        .child(field)
+        .child(Input::new(&field))
 }
 
 fn panel_button(label: &'static str, active: bool) -> Stateful<Div> {

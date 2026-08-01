@@ -25,6 +25,14 @@ futures = "0.3"
 futures-util = "0.3"
 dirs = "6"
 rfd = "0.15"
+# GPUI component library (Input, Button, etc.). The crates.io 0.5 release
+# depends on gpui ^0.2.2 - the same version this project uses - so no GPUI
+# source change is needed.
+gpui-component = "0.5"
+# Embedded SVG icon assets for gpui-component's IconName enum. The git tag
+# matches the crates.io release; the crate itself only depends on gpui's
+# AssetSource trait and embeds icons via rust_embed.
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", tag = "v0.5.1" }
 # rig drives the AI agent: an OpenAI-compatible client, multi-turn tool-calling
 # loop, and streaming. The `derive` feature pulls in `rig-derive` (and schemars)
 # so tool argument types can derive their JSON schema.

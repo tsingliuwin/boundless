@@ -79,9 +79,12 @@ pub struct AgentRequest {
 pub enum AgentEvent {
     /// A chunk of assistant text (streamed).
     Delta(String),
+    /// A chunk of reasoning/thinking text (streamed). Shown in a collapsible
+    /// panel that is expanded while streaming and auto-collapses on Done.
+    Reasoning(String),
     /// A canvas op produced by a tool call — apply it to the board.
     CanvasOp(CanvasOp),
-    /// The model made a tool call (by tool name); optional UI hint.
+    /// The model made a tool call (by tool name); shown as a step in the UI.
     ToolCall(String),
     /// Stream completed; `text` is the full final assistant message.
     Done { text: String },
@@ -219,6 +222,17 @@ fn handle_agent_item(
             StreamedAssistantContent::Text(text) => {
                 full_text.push_str(&text.text);
                 let _ = tx.unbounded_send(AgentEvent::Delta(text.text));
+            }
+            // Reasoning deltas: stream the thinking text to the UI.
+            StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
+                let _ = tx.unbounded_send(AgentEvent::Reasoning(reasoning));
+            }
+            // A complete reasoning block (some providers emit it at once).
+            StreamedAssistantContent::Reasoning(r) => {
+                let text = r.display_text();
+                if !text.is_empty() {
+                    let _ = tx.unbounded_send(AgentEvent::Reasoning(text));
+                }
             }
             // Tool calls are surfaced to the UI as hints; the actual canvas
             // effect arrives via the merged CanvasOp stream.

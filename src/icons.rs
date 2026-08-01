@@ -376,30 +376,4 @@ pub fn align_icon(c: Hsla, align: crate::scene::TextAlign) -> impl IntoElement {
     })
 }
 
-/// Send icon: a paper-plane / upward arrow inside a circle. Used for the chat
-/// input's send button.
-pub fn send(c: Hsla) -> impl IntoElement {
-    icon(c, |b| {
-        // Upward arrow (the "send" affordance).
-        b.mv(10.0, 4.0);
-        b.ln(5.0, 9.0);
-        b.ln(2.5, 9.0);
-        b.mv(10.0, 4.0);
-        b.ln(10.0, 16.0);
-        // Arrowhead.
-        b.mv(10.0, 4.0);
-        b.ln(15.0, 9.0);
-        b.ln(12.5, 9.0);
-    })
-}
-
-/// Stop icon: a filled square, used when a stream is in progress.
-pub fn stop(c: Hsla) -> impl IntoElement {
-    icon(c, |b| {
-        b.mv(6.0, 6.0);
-        b.ln(14.0, 6.0);
-        b.ln(14.0, 14.0);
-        b.ln(6.0, 14.0);
-        b.cp();
-    })
-}
+// Send/stop icons were moved to gpui-component's IconName enum (ArrowUp / Close).
