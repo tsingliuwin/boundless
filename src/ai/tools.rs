@@ -1,22 +1,28 @@
 //! rig `Tool` implementations that let the AI agent draw on the canvas.
 //!
-//! Each tool runs on the tokio runtime (rig executes tool calls there) but the
-//! canvas lives on the GPUI main thread. So a tool never touches the board
-//! directly: it sends a [`CanvasOp`] through a futures channel, and the AI panel
-//! drains that channel on the main thread to mutate the scene. `call()` returns
-//! a short confirmation string that the model sees as the tool result.
+//! **Design (mirrors lakemind):** each tool owns its full lifecycle. Inside
+//! `call()` it emits a three-phase event sequence through the shared event
+//! channel — `ToolCall` (open a pending step) → `CanvasOp` (apply the drawing)
+//! → `ToolResult` (mark the step done). rig's own tool-call / tool-result
+//! stream items are ignored on the agent side; the tool is the single source
+//! of truth for its lifecycle. The `call()` return value is a compact string
+//! fed back to the model ("已添加到画布"); the rich UI data (coordinates,
+//! colors…) flows via the `ToolCall` event's `args`.
 //!
-//! The `Tool` trait shape (verified against rig-core 0.38.2):
-//! `const NAME`, `type Args` (de+JsonSchema), `type Output` (Serialize),
-//! `definition(&self, prompt) -> ToolDefinition`, `call(&self, args) -> Output`.
+//! Tools run on the tokio runtime (rig executes them there); the canvas lives
+//! on the GPUI main thread. `AgentEvent::CanvasOp` is drained on the main
+//! thread to mutate the scene.
 
 use futures::channel::mpsc::UnboundedSender;
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
+use super::agent::{next_tool_id, AgentEvent};
 use super::canvas_ops::{CanvasOp, CanvasStyle, OpPoint, OpTextAlign};
+use super::client::ChatMessage;
 
 /// Shared error type for all drawing tools. Tools are infallible in practice
 /// (sending to an unbounded channel only fails if the receiver was dropped,
@@ -34,13 +40,39 @@ impl std::fmt::Display for ToolError {
 impl std::error::Error for ToolError {}
 
 // ---------------------------------------------------------------------------
-// A generic helper: each tool holds a sender and forwards a constructed op.
-// We implement `Tool` per-kind because rig dispatches by type, and `Args`
-// differs per shape (rect needs w/h, line needs points, text needs text…).
+// A generic helper: each tool holds an event sender and emits a three-phase
+// lifecycle (call → canvas-op → result) before returning the model-facing
+// string. This makes every tool call a clean, self-contained execution unit.
 // ---------------------------------------------------------------------------
 
+/// The compact string returned to the model for a successful draw.
+const TOOL_OK: &str = "已添加到画布";
+
+/// Emit the full tool-call lifecycle: open a pending step, apply the canvas
+/// op, then mark the step done. All three events share the same `id` so the
+/// UI can pair them. `args_json` is the re-serialized arguments the model
+/// supplied (kept for the UI's expandable detail view).
+fn emit_tool_step(
+    events: &UnboundedSender<AgentEvent>,
+    id: String,
+    name: &str,
+    args_json: Value,
+    op: CanvasOp,
+) {
+    let _ = events.unbounded_send(AgentEvent::ToolCall {
+        id: id.clone(),
+        name: name.to_string(),
+        args: args_json,
+    });
+    let _ = events.unbounded_send(AgentEvent::CanvasOp(op));
+    let _ = events.unbounded_send(AgentEvent::ToolResult {
+        id,
+        result: TOOL_OK.to_string(),
+    });
+}
+
 /// Arguments shared by the four box shapes (rectangle / ellipse / diamond).
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct BoxArgs {
     /// Top-left X in world coordinates.
     pub x: f64,
@@ -53,10 +85,15 @@ pub struct BoxArgs {
     /// Optional visual style. Omitted fields inherit the board's current style.
     #[serde(default)]
     pub style: CanvasStyle,
+    /// Optional text to draw inside the shape (e.g. "登录" inside an ellipse,
+    /// "是否为空?" inside a diamond). The text is centered and follows the
+    /// shape when moved. Omit for a shape without a label.
+    #[serde(default)]
+    pub text: Option<String>,
 }
 
 /// Arguments for line / arrow tools.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct PointsArgs {
     /// Two or more points the line/arrow passes through, in world coordinates,
     /// in order from start to end.
@@ -70,10 +107,14 @@ pub struct PointsArgs {
     /// Optional visual style.
     #[serde(default)]
     pub style: CanvasStyle,
+    /// Optional text label on the line/arrow (e.g. "是"/"否" on a flow arrow).
+    /// The label is centered on the line and follows it when moved.
+    #[serde(default)]
+    pub text: Option<String>,
 }
 
 /// Arguments for the text tool.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct TextArgs {
     /// Top-left X in world coordinates.
     pub x: f64,
@@ -96,13 +137,6 @@ fn default_true() -> bool {
     true
 }
 
-fn send_op(sender: &UnboundedSender<CanvasOp>, op: CanvasOp) -> Result<String, ToolError> {
-    sender
-        .unbounded_send(op)
-        .map_err(|_| ToolError("画布通道已关闭（请求已取消）".into()))?;
-    Ok("已添加到画布".to_string())
-}
-
 /// Build a `ToolDefinition` with the given name/description and a schema
 /// generated from the tool's `Args` type.
 fn tool_def<T: JsonSchema>(name: &str, description: &str) -> ToolDefinition {
@@ -117,7 +151,7 @@ fn tool_def<T: JsonSchema>(name: &str, description: &str) -> ToolDefinition {
 // --- Rectangle -------------------------------------------------------------
 
 pub struct RectangleTool {
-    pub sender: UnboundedSender<CanvasOp>,
+    pub events: UnboundedSender<AgentEvent>,
 }
 
 impl Tool for RectangleTool {
@@ -138,24 +172,25 @@ impl Tool for RectangleTool {
         &self,
         args: Self::Args,
     ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
-        let res = send_op(
-            &self.sender,
-            CanvasOp::Rectangle {
-                x: args.x,
-                y: args.y,
-                w: args.w,
-                h: args.h,
-                style: args.style,
-            },
-        );
-        async move { res }
+        let id = next_tool_id(Self::NAME);
+        let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
+        let op = CanvasOp::Rectangle {
+            x: args.x,
+            y: args.y,
+            w: args.w,
+            h: args.h,
+            style: args.style,
+            text: args.text,
+        };
+        emit_tool_step(&self.events, id, Self::NAME, args_json, op);
+        async move { Ok(TOOL_OK.to_string()) }
     }
 }
 
 // --- Ellipse ---------------------------------------------------------------
 
 pub struct EllipseTool {
-    pub sender: UnboundedSender<CanvasOp>,
+    pub events: UnboundedSender<AgentEvent>,
 }
 
 impl Tool for EllipseTool {
@@ -176,24 +211,25 @@ impl Tool for EllipseTool {
         &self,
         args: Self::Args,
     ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
-        let res = send_op(
-            &self.sender,
-            CanvasOp::Ellipse {
-                x: args.x,
-                y: args.y,
-                w: args.w,
-                h: args.h,
-                style: args.style,
-            },
-        );
-        async move { res }
+        let id = next_tool_id(Self::NAME);
+        let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
+        let op = CanvasOp::Ellipse {
+            x: args.x,
+            y: args.y,
+            w: args.w,
+            h: args.h,
+            style: args.style,
+            text: args.text,
+        };
+        emit_tool_step(&self.events, id, Self::NAME, args_json, op);
+        async move { Ok(TOOL_OK.to_string()) }
     }
 }
 
 // --- Diamond ---------------------------------------------------------------
 
 pub struct DiamondTool {
-    pub sender: UnboundedSender<CanvasOp>,
+    pub events: UnboundedSender<AgentEvent>,
 }
 
 impl Tool for DiamondTool {
@@ -214,24 +250,25 @@ impl Tool for DiamondTool {
         &self,
         args: Self::Args,
     ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
-        let res = send_op(
-            &self.sender,
-            CanvasOp::Diamond {
-                x: args.x,
-                y: args.y,
-                w: args.w,
-                h: args.h,
-                style: args.style,
-            },
-        );
-        async move { res }
+        let id = next_tool_id(Self::NAME);
+        let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
+        let op = CanvasOp::Diamond {
+            x: args.x,
+            y: args.y,
+            w: args.w,
+            h: args.h,
+            style: args.style,
+            text: args.text,
+        };
+        emit_tool_step(&self.events, id, Self::NAME, args_json, op);
+        async move { Ok(TOOL_OK.to_string()) }
     }
 }
 
 // --- Line ------------------------------------------------------------------
 
 pub struct LineTool {
-    pub sender: UnboundedSender<CanvasOp>,
+    pub events: UnboundedSender<AgentEvent>,
 }
 
 impl Tool for LineTool {
@@ -252,21 +289,22 @@ impl Tool for LineTool {
         &self,
         args: Self::Args,
     ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
-        let res = send_op(
-            &self.sender,
-            CanvasOp::Line {
-                points: args.points,
-                style: args.style,
-            },
-        );
-        async move { res }
+        let id = next_tool_id(Self::NAME);
+        let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
+        let op = CanvasOp::Line {
+            points: args.points,
+            style: args.style,
+            text: args.text,
+        };
+        emit_tool_step(&self.events, id, Self::NAME, args_json, op);
+        async move { Ok(TOOL_OK.to_string()) }
     }
 }
 
 // --- Arrow -----------------------------------------------------------------
 
 pub struct ArrowTool {
-    pub sender: UnboundedSender<CanvasOp>,
+    pub events: UnboundedSender<AgentEvent>,
 }
 
 impl Tool for ArrowTool {
@@ -287,23 +325,24 @@ impl Tool for ArrowTool {
         &self,
         args: Self::Args,
     ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
-        let res = send_op(
-            &self.sender,
-            CanvasOp::Arrow {
-                points: args.points,
-                start_arrowhead: args.start_arrowhead,
-                end_arrowhead: args.end_arrowhead,
-                style: args.style,
-            },
-        );
-        async move { res }
+        let id = next_tool_id(Self::NAME);
+        let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
+        let op = CanvasOp::Arrow {
+            points: args.points,
+            start_arrowhead: args.start_arrowhead,
+            end_arrowhead: args.end_arrowhead,
+            style: args.style,
+            text: args.text,
+        };
+        emit_tool_step(&self.events, id, Self::NAME, args_json, op);
+        async move { Ok(TOOL_OK.to_string()) }
     }
 }
 
 // --- Text ------------------------------------------------------------------
 
 pub struct TextTool {
-    pub sender: UnboundedSender<CanvasOp>,
+    pub events: UnboundedSender<AgentEvent>,
 }
 
 impl Tool for TextTool {
@@ -324,42 +363,48 @@ impl Tool for TextTool {
         &self,
         args: Self::Args,
     ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
-        let res = send_op(
-            &self.sender,
-            CanvasOp::Text {
-                x: args.x,
-                y: args.y,
-                text: args.text,
-                font_size: args.font_size,
-                align: args.align,
-                style: args.style,
-            },
-        );
-        async move { res }
+        let id = next_tool_id(Self::NAME);
+        let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
+        let op = CanvasOp::Text {
+            x: args.x,
+            y: args.y,
+            text: args.text,
+            font_size: args.font_size,
+            align: args.align,
+            style: args.style,
+        };
+        emit_tool_step(&self.events, id, Self::NAME, args_json, op);
+        async move { Ok(TOOL_OK.to_string()) }
     }
 }
 
-/// Build all drawing tools sharing one canvas-op channel. Registered onto the
-/// rig agent's toolset; each tool forwards its op through `sender`.
-pub fn all_tools(sender: UnboundedSender<CanvasOp>) -> Vec<Box<dyn rig_core::tool::ToolDyn>> {
-    // Each tool is coerced to `Box<dyn ToolDyn>` (the return type names the
-    // trait, so no import is needed here). `AgentBuilder::tools` accepts this.
+/// Build all drawing tools sharing one event channel. Each tool emits its
+/// own `ToolCall`/`CanvasOp`/`ToolResult` lifecycle through `events`; rig's
+/// internal tool-call stream items are ignored on the agent side.
+pub fn all_tools(
+    events: UnboundedSender<AgentEvent>,
+) -> Vec<Box<dyn rig_core::tool::ToolDyn>> {
     vec![
         Box::new(RectangleTool {
-            sender: sender.clone(),
+            events: events.clone(),
         }),
         Box::new(EllipseTool {
-            sender: sender.clone(),
+            events: events.clone(),
         }),
         Box::new(DiamondTool {
-            sender: sender.clone(),
+            events: events.clone(),
         }),
         Box::new(LineTool {
-            sender: sender.clone(),
+            events: events.clone(),
         }),
         Box::new(ArrowTool {
-            sender: sender.clone(),
+            events: events.clone(),
         }),
-        Box::new(TextTool { sender }),
+        Box::new(TextTool { events }),
     ]
 }
+
+// Keep the ChatMessage import referenced — it's part of the module's public
+// surface (re-exported via the agent) even if not directly used here.
+#[allow(dead_code)]
+fn _chat_message_referenced(_: &ChatMessage) {}

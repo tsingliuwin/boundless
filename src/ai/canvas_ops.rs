@@ -98,6 +98,9 @@ pub enum CanvasOp {
         h: f64,
         #[serde(default)]
         style: CanvasStyle,
+        /// Optional text label drawn inside the shape (bound label). Empty = no label.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
     },
     /// Ellipse inscribed in the given box.
     Ellipse {
@@ -107,6 +110,9 @@ pub enum CanvasOp {
         h: f64,
         #[serde(default)]
         style: CanvasStyle,
+        /// Optional text label drawn inside the shape (bound label). Empty = no label.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
     },
     /// Diamond inscribed in the given box.
     Diamond {
@@ -116,12 +122,18 @@ pub enum CanvasOp {
         h: f64,
         #[serde(default)]
         style: CanvasStyle,
+        /// Optional text label drawn inside the shape (bound label). Empty = no label.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
     },
     /// Polyline through the given absolute points.
     Line {
         points: Vec<OpPoint>,
         #[serde(default)]
         style: CanvasStyle,
+        /// Optional text label on the line (e.g. "是"/"否" on a flow arrow).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
     },
     /// Polyline with optional arrowheads.
     Arrow {
@@ -134,6 +146,9 @@ pub enum CanvasOp {
         end_arrowhead: bool,
         #[serde(default)]
         style: CanvasStyle,
+        /// Optional text label on the arrow (e.g. "是"/"否" on a flow arrow).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
     },
     /// Standalone text. `text` may contain newlines for multi-line.
     Text {
@@ -217,6 +232,7 @@ mod tests {
                 fill: Some(0xa5d8ff),
                 ..Default::default()
             },
+            text: Some("测试".to_string()),
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: CanvasOp = serde_json::from_str(&json).unwrap();

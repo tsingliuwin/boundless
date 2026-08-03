@@ -5,12 +5,14 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::collections::HashSet;
 
 use futures::StreamExt;
 use gpui::prelude::*;
 use gpui::*;
 use gpui_component::button::Button;
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::text::TextView;
 use gpui_component::IconName;
 use gpui_component::Sizable;
 
@@ -32,13 +34,14 @@ use super::store::{
 struct StreamingState {
     buffer: String,
     cancel: Arc<AtomicBool>,
-    /// Accumulated reasoning/thinking text (shown in a collapsible panel).
-    reasoning: String,
-    /// True while the model is actively emitting reasoning deltas. The
-    /// reasoning panel is expanded while this is true, auto-collapsed on Done.
+    /// Ordered reasoning/tool steps as the agent works, in execution order.
+    /// Reasoning deltas append to the last step iff it's already a Reasoning
+    /// step; a tool call always starts a fresh step. This keeps the
+    /// "think → tool → think → tool" loop visible.
+    steps: Vec<super::client::AssistantStep>,
+    /// True while the model is actively emitting reasoning deltas. The live
+    /// reasoning step is expanded while this is true, auto-collapsed on Done.
     reasoning_active: bool,
-    /// Ordered list of tool names the model has called so far, shown as steps.
-    tool_calls: Vec<String>,
     _task: Task<()>,
 }
 
@@ -68,9 +71,14 @@ pub struct AiPanel {
     /// set_value needs a Window, which is only available in render / event
     /// handlers that receive one).
     pending_clear_input: bool,
-    /// User override for the reasoning panel: Some(true/false) = force
-    /// expand/collapse; None = auto (expand while streaming, collapse after).
-    reasoning_user_open: Option<bool>,
+    /// Indices of steps the user has manually expanded/collapsed in the live
+    /// streaming bubble. A step present here is force-toggled from its default
+    /// (reasoning steps default open while streaming, closed after; tool steps
+    /// default closed). Absent = use the default.
+    open_stream_steps: std::collections::HashSet<usize>,
+    /// Keys of (message index, step index) the user has toggled open in a
+    /// completed message. All steps default to collapsed once streaming ends.
+    open_done_steps: std::collections::HashSet<(usize, usize)>,
     /// Scroll handle for the messages area, used to auto-scroll to bottom.
     messages_scroll: ScrollHandle,
     /// Current panel width in px. User-resizable via the left edge handle.
@@ -166,7 +174,8 @@ impl AiPanel {
             model_input,
             notice: None,
             pending_clear_input: false,
-            reasoning_user_open: None,
+            open_stream_steps: HashSet::new(),
+            open_done_steps: HashSet::new(),
             messages_scroll: ScrollHandle::new(),
             width: DEFAULT_WIDTH,
             _subscriptions: subscriptions,
@@ -336,87 +345,215 @@ impl AiPanel {
     }
 
     fn start_stream_task(&mut self, request: AgentRequest, cx: &mut Context<Self>) {
-        // Reset the user's reasoning-panel toggle so it auto-expands on the
-        // new stream's reasoning, regardless of what they did last time.
-        self.reasoning_user_open = None;
+        // Reset the user's step toggles so each new stream starts from the
+        // defaults (reasoning open while streaming, tools collapsed).
+        self.open_stream_steps.clear();
         let mut events = request.events;
         let cancel = request.cancel;
         let board = self.board.clone();
         let task = cx.spawn(async move |this, cx| {
-            // The agent merges text deltas, tool-call hints, and canvas ops
-            // into this single event stream (see agent::handle_agent_item and
-            // the select loop). We just drain and dispatch.
-            while let Some(event) = events.next().await {
-                let keep_going = this
-                    .update(cx, |panel, cx| match event {
-                        AgentEvent::Delta(text) => {
-                            if let Some(s) = panel.streaming.as_mut() {
-                                // Text arrives after reasoning ends; mark reasoning done.
-                                s.reasoning_active = false;
-                                s.buffer.push_str(&text);
-                            }
-                            cx.notify();
-                            true
+            // High-frequency deltas (text/reasoning) arrive one-per-token.
+            // Instead of calling `this.update()` on every token (which contends
+            // for the main-thread lock and can block behind an in-progress
+            // render), we buffer them and flush to the panel state on a ~50ms
+            // timer — one `this.update()` + `cx.notify()` per flush, not per
+            // token. Low-frequency events (tool calls, canvas ops, done, error)
+            // are handled immediately. GPUI coalesces same-frame `cx.notify()`
+            // calls, and TextView's keyed-state cache debounces the markdown
+            // parse to 200ms on a background thread, so the flush rate only
+            // controls how often we re-shape the growing text.
+            let mut pending_reasoning = String::new();
+            let mut pending_delta = String::new();
+            let flush_duration = std::time::Duration::from_millis(50);
+            loop {
+                // Race the next agent event against the flush timer. If deltas
+                // are pending, the timer fires to flush them; otherwise we just
+                // wait for the next event.
+                let next = if pending_delta.is_empty() && pending_reasoning.is_empty() {
+                    futures::future::Either::Left(events.next().await.map(|e| (e,)))
+                } else {
+                    let timer = cx.background_executor().timer(flush_duration);
+                    futures::future::Either::Right(
+                        futures::future::select(events.next(), timer).await,
+                    )
+                };
+                // Normalize into an optional event (None = timer fired or stream ended).
+                let event = match next {
+                    futures::future::Either::Left(Some((e,))) => Some(e),
+                    futures::future::Either::Left(None) => break,
+                    futures::future::Either::Right(futures::future::Either::Left((e, _))) => {
+                        Some(e.unwrap_or(AgentEvent::Done {
+                            text: String::new(),
+                            drew_anything: false,
+                        }))
+                    }
+                    futures::future::Either::Right(futures::future::Either::Right(_)) => None, // timer
+                };
+                match event {
+                    Some(AgentEvent::Delta(text)) => {
+                        pending_delta.push_str(&text);
+                    }
+                    Some(AgentEvent::Reasoning(text)) => {
+                        pending_reasoning.push_str(&text);
+                    }
+                    Some(ev) => {
+                        // Flush any pending deltas before handling a discrete
+                        // event so the ordering is preserved (text → tool etc.).
+                        let pd = std::mem::take(&mut pending_delta);
+                        let pr = std::mem::take(&mut pending_reasoning);
+                        let keep_going = this
+                            .update(cx, |panel, cx| {
+                                if !pr.is_empty() {
+                                    Self::apply_reasoning(panel, &pr);
+                                }
+                                if !pd.is_empty() {
+                                    Self::apply_delta(panel, &pd);
+                                }
+                                Self::handle_event(panel, ev, &board, cx)
+                            })
+                            .unwrap_or(false);
+                        this.update(cx, |panel, _| panel.messages_scroll.scroll_to_bottom())
+                            .ok();
+                        if !keep_going {
+                            break;
                         }
-                        AgentEvent::Reasoning(text) => {
-                            if let Some(s) = panel.streaming.as_mut() {
-                                s.reasoning_active = true;
-                                s.reasoning.push_str(&text);
-                            }
-                            cx.notify();
-                            true
-                        }
-                        AgentEvent::CanvasOp(op) => {
-                            // Apply the op to the board on the main thread.
-                            board
-                                .update(cx, |board, cx| board.apply_canvas_op(op, cx))
+                    }
+                    None => {
+                        // Timer fired — flush pending deltas in one update.
+                        let pd = std::mem::take(&mut pending_delta);
+                        let pr = std::mem::take(&mut pending_reasoning);
+                        if !pd.is_empty() || !pr.is_empty() {
+                            this.update(cx, |panel, cx| {
+                                if !pr.is_empty() {
+                                    Self::apply_reasoning(panel, &pr);
+                                }
+                                if !pd.is_empty() {
+                                    Self::apply_delta(panel, &pd);
+                                }
+                                cx.notify();
+                            })
+                            .ok();
+                            this.update(cx, |panel, _| panel.messages_scroll.scroll_to_bottom())
                                 .ok();
-                            cx.notify();
-                            true
                         }
-                        AgentEvent::ToolCall(name) => {
-                            if let Some(s) = panel.streaming.as_mut() {
-                                s.reasoning_active = false;
-                                s.tool_calls.push(name);
-                            }
-                            cx.notify();
-                            true
-                        }
-                        AgentEvent::Done { text } => {
-                            panel.finish_streaming(text, cx);
-                            false
-                        }
-                        AgentEvent::Error(err) => {
-                            panel.error = Some(err);
-                            panel.streaming = None;
-                            cx.notify();
-                            false
-                        }
-                    })
-                    .unwrap_or(false);
-                // Auto-scroll the messages area to show the latest content,
-                // whether streaming or just finished. scroll_to_bottom sets a
-                // flag that GPUI consumes during the next paint.
-                this.update(cx, |panel, _cx| {
-                    panel.messages_scroll.scroll_to_bottom();
-                })
-                .ok();
-                if !keep_going {
-                    break;
+                    }
                 }
             }
         });
         self.streaming = Some(StreamingState {
             buffer: String::new(),
             cancel,
-            reasoning: String::new(),
+            steps: Vec::new(),
             reasoning_active: false,
-            tool_calls: Vec::new(),
             _task: task,
         });
     }
 
-    fn finish_streaming(&mut self, final_text: String, cx: &mut Context<Self>) {
+    /// Append buffered text deltas to the panel's streaming state.
+    fn apply_delta(panel: &mut AiPanel, text: &str) {
+        if let Some(s) = panel.streaming.as_mut() {
+            s.reasoning_active = false;
+            s.buffer.push_str(text);
+            match s.steps.last() {
+                Some(super::client::AssistantStep::Text { .. }) => {
+                    if let Some(super::client::AssistantStep::Text { text: t }) =
+                        s.steps.last_mut()
+                    {
+                        t.push_str(text);
+                    }
+                }
+                _ => s.steps.push(super::client::AssistantStep::Text {
+                    text: text.to_string(),
+                }),
+            }
+        }
+    }
+
+    /// Append buffered reasoning deltas to the panel's streaming state.
+    fn apply_reasoning(panel: &mut AiPanel, text: &str) {
+        if let Some(s) = panel.streaming.as_mut() {
+            s.reasoning_active = true;
+            match s.steps.last() {
+                Some(super::client::AssistantStep::Reasoning { .. }) => {
+                    if let Some(super::client::AssistantStep::Reasoning { text: t }) =
+                        s.steps.last_mut()
+                    {
+                        t.push_str(text);
+                    }
+                }
+                _ => s.steps.push(super::client::AssistantStep::Reasoning {
+                    text: text.to_string(),
+                }),
+            }
+        }
+    }
+
+    /// Handle a discrete (non-delta) event: tool call, canvas op, done, error.
+    /// Returns false if the stream should stop.
+    fn handle_event(
+        panel: &mut AiPanel,
+        event: AgentEvent,
+        board: &WeakEntity<BoardView>,
+        cx: &mut Context<AiPanel>,
+    ) -> bool {
+        match event {
+            AgentEvent::Delta(_) | AgentEvent::Reasoning(_) => true,
+            AgentEvent::CanvasOp(op) => {
+                board
+                    .update(cx, |board, cx| board.apply_canvas_op(op, cx))
+                    .ok();
+                cx.notify();
+                true
+            }
+            AgentEvent::ToolCall { id, name, args } => {
+                if let Some(s) = panel.streaming.as_mut() {
+                    s.reasoning_active = false;
+                    s.steps.push(super::client::AssistantStep::Tool {
+                        name,
+                        args,
+                        done: false,
+                        id,
+                        result: String::new(),
+                    });
+                }
+                cx.notify();
+                true
+            }
+            AgentEvent::ToolResult { id, result } => {
+                if let Some(s) = panel.streaming.as_mut() {
+                    for step in s.steps.iter_mut() {
+                        if let super::client::AssistantStep::Tool {
+                            id: step_id,
+                            done,
+                            result: step_result,
+                            ..
+                        } = step
+                        {
+                            if *step_id == id && !*done {
+                                *done = true;
+                                *step_result = result.clone();
+                                break;
+                            }
+                        }
+                    }
+                }
+                cx.notify();
+                true
+            }
+            AgentEvent::Done { text, drew_anything } => {
+                panel.finish_streaming(text, drew_anything, cx);
+                false
+            }
+            AgentEvent::Error(err) => {
+                panel.error = Some(err);
+                panel.streaming = None;
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    fn finish_streaming(&mut self, final_text: String, _drew_anything: bool, cx: &mut Context<Self>) {
         if let Some(s) = self.streaming.take() {
             // Prefer the aggregated final text; fall back to the streamed buffer
             // (some providers only emit deltas, never a final response).
@@ -427,17 +564,14 @@ impl AiPanel {
             };
             if !text.trim().is_empty() {
                 let mut msg = ChatMessage::assistant(text);
-                // Preserve the reasoning and tool calls so they survive after
-                // streaming — the user can re-expand the thinking panel.
-                if !s.reasoning.is_empty() {
-                    msg.reasoning = Some(s.reasoning);
-                }
-                if !s.tool_calls.is_empty() {
-                    msg.tool_calls = s.tool_calls;
-                }
+                // Preserve the ordered reasoning/tool steps so they survive
+                // after streaming — the user can re-expand any step.
+                msg.steps = s.steps;
                 self.persist(&msg);
                 self.messages.push(msg);
             }
+            // Steps of the finished turn are now persisted; drop live toggles.
+            self.open_done_steps.clear();
             // Refresh the list so this session's preview/mtime updates.
             self.refresh_sessions();
             cx.notify();
@@ -670,13 +804,14 @@ impl Render for AiPanel {
             );
         }
         for (idx, msg) in self.messages.iter().enumerate() {
-            messages = messages.child(self.render_message(idx, msg, cx));
+            messages = messages.child(self.render_message(idx, msg, window, cx));
         }
         if let Some(s) = &self.streaming {
-            // A single agent step bubble that evolves as the stream progresses:
-            // "思考中…" → reasoning panel → tool calls → text response. It's
-            // always rendered (no separate "thinking" bubble) so the transition
-            // feels continuous.
+            // A single agent step bubble that evolves as the stream progresses.
+            // The model's work is shown as an ordered sequence of steps —
+            // reasoning chunks and tool calls interleaved in the order they
+            // actually happened — so the "think → tool → think → tool → answer"
+            // loop reads like a person narrating their work.
             let mut step = div()
                 .flex()
                 .flex_col()
@@ -686,8 +821,7 @@ impl Render for AiPanel {
                 .py_1();
 
             // While no content has arrived yet, show "🤖 思考中…" with a bot icon.
-            let has_content =
-                !s.reasoning.is_empty() || !s.tool_calls.is_empty() || !s.buffer.is_empty();
+            let has_content = !s.steps.is_empty() || !s.buffer.is_empty();
             if !has_content {
                 step = step.child(
                     div()
@@ -710,97 +844,31 @@ impl Render for AiPanel {
                 );
             }
 
-            // Reasoning / thinking panel: auto-expanded while streaming
-            // (reasoning_active), auto-collapsed after. The toggle arrow is at
-            // the END of the header and hidden by default, shown on hover.
-            if !s.reasoning.is_empty() {
-                let reasoning_open = self.reasoning_user_open.unwrap_or(s.reasoning_active);
-                let reasoning_text = s.reasoning.clone();
-                // Clickable header: 🤖 icon + "思考过程" on the left, ▾/▸ arrow
-                // on the right (hidden until hover).
-                let header = div()
-                    .id("reasoning-toggle")
-                    .group("reasoning-header")
-                    .flex()
-                    .flex_row()
-                    .gap_1()
-                    .items_center()
-                    .text_xs()
-                    .text_color(rgb(0x888888))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(0xf5f5f5)).rounded_md())
-                    .child(
-                        div()
-                            .w(px(14.0))
-                            .h(px(14.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(gpui_component::Icon::new(IconName::Bot)),
-                    )
-                    .child(div().child("思考过程"))
-                    .child(
-                        // Toggle arrow — hidden by default, shown on hover of
-                        // the header group.
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x888888))
-                            .opacity(0.0)
-                            .group_hover("reasoning-header", |s| s.opacity(1.0))
-                            .child(if reasoning_open { "▾" } else { "▸" }),
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.reasoning_user_open =
-                            Some(!this.reasoning_user_open.unwrap_or(false));
-                        cx.notify();
-                    }));
-                step = step.child(header);
-                if reasoning_open {
-                    step = step.child(
-                        div()
-                            .id("reasoning-scroll")
-                            .max_h(px(200.0))
-                            .overflow_y_scroll()
-                            .text_xs()
-                            .text_color(rgb(0x666666))
-                            .py_1()
-                            .child(reasoning_text),
-                    );
-                }
-            }
-
-            // Tool call steps: show each as a labeled tag with a check icon.
-            if !s.tool_calls.is_empty() {
-                let mut tools = div().flex().flex_col().gap_1();
-                for name in &s.tool_calls {
-                    let label = tool_label(name);
-                    tools = tools.child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap_1()
-                            .items_center()
-                            .text_xs()
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded_md()
-                                    .bg(rgb(0xdce8ff))
-                                    .text_color(rgb(0x1a5fd7))
-                                    .child(format!("✏️ {label}")),
-                            )
-                            .child(div().text_color(rgb(0x2f9e44)).child("✓")),
-                    );
-                }
-                step = step.child(tools);
-            }
-
-            // Text response (streaming, with cursor).
-            if !s.buffer.is_empty() {
-                let mut body = s.buffer.clone();
-                body.push('▍');
-                step = step.child(div().text_sm().child(body));
+            // Render each step in order — reasoning, tool calls, and text are all
+            // individual, independently expandable steps (no grouping). This
+            // makes the "think → tool → think → tool" rhythm visible: each tool
+            // call is its own full-width step like a reasoning block, not folded
+            // into a compact chip row.
+            for (i, item) in s.steps.iter().enumerate() {
+                let is_last = i + 1 == s.steps.len();
+                let default_open = match item {
+                    super::client::AssistantStep::Reasoning { .. } => {
+                        is_last && s.reasoning_active
+                    }
+                    super::client::AssistantStep::Text { .. } => {
+                        // Text steps are rendered inline by render_stream_step;
+                        // pass the streaming cursor flag via default_open.
+                        is_last && !s.buffer.is_empty()
+                    }
+                    _ => false,
+                };
+                step = step.child(self.render_stream_step(
+                    i,
+                    item,
+                    default_open,
+                    window,
+                    cx,
+                ));
             }
 
             messages = messages.child(step);
@@ -984,21 +1052,28 @@ impl Render for AiPanel {
                     })
                     .ok();
             })
-            // Shield the canvas from pointer interactions over the panel.
-            // NOTE: there is intentionally NO `.on_key_down` stop-propagation
-            // here. On Windows, GPUI generates the WM_CHAR that delivers typed
-            // characters to a focused TextField ONLY if the WM_KEYDOWN is left
-            // unhandled (propagate=true). A blanket `on_key_down` →
-            // stop_propagation would mark the key "handled" and suppress
-            // TranslateMessage, so no character would ever reach
+            // Pointer shielding for the canvas is handled in the board itself
+            // (BoardView::over_ai_panel + early-returns in the canvas mouse/
+            // scroll handlers), NOT via stop_propagation here. GPUI dispatches
+            // all mouse listeners — element handlers and the window-level
+            // on_mouse_event callbacks that TextView uses for text selection —
+            // through one shared loop that breaks on stop_propagation, so a
+            // panel-root mouse handler would abort that loop before TextView's
+            // selection listeners run, making message text impossible to
+            // select. Doing the shielding geometrically on the canvas side
+            // avoids that entirely while still keeping the canvas from stealing
+            // focus / panning / zooming under the panel.
+            //
+            // NOTE: there is also intentionally NO `.on_key_down`
+            // stop-propagation. On Windows, GPUI generates the WM_CHAR that
+            // delivers typed characters to a focused TextField ONLY if the
+            // WM_KEYDOWN is left unhandled (propagate=true). A blanket
+            // `on_key_down` → stop_propagation would mark the key "handled" and
+            // suppress TranslateMessage, so no character would ever reach
             // `replace_text_in_range` — every input field would show a caret
             // but accept no typing. Canvas tool shortcuts are already disabled
             // while a text field has focus via the "Board && !TextInput" key
             // context (see main.rs), so this guard is unnecessary.
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_mouse_move(|_, _, cx| cx.stop_propagation())
-            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .child(resize_handle)
             .child(header)
             .child(settings_section)
@@ -1010,16 +1085,270 @@ impl Render for AiPanel {
 }
 
 impl AiPanel {
+    /// Render one step of the live streaming bubble. `default_open` is true for
+    /// the reasoning step that is currently being streamed into.
+    fn render_stream_step(
+        &self,
+        idx: usize,
+        item: &super::client::AssistantStep,
+        default_open: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match item {
+            super::client::AssistantStep::Reasoning { text } => {
+                // Live reasoning defaults open while streaming, closed after.
+                let open = self
+                    .open_stream_steps
+                    .contains(&idx)
+                    ^ default_open;
+                // While actively streaming into this step, render as plain text
+                // (raw SharedString) so each token flush shows instantly — no
+                // TextView markdown debounce. Once the step is done (not the
+                // active one), use styled_body for selectable markdown rendering.
+                let body: Option<AnyElement> = if open {
+                    Some(
+                        plain_body(
+                            ElementId::named_usize("reasoning-scroll", idx),
+                            StyledBodyKind::Reasoning,
+                            text.clone(),
+                        )
+                        .into_any_element(),
+                    )
+                } else {
+                    Some(
+                        styled_body(
+                            ElementId::named_usize("reasoning-scroll", idx),
+                            ElementId::named_usize("reasoning-text", idx),
+                            StyledBodyKind::Reasoning,
+                            text.clone(),
+                            window,
+                            cx,
+                        )
+                        .into_any_element(),
+                    )
+                };
+                step_toggle(
+                    ElementId::named_usize("reasoning-toggle", idx),
+                    format!("reasoning-header-{idx}"),
+                    Some(IconName::Bot),
+                    "思考过程",
+                    open,
+                    rgb(0x888888),
+                    None,
+                    cx.listener(move |this, _, _, cx| {
+                        if this.open_stream_steps.contains(&idx) {
+                            this.open_stream_steps.remove(&idx);
+                        } else {
+                            this.open_stream_steps.insert(idx);
+                        }
+                        cx.notify();
+                    }),
+                    body,
+                )
+                .into_any_element()
+            }
+            super::client::AssistantStep::Tool { name, args, done, result, .. } => {
+                // Each tool call is its own full-width expandable step — like a
+                // reasoning panel, but with a tool label + status glyph.
+                let open = self.open_stream_steps.contains(&idx);
+                let label = tool_label(name);
+                let preview = tool_chip_preview(name, args);
+                let body_text = tool_body_text(name, args, result);
+                let status = if *done { "✓" } else { "⏳" };
+                let status_color = if *done { rgb(0x2f9e44) } else { rgb(0x999999) };
+                let title = if preview.is_empty() {
+                    format!("✏️ {label}")
+                } else {
+                    format!("✏️ {label} {preview}")
+                };
+                step_toggle(
+                    ElementId::named_usize("tool-toggle", idx),
+                    format!("tool-header-{idx}"),
+                    None,
+                    title,
+                    open,
+                    rgb(0x1a5fd7),
+                    Some(div().text_color(status_color).child(status)),
+                    cx.listener(move |this, _, _, cx| {
+                        if this.open_stream_steps.contains(&idx) {
+                            this.open_stream_steps.remove(&idx);
+                        } else {
+                            this.open_stream_steps.insert(idx);
+                        }
+                        cx.notify();
+                    }),
+                    open.then(|| {
+                        styled_body(
+                            ElementId::named_usize("tool-scroll", idx),
+                            ElementId::named_usize("tool-text", idx),
+                            StyledBodyKind::Tool,
+                            body_text,
+                            window,
+                            cx,
+                        )
+                    }),
+                )
+                .into_any_element()
+            }
+            // Text steps: inline rendered, not collapsible. `default_open` carries
+            // the "is this the active streaming text step" flag — when true we
+            // append the ▍ cursor and render as plain text for instant flush.
+            // When not active (a completed text step), use TextView::markdown
+            // for selectable, formatted rendering.
+            super::client::AssistantStep::Text { text } => {
+                if default_open {
+                    // Active streaming: plain SharedString, instant display.
+                    div()
+                        .text_sm()
+                        .child(format!("{text}▍"))
+                        .into_any_element()
+                } else {
+                    // Completed: selectable markdown.
+                    div()
+                        .text_sm()
+                        .child(
+                            TextView::markdown(
+                                ElementId::named_usize("ai-stream-text", idx),
+                                text.clone(),
+                                window,
+                                cx,
+                            )
+                            .selectable(true),
+                        )
+                        .into_any_element()
+                }
+            }
+        }
+    }
+
+    /// Render one step of a completed assistant message. All steps default to
+    /// collapsed once streaming ends; the user can expand any of them.
+    fn render_done_step(
+        &self,
+        msg_idx: usize,
+        step_idx: usize,
+        item: &super::client::AssistantStep,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let key = (msg_idx, step_idx);
+        match item {
+            super::client::AssistantStep::Reasoning { text } => {
+                let open = self.open_done_steps.contains(&key);
+                step_toggle(
+                    ElementId::named_usize("reasoning-toggle-done", msg_idx * 100000 + step_idx),
+                    format!("reasoning-header-done-{msg_idx}-{step_idx}"),
+                    Some(IconName::Bot),
+                    "思考过程",
+                    open,
+                    rgb(0x888888),
+                    None,
+                    cx.listener(move |this, _, _, cx| {
+                        if this.open_done_steps.contains(&key) {
+                            this.open_done_steps.remove(&key);
+                        } else {
+                            this.open_done_steps.insert(key);
+                        }
+                        cx.notify();
+                    }),
+                    open.then(|| {
+                        styled_body(
+                            ElementId::named_usize(
+                                "reasoning-scroll-done",
+                                msg_idx * 100000 + step_idx,
+                            ),
+                            ElementId::named_usize(
+                                "reasoning-text-done",
+                                msg_idx * 100000 + step_idx,
+                            ),
+                            StyledBodyKind::Reasoning,
+                            text.clone(),
+                            window,
+                            cx,
+                        )
+                    }),
+                )
+                .into_any_element()
+            }
+            super::client::AssistantStep::Tool { name, args, done, result, .. } => {
+                let open = self.open_done_steps.contains(&key);
+                let label = tool_label(name);
+                let preview = tool_chip_preview(name, args);
+                let body_text = tool_body_text(name, args, result);
+                let status = if *done { "✓" } else { "⏳" };
+                let status_color = if *done { rgb(0x2f9e44) } else { rgb(0x999999) };
+                let title = if preview.is_empty() {
+                    format!("✏️ {label}")
+                } else {
+                    format!("✏️ {label} {preview}")
+                };
+                step_toggle(
+                    ElementId::named_usize("tool-toggle-done", msg_idx * 100000 + step_idx),
+                    format!("tool-header-done-{msg_idx}-{step_idx}"),
+                    None,
+                    title,
+                    open,
+                    rgb(0x1a5fd7),
+                    Some(div().text_color(status_color).child(status)),
+                    cx.listener(move |this, _, _, cx| {
+                        if this.open_done_steps.contains(&key) {
+                            this.open_done_steps.remove(&key);
+                        } else {
+                            this.open_done_steps.insert(key);
+                        }
+                        cx.notify();
+                    }),
+                    open.then(|| {
+                        styled_body(
+                            ElementId::named_usize(
+                                "tool-scroll-done",
+                                msg_idx * 100000 + step_idx,
+                            ),
+                            ElementId::named_usize(
+                                "tool-text-done",
+                                msg_idx * 100000 + step_idx,
+                            ),
+                            StyledBodyKind::Tool,
+                            body_text,
+                            window,
+                            cx,
+                        )
+                    }),
+                )
+                .into_any_element()
+            }
+            // Text steps: inline rendered, selectable, not collapsible.
+            super::client::AssistantStep::Text { text } => {
+                div()
+                    .text_sm()
+                    .child(
+                        TextView::markdown(
+                            ElementId::named_usize(
+                                "ai-msg-text",
+                                msg_idx * 100000 + step_idx,
+                            ),
+                            text.clone(),
+                            window,
+                            cx,
+                        )
+                        .selectable(true),
+                    )
+                    .into_any_element()
+            }
+        }
+    }
+
     fn render_message(
         &self,
         idx: usize,
         msg: &ChatMessage,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let is_user = msg.role == "user";
         let content = msg.content.clone();
-        let reasoning = msg.reasoning.clone();
-        let tool_calls = msg.tool_calls.clone();
+        let steps = msg.normalized_steps();
         let insert_button = if !is_user {
             let content = content.clone();
             Some(
@@ -1032,12 +1361,11 @@ impl AiPanel {
         } else {
             None
         };
-        let _ = idx;
 
-        // For assistant messages with reasoning/tool-calls, render them inside
+        // For assistant messages with reasoning/tool steps, render them inside
         // a step bubble (same style as the streaming step) so the thinking
-        // process and tools survive after streaming completes.
-        if !is_user && (reasoning.is_some() || !tool_calls.is_empty()) {
+        // process and tools survive after streaming completes, in order.
+        if !is_user && !steps.is_empty() {
             let mut step = div()
                 .flex()
                 .flex_col()
@@ -1046,88 +1374,26 @@ impl AiPanel {
                 .px_1()
                 .py_1();
 
-            // Reasoning panel (collapsed by default after completion).
-            if let Some(reasoning_text) = reasoning {
-                let reasoning_open =
-                    self.reasoning_user_open.unwrap_or(false);
-                let header = div()
-                    .id("reasoning-toggle-done")
-                    .group("reasoning-header-done")
-                    .flex()
-                    .flex_row()
-                    .gap_1()
-                    .items_center()
-                    .text_xs()
-                    .text_color(rgb(0x888888))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(0xf5f5f5)).rounded_md())
-                    .child(
-                        div()
-                            .w(px(14.0))
-                            .h(px(14.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(gpui_component::Icon::new(IconName::Bot)),
-                    )
-                    .child(div().child("思考过程"))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x888888))
-                            .opacity(0.0)
-                            .group_hover("reasoning-header-done", |s| s.opacity(1.0))
-                            .child(if reasoning_open { "▾" } else { "▸" }),
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.reasoning_user_open =
-                            Some(!this.reasoning_user_open.unwrap_or(false));
-                        cx.notify();
-                    }));
-                step = step.child(header);
-                if reasoning_open {
-                    step = step.child(
-                        div()
-                            .id("reasoning-scroll-done")
-                            .max_h(px(200.0))
-                            .overflow_y_scroll()
-                            .text_xs()
-                            .text_color(rgb(0x666666))
-                            .py_1()
-                            .child(reasoning_text),
-                    );
-                }
+            // Render each step in order — no grouping. Each tool call is its
+            // own full-width expandable step, matching the streaming bubble.
+            for (i, item) in steps.iter().enumerate() {
+                step = step.child(self.render_done_step(idx, i, item, window, cx));
             }
 
-            // Tool call tags.
-            if !tool_calls.is_empty() {
-                let mut tools = div().flex().flex_col().gap_1();
-                for name in &tool_calls {
-                    let label = tool_label(name);
-                    tools = tools.child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap_1()
-                            .items_center()
-                            .text_xs()
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded_md()
-                                    .bg(rgb(0xdce8ff))
-                                    .text_color(rgb(0x1a5fd7))
-                                    .child(format!("✏️ {label}")),
-                            )
-                            .child(div().text_color(rgb(0x2f9e44)).child("✓")),
-                    );
-                }
-                step = step.child(tools);
+            // Text response: render content as a final text block iff the steps
+            // didn't already carry inline Text steps (legacy messages, or turns
+            // where the model only replied with text and no reasoning/tools).
+            let has_text_step = steps
+                .iter()
+                .any(|s| matches!(s, super::client::AssistantStep::Text { .. }));
+            if !has_text_step {
+                step = step.child(
+                    div().text_sm().child(
+                        TextView::markdown(("ai-msg-text", idx), content, window, cx)
+                            .selectable(true),
+                    ),
+                );
             }
-
-            // Text response.
-            step = step.child(div().text_sm().child(content));
 
             let mut col = div().flex().flex_col().gap_1().items_start();
             col = col.child(step);
@@ -1137,16 +1403,24 @@ impl AiPanel {
             return col.into_any_element();
         }
 
-        message_bubble(&msg.role, content, insert_button).into_any_element()
+        message_bubble(idx, &msg.role, content, insert_button, window, cx).into_any_element()
     }
 }
 
 fn message_bubble(
+    idx: usize,
     role: &str,
     content: String,
     extra: Option<Stateful<Div>>,
+    window: &mut Window,
+    cx: &mut App,
 ) -> Div {
     let is_user = role == "user";
+    let id = if is_user {
+        ElementId::named_usize("ai-msg-user", idx)
+    } else {
+        ElementId::named_usize("ai-msg-plain", idx)
+    };
     // User bubbles size to their text width (max ~85% of panel) and align right;
     // AI bubbles take full width so wrapped text aligns left cleanly.
     let bubble = if is_user {
@@ -1157,7 +1431,7 @@ fn message_bubble(
             .text_sm()
             .max_w(px(360.0))
             .min_w_0()
-            .child(content)
+            .child(TextView::markdown(id, content, window, cx).selectable(true))
             .bg(rgb(0xdce8ff))
     } else {
         // AI messages: plain text, no card background/border — content flows
@@ -1168,7 +1442,7 @@ fn message_bubble(
             .text_sm()
             .w_full()
             .min_w_0()
-            .child(content)
+            .child(TextView::markdown(id, content, window, cx).selectable(true))
     };
     let mut col = div().flex().flex_col().gap_1();
     // User messages: bubble aligns right (items_end prevents the default
@@ -1225,5 +1499,349 @@ fn tool_label(name: &str) -> &'static str {
         "draw_arrow" => "箭头",
         "draw_text" => "文本",
         _ => "图形",
+    }
+}
+
+/// Which flavor of expanded body a step shows — reasoning text, or a tool-call
+/// description. Both get the same left-border treatment; this just selects the
+/// label color.
+enum StyledBodyKind {
+    Reasoning,
+    Tool,
+}
+
+/// The expandable body under a step header: left vertical border + scrollable.
+/// Uses `TextView::markdown` for selectable, formatted text — for steps whose
+/// content is final (won't grow). The markdown parse is debounced 200ms in a
+/// background thread by TextView, so it's smooth even for large text.
+fn styled_body(
+    scroll_id: impl Into<ElementId>,
+    text_id: impl Into<ElementId>,
+    kind: StyledBodyKind,
+    text: String,
+    window: &mut Window,
+    cx: &mut App,
+) -> impl IntoElement {
+    let color = match kind {
+        StyledBodyKind::Reasoning => rgb(0x666666),
+        StyledBodyKind::Tool => rgb(0x444444),
+    };
+    div()
+        .id(scroll_id)
+        .max_h(px(200.0))
+        .overflow_y_scroll()
+        .text_xs()
+        .text_color(color)
+        .border_l_1()
+        .border_color(rgb(0xeeeeec))
+        .pl_2()
+        .py_1()
+        .child(TextView::markdown(text_id, text, window, cx).selectable(true))
+}
+
+/// Same visual style as [`styled_body`] but renders the text as a raw
+/// `SharedString` — no markdown parsing, no `TextView`, no 200ms debounce.
+/// Used for the **active** (still-streaming) reasoning/text step so each token
+/// flush shows instantly instead of waiting for TextView's background parse.
+/// The tradeoff: no markdown formatting and no text selection during streaming;
+/// both are restored once the step completes and is rendered via `styled_body`.
+fn plain_body(
+    scroll_id: impl Into<ElementId>,
+    kind: StyledBodyKind,
+    text: impl Into<SharedString>,
+) -> Stateful<Div> {
+    let color = match kind {
+        StyledBodyKind::Reasoning => rgb(0x666666),
+        StyledBodyKind::Tool => rgb(0x444444),
+    };
+    div()
+        .id(scroll_id)
+        .max_h(px(200.0))
+        .overflow_y_scroll()
+        .text_xs()
+        .text_color(color)
+        .border_l_1()
+        .border_color(rgb(0xeeeeec))
+        .pl_2()
+        .py_1()
+        .child(text.into())
+}
+
+/// Build a clickable, hover-reveal step header with an optional body below it.
+/// `icon` is an optional leading icon; `title` is the header label; `open`
+/// controls the ▾/▸ arrow and whether `body` is rendered. The toggle arrow sits
+/// at the end of the header and is hidden until the header is hovered.
+#[allow(clippy::too_many_arguments)]
+fn step_toggle<B: IntoElement>(
+    id: impl Into<ElementId>,
+    group: String,
+    icon: Option<IconName>,
+    title: impl Into<String>,
+    open: bool,
+    title_color: Rgba,
+    trailing_child: Option<Div>,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    body: Option<B>,
+) -> impl IntoElement {
+    let title = title.into();
+    let mut header = div()
+        .id(id)
+        .group(group.clone())
+        .flex()
+        .flex_row()
+        .gap_1()
+        .items_center()
+        .text_xs()
+        .text_color(title_color)
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(0xf5f5f5)).rounded_md());
+    if let Some(name) = icon {
+        header = header.child(
+            div()
+                .w(px(14.0))
+                .h(px(14.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(gpui_component::Icon::new(name)),
+        );
+    }
+    header = header.child(div().child(title));
+    if let Some(extra) = trailing_child {
+        header = header.child(extra);
+    }
+    header = header.child(
+        div()
+            .text_xs()
+            .text_color(rgb(0x888888))
+            .opacity(0.0)
+            .group_hover(group.clone(), |s| s.opacity(1.0))
+            .child(if open { "▾" } else { "▸" }),
+    );
+    header = header.on_click(on_click);
+    let mut wrapper = div().flex().flex_col().gap_1().w_full();
+    wrapper = wrapper.child(header);
+    if let Some(body) = body {
+        wrapper = wrapper.child(body);
+    }
+    wrapper
+}
+
+/// Format a color JSON value (`0xRRGGBB` integer) as `#RRGGBB`, if present.
+fn color_hex(v: Option<&serde_json::Value>) -> Option<String> {
+    let n = v.and_then(|x| x.as_f64())? as u32;
+    Some(format!("#{:06X}", n))
+}
+
+/// A very short inline label for a tool chip — what distinguishes this call at
+/// a glance without expanding. For text it's the content (truncated); for
+/// shapes it's the position; returns empty if nothing useful can be shown.
+fn tool_chip_preview(name: &str, args: &serde_json::Value) -> String {
+    let obj = match args.as_object() {
+        Some(o) => o,
+        None => return String::new(),
+    };
+    let f = |k: &str| obj.get(k).and_then(|v| v.as_f64());
+    match name {
+        "draw_text" => {
+            let text = obj.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let one_line: String =
+                text.chars().filter(|c| *c != '\n').take(10).collect();
+            if text.chars().count() > 10 {
+                format!("「{one_line}…」")
+            } else if !one_line.is_empty() {
+                format!("「{one_line}」")
+            } else {
+                String::new()
+            }
+        }
+        "draw_rectangle" | "draw_ellipse" | "draw_diamond"
+        | "draw_line" | "draw_arrow" => {
+            let (x, y) = (f("x"), f("y"));
+            if let (Some(x), Some(y)) = (x, y) {
+                format!("({x:.0},{y:.0})")
+            } else {
+                String::new()
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+/// Build the full expanded-body text for a tool step: the friendly parameter
+/// description, plus the tool's result text (if any, e.g. "已添加到画布").
+fn tool_body_text(name: &str, args: &serde_json::Value, result: &str) -> String {
+    let mut out = tool_call_detail(name, args);
+    if !result.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("→ ");
+        out.push_str(result);
+    }
+    out
+}
+
+/// A friendly, human-readable description of one tool call: what shape it drew
+/// and the key parameters (coordinates, size, points, color…). Falls back to a
+/// pretty-printed JSON blob if the arguments don't match a known shape or carry
+/// none of the expected fields.
+fn tool_call_detail(name: &str, args: &serde_json::Value) -> String {
+    let obj = match args.as_object() {
+        Some(o) => o,
+        None => return args.to_string(),
+    };
+    let f = |k: &str| obj.get(k).and_then(|v| v.as_f64());
+    let out = match name {
+        "draw_rectangle" | "draw_ellipse" | "draw_diamond" => {
+            let kind = tool_label(name);
+            let (x, y, w, h) = (f("x"), f("y"), f("w"), f("h"));
+            let mut out = String::new();
+            if let (Some(x), Some(y)) = (x, y) {
+                out.push_str(&format!("{kind} ({x:.0}, {y:.0})"));
+            }
+            if let (Some(w), Some(h)) = (w, h) {
+                if !out.is_empty() {
+                    out.push('，');
+                }
+                out.push_str(&format!("宽 {w:.0} × 高 {h:.0}"));
+            }
+            push_style(&mut out, obj.get("style"));
+            out
+        }
+        "draw_line" | "draw_arrow" => {
+            let kind = tool_label(name);
+            let n = obj
+                .get("points")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            let mut out = format!("{kind}，经过 {n} 个点");
+            push_style(&mut out, obj.get("style"));
+            out
+        }
+        "draw_text" => {
+            let text = obj
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let mut out = format!("文本「{}」", text.replace('\n', " "));
+            let (x, y) = (f("x"), f("y"));
+            if let (Some(x), Some(y)) = (x, y) {
+                out.push_str(&format!("，位置 ({x:.0}, {y:.0})"));
+            }
+            if let Some(fs) = f("font_size") {
+                out.push_str(&format!("，字号 {:.0}", fs));
+            }
+            out
+        }
+        _ => String::new(),
+    };
+    if out.trim().is_empty() {
+        serde_json::to_string_pretty(args).unwrap_or_else(|_| args.to_string())
+    } else {
+        out
+    }
+}
+
+/// Append a short style summary (stroke / fill colors) to a tool description.
+fn push_style(out: &mut String, style: Option<&serde_json::Value>) {
+    let style = match style.and_then(|v| v.as_object()) {
+        Some(s) => s,
+        None => return,
+    };
+    let stroke = color_hex(style.get("stroke"));
+    let fill = color_hex(style.get("fill"));
+    if stroke.is_some() || fill.is_some() {
+        out.push('\n');
+        let parts: Vec<String> = [stroke.map(|c| format!("描边 {c}")), fill.map(|c| format!("填充 {c}"))]
+            .into_iter()
+            .flatten()
+            .collect();
+        out.push_str(&parts.join(" · "));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{tool_body_text, tool_call_detail, tool_chip_preview};
+
+    #[test]
+    fn tool_detail_describes_rectangle_with_coords_and_size() {
+        // Colors as decimals: 0x1e1e1e = 1973790, 0xa5d8ff = 10868991.
+        let args: serde_json::Value = serde_json::from_str(
+            r#"{"x":100.0,"y":200.0,"w":120.0,"h":60.0,"style":{"stroke":1973790,"fill":10868991}}"#,
+        )
+        .unwrap();
+        let detail = tool_call_detail("draw_rectangle", &args);
+        assert!(detail.contains("矩形"));
+        assert!(detail.contains("(100, 200)"));
+        assert!(detail.contains("宽 120 × 高 60"));
+        assert!(detail.contains("描边 #1E1E1E"));
+        assert!(detail.contains("填充 #A5D8FF"));
+    }
+
+    #[test]
+    fn tool_detail_describes_text_content() {
+        let args: serde_json::Value =
+            serde_json::from_str(r#"{"x":5.0,"y":6.0,"text":"开始","font_size":24.0}"#).unwrap();
+        let detail = tool_call_detail("draw_text", &args);
+        assert!(detail.contains("文本「开始」"));
+        assert!(detail.contains("位置 (5, 6)"));
+        assert!(detail.contains("字号 24"));
+    }
+
+    #[test]
+    fn tool_detail_counts_points_for_arrow() {
+        let args: serde_json::Value =
+            serde_json::from_str(r#"{"points":[{"x":0.0,"y":0.0},{"x":10.0,"y":0.0},{"x":10.0,"y":20.0}]}"#)
+                .unwrap();
+        let detail = tool_call_detail("draw_arrow", &args);
+        assert!(detail.contains("箭头"));
+        assert!(detail.contains("3 个点"));
+    }
+
+    #[test]
+    fn tool_detail_falls_back_to_json_for_unknown_args() {
+        let args: serde_json::Value =
+            serde_json::from_str(r#"{"weird":true}"#).unwrap();
+        let detail = tool_call_detail("draw_rectangle", &args);
+        // No recognizable shape fields → pretty JSON fallback.
+        assert!(detail.contains("weird"));
+    }
+
+    #[test]
+    fn chip_preview_shows_text_content_truncated() {
+        let short = serde_json::from_str(r#"{"text":"开始"}"#).unwrap();
+        assert_eq!(tool_chip_preview("draw_text", &short), "「开始」");
+        // Long text is truncated to 10 chars with an ellipsis.
+        let long = serde_json::from_str(r#"{"text":"输入用户名和密码并提交"}"#).unwrap();
+        let p = tool_chip_preview("draw_text", &long);
+        assert!(p.starts_with("「"));
+        assert!(p.ends_with("…」"));
+    }
+
+    #[test]
+    fn chip_preview_shows_shape_position() {
+        let args = serde_json::from_str(r#"{"x":100.0,"y":200.0,"w":120.0,"h":60.0}"#).unwrap();
+        assert_eq!(tool_chip_preview("draw_rectangle", &args), "(100,200)");
+    }
+
+    #[test]
+    fn chip_preview_empty_for_unknown_or_missing() {
+        let args = serde_json::from_str(r#"{"weird":true}"#).unwrap();
+        assert_eq!(tool_chip_preview("draw_rectangle", &args), "");
+    }
+
+    #[test]
+    fn body_text_appends_result_when_present() {
+        let args = serde_json::from_str(r#"{"x":100.0,"y":200.0,"w":120.0,"h":60.0}"#).unwrap();
+        // No result → just the detail, no "→".
+        let without = tool_body_text("draw_rectangle", &args, "");
+        assert!(!without.contains("→ 已添加到画布"));
+        // With result → detail + "→ 已添加到画布" on a new line.
+        let with = tool_body_text("draw_rectangle", &args, "已添加到画布");
+        assert!(with.contains("矩形"));
+        assert!(with.contains("→ 已添加到画布"));
     }
 }

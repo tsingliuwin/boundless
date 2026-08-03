@@ -315,7 +315,11 @@ impl Element {
     pub fn is_container(&self) -> bool {
         matches!(
             self.kind,
-            ElementKind::Rectangle | ElementKind::Ellipse | ElementKind::Diamond
+            ElementKind::Rectangle
+                | ElementKind::Ellipse
+                | ElementKind::Diamond
+                | ElementKind::Arrow { .. }
+                | ElementKind::Line { .. }
         )
     }
 

@@ -496,19 +496,28 @@ impl BoardView {
         self.history.record(&self.scene);
 
         match op {
-            CanvasOp::Rectangle { x, y, w, h, style } => {
+            CanvasOp::Rectangle { x, y, w, h, style, text } => {
                 let el = Element::new(ElementKind::Rectangle, WBounds::new(x, y, w, h), styled(style));
-                self.scene.add(el);
+                let id = self.scene.add(el);
+                if let Some(t) = text.filter(|t| !t.is_empty()) {
+                    self.add_bound_label(id, WBounds::new(x, y, w, h), t);
+                }
             }
-            CanvasOp::Ellipse { x, y, w, h, style } => {
+            CanvasOp::Ellipse { x, y, w, h, style, text } => {
                 let el = Element::new(ElementKind::Ellipse, WBounds::new(x, y, w, h), styled(style));
-                self.scene.add(el);
+                let id = self.scene.add(el);
+                if let Some(t) = text.filter(|t| !t.is_empty()) {
+                    self.add_bound_label(id, WBounds::new(x, y, w, h), t);
+                }
             }
-            CanvasOp::Diamond { x, y, w, h, style } => {
+            CanvasOp::Diamond { x, y, w, h, style, text } => {
                 let el = Element::new(ElementKind::Diamond, WBounds::new(x, y, w, h), styled(style));
-                self.scene.add(el);
+                let id = self.scene.add(el);
+                if let Some(t) = text.filter(|t| !t.is_empty()) {
+                    self.add_bound_label(id, WBounds::new(x, y, w, h), t);
+                }
             }
-            CanvasOp::Line { points, style } => {
+            CanvasOp::Line { points, style, text } => {
                 let pts: Vec<WPoint> = points.into_iter().map(Into::into).collect();
                 if pts.len() >= 2 {
                     let el = Element::from_absolute_points(
@@ -516,7 +525,11 @@ impl BoardView {
                         pts,
                         styled(style),
                     );
-                    self.scene.add(el);
+                    let bounds = el.bounds;
+                    let id = self.scene.add(el);
+                    if let Some(t) = text.filter(|t| !t.is_empty()) {
+                        self.add_bound_label(id, bounds, t);
+                    }
                 }
             }
             CanvasOp::Arrow {
@@ -524,6 +537,7 @@ impl BoardView {
                 start_arrowhead,
                 end_arrowhead,
                 style,
+                text,
             } => {
                 let pts: Vec<WPoint> = points.into_iter().map(Into::into).collect();
                 if pts.len() >= 2 {
@@ -536,7 +550,11 @@ impl BoardView {
                         pts,
                         styled(style),
                     );
-                    self.scene.add(el);
+                    let bounds = el.bounds;
+                    let id = self.scene.add(el);
+                    if let Some(t) = text.filter(|t| !t.is_empty()) {
+                        self.add_bound_label(id, bounds, t);
+                    }
                 }
             }
             CanvasOp::Text {
@@ -576,6 +594,48 @@ impl BoardView {
         cx.notify();
     }
 
+    /// Create a bound text label centered inside a container shape. Mirrors
+    /// what `edit_container_label` does for interactive double-click: creates a
+    /// `Text` element with `container_id` set, wraps to the container width,
+    /// centers it, and queues it for measurement so the real text system
+    /// refines its bounds on the next render.
+    ///
+    /// For line/arrow containers, a white background is added to the label so
+    /// the text is readable over the line stroke.
+    fn add_bound_label(&mut self, container_id: ElementId, bounds: WBounds, text: String) {
+        // Check if the container is a line/arrow — those need a label background
+        // so text is legible over the stroke.
+        let is_line_container = self
+            .scene
+            .get(container_id)
+            .is_some_and(|e| {
+                matches!(
+                    e.kind,
+                    ElementKind::Arrow { .. } | ElementKind::Line { .. }
+                )
+            });
+        let mut el = self.new_text_element(WPoint::new(bounds.x, bounds.y), text);
+        if let ElementKind::Text {
+            wrap_width,
+            container_id: cid,
+            text_align,
+            ..
+        } = &mut el.kind
+        {
+            *wrap_width = Some(bounds.w.max(10.0));
+            *cid = Some(container_id);
+            *text_align = TextAlign::Center;
+        }
+        // Give line/arrow labels an opaque white background so the label text
+        // is readable on top of the line stroke.
+        if is_line_container {
+            el.style.background = Some(0xffffff);
+        }
+        place_label(&mut el.bounds, bounds, TextAlign::Center);
+        let id = self.scene.add(el);
+        self.pending_measure.push(id);
+    }
+
     /// World-space point at the center of the visible canvas. Kept for future
     /// auto-layout use; box/text ops currently carry absolute coordinates.
     fn viewport_center_world(&self) -> WPoint {
@@ -605,6 +665,24 @@ impl BoardView {
             .as_ref()
             .map(|p| p.read(cx).width())
             .unwrap_or(crate::ai::panel::DEFAULT_WIDTH)
+    }
+
+    /// True if `position` (window/content coordinates) lies over the AI panel.
+    /// The panel docks against the right edge, so this is "right of the panel's
+    /// left edge". Used to make the canvas's mouse/scroll handlers ignore events
+    /// that the panel owns — without this, the canvas would steal focus on every
+    /// click inside the panel (and would otherwise need stop_propagation on the
+    /// panel root, which breaks gpui-component's text selection drag, since GPUI
+    /// runs all mouse listeners — element handlers and TextView's selection
+    /// listeners alike — through one loop that aborts on stop_propagation).
+    fn over_ai_panel(&self, position: Point<Pixels>, window: &Window, cx: &mut Context<Self>) -> bool {
+        if self.ai_panel.is_none() {
+            return false;
+        }
+        let panel_w = self.ai_panel_width(cx);
+        let win_right = f32::from(window.viewport_size().width);
+        let panel_left = win_right - panel_w;
+        f32::from(position.x) >= panel_left
     }
 
     /// The cursor the canvas should show right now. Centralized so both the
@@ -773,6 +851,12 @@ impl BoardView {
     // mouse handlers
 
     fn on_left_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Ignore clicks that land on the AI panel — the panel owns those (its
+        // input field, selectable text, buttons). Returning before the focus
+        // grab below keeps the panel's widgets focused and interactive.
+        if self.over_ai_panel(event.position, window, cx) {
+            return;
+        }
         self.focus_handle.focus(window);
         let world = self.to_world(event.position);
 
@@ -1006,16 +1090,25 @@ impl BoardView {
     fn on_middle_down(
         &mut self,
         event: &MouseDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.over_ai_panel(event.position, window, cx) {
+            return;
+        }
         self.drag = DragState::Panning {
             last_screen: event.position,
         };
         cx.notify();
     }
 
-    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Ignore moves over the AI panel — the panel owns hover/cursor/selection
+        // there, and the canvas must not fight it (e.g. update the hover handle
+        // or keep an in-progress drag updating while the pointer is over text).
+        if self.over_ai_panel(event.position, window, cx) {
+            return;
+        }
         // Track modifier state so render() can hint the pending gesture cursor
         // (Ctrl => pan hand, Shift => pen crosshair) while hovering, before any
         // button is pressed.
@@ -1319,6 +1412,14 @@ impl BoardView {
 
     fn on_left_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         let _ = window;
+        // A drag that ends over the AI panel is abandoned (the release point
+        // maps to an occluded canvas region). Reset the drag state so the
+        // canvas doesn't stay stuck mid-draw, but don't commit anything.
+        if self.over_ai_panel(event.position, window, cx) {
+            self.drag = DragState::Idle;
+            cx.notify();
+            return;
+        }
         let world = self.to_world(event.position);
         match std::mem::take(&mut self.drag) {
             DragState::Drawing { start, seed } => {
@@ -1402,7 +1503,15 @@ impl BoardView {
         cx.notify();
     }
 
-    fn on_middle_up(&mut self, _event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_middle_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.over_ai_panel(event.position, window, cx) {
+            // Reset any in-progress pan so the canvas doesn't stay stuck.
+            if matches!(self.drag, DragState::Panning { .. }) {
+                self.drag = DragState::Idle;
+                cx.notify();
+            }
+            return;
+        }
         if matches!(self.drag, DragState::Panning { .. }) {
             self.drag = DragState::Idle;
             cx.notify();
@@ -1412,9 +1521,14 @@ impl BoardView {
     fn on_scroll_wheel(
         &mut self,
         event: &ScrollWheelEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Let the AI panel's messages area handle its own scroll; don't zoom/pan
+        // the canvas when the wheel turns over the panel.
+        if self.over_ai_panel(event.position, window, cx) {
+            return;
+        }
         let delta = event.delta.pixel_delta(px(20.0));
         if event.modifiers.control || event.modifiers.platform {
             let factor = (-delta.y.to_f64() * 0.002).exp();
