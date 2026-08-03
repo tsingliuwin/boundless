@@ -67,7 +67,11 @@ pub const SYSTEM_PROMPT: &str = r##"你是 boundless 白板应用的绘图助手
 用 text 参数在线上标注条件，如「是」「否」。
 - draw_line(points, text?)：画无箭头的连线。同样支持 text 参数标注。
 - draw_text(x, y, text)：画独立文本，用于标题或说明（不属于任何形状的文字）。
-- 以上工具均可省略 style，沿用画板当前样式。
+- update_element(id, x?, y?, text?)：修改已有元素的位置或文字。画错了可以用它修正，不必删除重画。
+- delete_element(id)：删除一个元素（及其标签）。
+- list_elements()：查询画布上所有元素的 ID、类型、文字和位置。
+- 以上绘图工具均可省略 style，沿用画板当前样式。
+- 每个 draw_* 工具会返回元素的 id（如 id=a1b2c3d4），后续可用 update_element 或 delete_element 引用。
 
 ## 画布坐标系
 - 原点在左上角，x 向右增大，y 向下增大。可见范围约 x∈[0,1600]、y∈[0,1000]。
@@ -112,7 +116,13 @@ pub enum AgentEvent {
     /// panel that is expanded while streaming and auto-collapses on Done.
     Reasoning(String),
     /// A canvas op produced by a tool call — apply it to the board.
-    CanvasOp(CanvasOp),
+    /// `pre_assigned_id` is the UUID the tool generated for this element (so
+    /// the tool can report it back to the model); `apply_canvas_op` uses it as
+    /// the element's id on create ops. None for non-create ops (update/delete).
+    CanvasOp {
+        op: CanvasOp,
+        pre_assigned_id: Option<uuid::Uuid>,
+    },
     /// The model made a tool call. `id` is rig's internal call id (used to pair
     /// with the later [`AgentEvent::ToolResult`]); `name` is the tool, `args` is
     /// the raw JSON arguments the model supplied. Shown as an expandable step
@@ -143,6 +153,7 @@ impl BoundlessAgent {
     fn build(
         settings: &AiSettings,
         events: UnboundedSender<AgentEvent>,
+        snapshot: Arc<Vec<super::tools::ElementSnapshot>>,
     ) -> anyhow::Result<rig_core::agent::Agent<Model>> {
         if settings.api_key.is_empty() {
             return Err(anyhow!(
@@ -170,7 +181,7 @@ impl BoundlessAgent {
             .additional_params(serde_json::json!({
                 "reasoning_effort": settings.reasoning_effort.as_str()
             }))
-            .tools(all_tools(events))
+            .tools(all_tools(events, snapshot))
             .build();
         Ok(agent)
     }
@@ -185,9 +196,10 @@ impl BoundlessAgent {
         settings: &AiSettings,
         prompt: String,
         history: Vec<ChatMessage>,
+        snapshot: Arc<Vec<super::tools::ElementSnapshot>>,
     ) -> anyhow::Result<AgentRequest> {
         let (tx, rx) = futures::channel::mpsc::unbounded();
-        let agent = Self::build(settings, tx.clone())?;
+        let agent = Self::build(settings, tx.clone(), snapshot)?;
         let chat_history: Vec<RigMessage> = history.into_iter().filter_map(msg_to_rig).collect();
 
         // stream_chat(prompt, history) returns a StreamingPromptRequest;

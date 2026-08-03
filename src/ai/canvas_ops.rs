@@ -86,7 +86,7 @@ impl From<OpTextAlign> for crate::scene::TextAlign {
 }
 
 /// A single drawing operation. Variants mirror the whiteboard's element kinds.
-/// Coordinates are in world space (see [`OpPoint`]).
+/// Coordinates are in world space (see [`OpPoint]).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "shape", rename_all = "snake_case")]
 pub enum CanvasOp {
@@ -150,6 +150,20 @@ pub enum CanvasOp {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,
     },
+    /// Modify an existing element: move it to new coordinates and/or change its
+    /// text. `id` is the element's UUID (returned by the draw tool that created
+    /// it, or discovered via `list_elements`). All fields except `id` are optional.
+    UpdateElement {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        x: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        y: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+    },
+    /// Delete an element by id (also removes its bound label, if any).
+    DeleteElement { id: String },
     /// Standalone text. `text` may contain newlines for multi-line.
     Text {
         x: f64,
@@ -182,6 +196,8 @@ impl CanvasOp {
             CanvasOp::Line { .. } => "直线",
             CanvasOp::Arrow { .. } => "箭头",
             CanvasOp::Text { .. } => "文本",
+            CanvasOp::UpdateElement { .. } => "修改",
+            CanvasOp::DeleteElement { .. } => "删除",
         }
     }
 }

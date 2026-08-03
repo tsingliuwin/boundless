@@ -13,6 +13,8 @@
 //! on the GPUI main thread. `AgentEvent::CanvasOp` is drained on the main
 //! thread to mutate the scene.
 
+use std::sync::Arc;
+
 use futures::channel::mpsc::UnboundedSender;
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
@@ -23,6 +25,12 @@ use serde_json::Value;
 use super::agent::{next_tool_id, AgentEvent};
 use super::canvas_ops::{CanvasOp, CanvasStyle, OpPoint, OpTextAlign};
 use super::client::ChatMessage;
+
+/// Generate a new element UUID (used by draw tools so the id can be reported
+/// back to the model before the element is created on the main thread).
+fn new_element_id() -> uuid::Uuid {
+    uuid::Uuid::new_v4()
+}
 
 /// Shared error type for all drawing tools. Tools are infallible in practice
 /// (sending to an unbounded channel only fails if the receiver was dropped,
@@ -45,29 +53,63 @@ impl std::error::Error for ToolError {}
 // string. This makes every tool call a clean, self-contained execution unit.
 // ---------------------------------------------------------------------------
 
-/// The compact string returned to the model for a successful draw.
-const TOOL_OK: &str = "已添加到画布";
+/// The compact string returned to the model for a successful draw, carrying
+/// the element's short id so the model can reference it in update/delete calls.
+fn tool_ok_result(element_id: uuid::Uuid) -> String {
+    format!("已添加到画布，id={}", &element_id.to_string()[..8])
+}
 
 /// Emit the full tool-call lifecycle: open a pending step, apply the canvas
 /// op, then mark the step done. All three events share the same `id` so the
 /// UI can pair them. `args_json` is the re-serialized arguments the model
-/// supplied (kept for the UI's expandable detail view).
+/// supplied (kept for the UI's expandable detail view). `element_id` is the
+/// pre-generated UUID for the new element — reported back to the model in the
+/// result string so it can update/delete the element later.
 fn emit_tool_step(
     events: &UnboundedSender<AgentEvent>,
     id: String,
     name: &str,
     args_json: Value,
     op: CanvasOp,
+    element_id: uuid::Uuid,
 ) {
     let _ = events.unbounded_send(AgentEvent::ToolCall {
         id: id.clone(),
         name: name.to_string(),
         args: args_json,
     });
-    let _ = events.unbounded_send(AgentEvent::CanvasOp(op));
+    let _ = events.unbounded_send(AgentEvent::CanvasOp {
+        op,
+        pre_assigned_id: Some(element_id),
+    });
     let _ = events.unbounded_send(AgentEvent::ToolResult {
         id,
-        result: TOOL_OK.to_string(),
+        result: tool_ok_result(element_id),
+    });
+}
+
+/// Emit a tool-call lifecycle for non-create ops (update/delete) that don't
+/// create a new element. The result string confirms the operation.
+fn emit_tool_action(
+    events: &UnboundedSender<AgentEvent>,
+    id: String,
+    name: &str,
+    args_json: Value,
+    op: CanvasOp,
+    result: &str,
+) {
+    let _ = events.unbounded_send(AgentEvent::ToolCall {
+        id: id.clone(),
+        name: name.to_string(),
+        args: args_json,
+    });
+    let _ = events.unbounded_send(AgentEvent::CanvasOp {
+        op,
+        pre_assigned_id: None,
+    });
+    let _ = events.unbounded_send(AgentEvent::ToolResult {
+        id,
+        result: result.to_string(),
     });
 }
 
@@ -182,8 +224,10 @@ impl Tool for RectangleTool {
             style: args.style,
             text: args.text,
         };
-        emit_tool_step(&self.events, id, Self::NAME, args_json, op);
-        async move { Ok(TOOL_OK.to_string()) }
+        let element_id = new_element_id();
+        let result = tool_ok_result(element_id);
+        emit_tool_step(&self.events, id, Self::NAME, args_json, op, element_id);
+        async move { Ok(result) }
     }
 }
 
@@ -221,8 +265,10 @@ impl Tool for EllipseTool {
             style: args.style,
             text: args.text,
         };
-        emit_tool_step(&self.events, id, Self::NAME, args_json, op);
-        async move { Ok(TOOL_OK.to_string()) }
+        let element_id = new_element_id();
+        let result = tool_ok_result(element_id);
+        emit_tool_step(&self.events, id, Self::NAME, args_json, op, element_id);
+        async move { Ok(result) }
     }
 }
 
@@ -260,8 +306,10 @@ impl Tool for DiamondTool {
             style: args.style,
             text: args.text,
         };
-        emit_tool_step(&self.events, id, Self::NAME, args_json, op);
-        async move { Ok(TOOL_OK.to_string()) }
+        let element_id = new_element_id();
+        let result = tool_ok_result(element_id);
+        emit_tool_step(&self.events, id, Self::NAME, args_json, op, element_id);
+        async move { Ok(result) }
     }
 }
 
@@ -296,8 +344,10 @@ impl Tool for LineTool {
             style: args.style,
             text: args.text,
         };
-        emit_tool_step(&self.events, id, Self::NAME, args_json, op);
-        async move { Ok(TOOL_OK.to_string()) }
+        let element_id = new_element_id();
+        let result = tool_ok_result(element_id);
+        emit_tool_step(&self.events, id, Self::NAME, args_json, op, element_id);
+        async move { Ok(result) }
     }
 }
 
@@ -334,8 +384,10 @@ impl Tool for ArrowTool {
             style: args.style,
             text: args.text,
         };
-        emit_tool_step(&self.events, id, Self::NAME, args_json, op);
-        async move { Ok(TOOL_OK.to_string()) }
+        let element_id = new_element_id();
+        let result = tool_ok_result(element_id);
+        emit_tool_step(&self.events, id, Self::NAME, args_json, op, element_id);
+        async move { Ok(result) }
     }
 }
 
@@ -373,16 +425,178 @@ impl Tool for TextTool {
             align: args.align,
             style: args.style,
         };
-        emit_tool_step(&self.events, id, Self::NAME, args_json, op);
-        async move { Ok(TOOL_OK.to_string()) }
+        let element_id = new_element_id();
+        let result = tool_ok_result(element_id);
+        emit_tool_step(&self.events, id, Self::NAME, args_json, op, element_id);
+        async move { Ok(result) }
     }
 }
 
-/// Build all drawing tools sharing one event channel. Each tool emits its
-/// own `ToolCall`/`CanvasOp`/`ToolResult` lifecycle through `events`; rig's
-/// internal tool-call stream items are ignored on the agent side.
+// --- Update Element --------------------------------------------------------
+
+/// Arguments for updating an existing element.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct UpdateElementArgs {
+    /// The element's id (returned by the draw tool, 8-char prefix).
+    pub id: String,
+    /// New top-left X. Omit to keep current position.
+    #[serde(default)]
+    pub x: Option<f64>,
+    /// New top-left Y. Omit to keep current position.
+    #[serde(default)]
+    pub y: Option<f64>,
+    /// New text content (for shapes/lines/arrows with labels, or standalone
+    /// text). Omit to keep current text.
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+pub struct UpdateElementTool {
+    pub events: UnboundedSender<AgentEvent>,
+}
+
+impl Tool for UpdateElementTool {
+    const NAME: &'static str = "update_element";
+    type Error = ToolError;
+    type Args = UpdateElementArgs;
+    type Output = String;
+
+    fn definition(&self, _prompt: String) -> impl std::future::Future<Output = ToolDefinition> + Send {
+        let def = tool_def::<UpdateElementArgs>(
+            Self::NAME,
+            "修改已有元素的位置或文字。id 是创建时返回的元素 ID。可单独修改 x/y（移动）或 text（改文字）。",
+        );
+        async move { def }
+    }
+
+    fn call(
+        &self,
+        args: Self::Args,
+    ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
+        let id = next_tool_id(Self::NAME);
+        let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
+        let op = CanvasOp::UpdateElement {
+            id: args.id,
+            x: args.x,
+            y: args.y,
+            text: args.text,
+        };
+        emit_tool_action(&self.events, id, Self::NAME, args_json, op, "已更新");
+        async move { Ok("已更新".to_string()) }
+    }
+}
+
+// --- Delete Element --------------------------------------------------------
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct DeleteElementArgs {
+    /// The element's id (returned by the draw tool, 8-char prefix).
+    pub id: String,
+}
+
+pub struct DeleteElementTool {
+    pub events: UnboundedSender<AgentEvent>,
+}
+
+impl Tool for DeleteElementTool {
+    const NAME: &'static str = "delete_element";
+    type Error = ToolError;
+    type Args = DeleteElementArgs;
+    type Output = String;
+
+    fn definition(&self, _prompt: String) -> impl std::future::Future<Output = ToolDefinition> + Send {
+        let def = tool_def::<DeleteElementArgs>(
+            Self::NAME,
+            "删除画布上的一个元素（及其绑定的文字标签）。id 是创建时返回的元素 ID。",
+        );
+        async move { def }
+    }
+
+    fn call(
+        &self,
+        args: Self::Args,
+    ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
+        let id = next_tool_id(Self::NAME);
+        let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
+        let op = CanvasOp::DeleteElement { id: args.id };
+        emit_tool_action(&self.events, id, Self::NAME, args_json, op, "已删除");
+        async move { Ok("已删除".to_string()) }
+    }
+}
+
+// --- List Elements ---------------------------------------------------------
+
+/// A lightweight summary of one canvas element, for the `list_elements` tool.
+#[derive(Clone, Debug)]
+pub struct ElementSnapshot {
+    pub id: String,
+    pub kind: String,
+    pub text: Option<String>,
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+impl ElementSnapshot {
+    /// One-line summary for the model, e.g. "ellipse id=a1b2c3d4 text=开始 (350,40) 120×50".
+    fn summary(&self) -> String {
+        let text_part = self
+            .text
+            .as_ref()
+            .map(|t| format!(" text={t}"))
+            .unwrap_or_default();
+        format!(
+            "{} id={}{} ({:.0},{:.0}) {:.0}x{:.0}",
+            self.kind, self.id, text_part, self.x, self.y, self.w, self.h
+        )
+    }
+}
+
+pub struct ListElementsTool {
+    pub snapshot: Arc<Vec<ElementSnapshot>>,
+}
+
+impl Tool for ListElementsTool {
+    const NAME: &'static str = "list_elements";
+    type Error = ToolError;
+    type Args = NoArgs;
+    type Output = String;
+
+    fn definition(&self, _prompt: String) -> impl std::future::Future<Output = ToolDefinition> + Send {
+        let def = tool_def::<NoArgs>(
+            Self::NAME,
+            "列出画布上当前所有元素的 ID、类型、文字和位置。用于查询已有元素以便修改或删除。",
+        );
+        async move { def }
+    }
+
+    fn call(
+        &self,
+        _args: Self::Args,
+    ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
+        let result = if self.snapshot.is_empty() {
+            "画布为空".to_string()
+        } else {
+            let lines: Vec<String> = self.snapshot.iter().enumerate().map(|(i, e)| {
+                format!("{}. {}", i + 1, e.summary())
+            }).collect();
+            lines.join("\n")
+        };
+        async move { Ok(result) }
+    }
+}
+
+/// Empty args for tools that take no parameters.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct NoArgs {}
+
+/// Build all tools sharing one event channel + a canvas snapshot for
+/// `list_elements`. Each draw tool emits its own `ToolCall`/`CanvasOp`/
+/// `ToolResult` lifecycle through `events`.
 pub fn all_tools(
     events: UnboundedSender<AgentEvent>,
+    snapshot: Arc<Vec<ElementSnapshot>>,
 ) -> Vec<Box<dyn rig_core::tool::ToolDyn>> {
     vec![
         Box::new(RectangleTool {
@@ -400,7 +614,16 @@ pub fn all_tools(
         Box::new(ArrowTool {
             events: events.clone(),
         }),
-        Box::new(TextTool { events }),
+        Box::new(TextTool {
+            events: events.clone(),
+        }),
+        Box::new(UpdateElementTool {
+            events: events.clone(),
+        }),
+        Box::new(DeleteElementTool {
+            events: events.clone(),
+        }),
+        Box::new(ListElementsTool { snapshot }),
     ]
 }
 

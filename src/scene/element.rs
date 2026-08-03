@@ -266,9 +266,31 @@ impl Element {
         }
     }
 
+    /// Like [`new`] but with a caller-supplied id. Used by AI draw tools that
+    /// pre-generate the id so they can report it back to the model.
+    pub fn new_with_id(id: Uuid, kind: ElementKind, bounds: WBounds, style: ElementStyle) -> Self {
+        Self {
+            id,
+            bounds,
+            seed: new_seed(),
+            style,
+            kind,
+        }
+    }
+
     /// Create a point-based element (line/arrow/freedraw) from absolute points:
     /// the bounds are computed and points made relative to the origin.
     pub fn from_absolute_points(
+        kind_builder: impl FnOnce(Vec<WPoint>) -> ElementKind,
+        points: Vec<WPoint>,
+        style: ElementStyle,
+    ) -> Self {
+        Self::from_absolute_points_with_id(Uuid::new_v4(), kind_builder, points, style)
+    }
+
+    /// Like [`from_absolute_points`] but with a caller-supplied id.
+    pub fn from_absolute_points_with_id(
+        id: Uuid,
         kind_builder: impl FnOnce(Vec<WPoint>) -> ElementKind,
         mut points: Vec<WPoint>,
         style: ElementStyle,
@@ -278,7 +300,7 @@ impl Element {
             p.x -= bounds.x;
             p.y -= bounds.y;
         }
-        Self::new(kind_builder(points), bounds, style)
+        Self::new_with_id(id, kind_builder(points), bounds, style)
     }
 
     pub fn new_text(origin: WPoint, text: String, style: ElementStyle) -> Self {

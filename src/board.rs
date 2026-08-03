@@ -480,7 +480,12 @@ impl BoardView {
     /// record it to history (so it's undoable), add it to the scene, and — for
     /// text — queue it for precise remeasure during the next render. This is
     /// the main-thread entry point driven by the AI agent's tool calls.
-    pub fn apply_canvas_op(&mut self, op: CanvasOp, cx: &mut Context<Self>) {
+    pub fn apply_canvas_op(
+        &mut self,
+        op: CanvasOp,
+        pre_assigned_id: Option<uuid::Uuid>,
+        cx: &mut Context<Self>,
+    ) {
         // Merge the op's optional style over the board's current style so that
         // omitted fields inherit "last used wins" — the same behavior as a
         // hand-drawn shape.
@@ -497,21 +502,21 @@ impl BoardView {
 
         match op {
             CanvasOp::Rectangle { x, y, w, h, style, text } => {
-                let el = Element::new(ElementKind::Rectangle, WBounds::new(x, y, w, h), styled(style));
+                let el = Element::new_with_id(pre_assigned_id.unwrap_or_default(), ElementKind::Rectangle, WBounds::new(x, y, w, h), styled(style));
                 let id = self.scene.add(el);
                 if let Some(t) = text.filter(|t| !t.is_empty()) {
                     self.add_bound_label(id, WBounds::new(x, y, w, h), t);
                 }
             }
             CanvasOp::Ellipse { x, y, w, h, style, text } => {
-                let el = Element::new(ElementKind::Ellipse, WBounds::new(x, y, w, h), styled(style));
+                let el = Element::new_with_id(pre_assigned_id.unwrap_or_default(), ElementKind::Ellipse, WBounds::new(x, y, w, h), styled(style));
                 let id = self.scene.add(el);
                 if let Some(t) = text.filter(|t| !t.is_empty()) {
                     self.add_bound_label(id, WBounds::new(x, y, w, h), t);
                 }
             }
             CanvasOp::Diamond { x, y, w, h, style, text } => {
-                let el = Element::new(ElementKind::Diamond, WBounds::new(x, y, w, h), styled(style));
+                let el = Element::new_with_id(pre_assigned_id.unwrap_or_default(), ElementKind::Diamond, WBounds::new(x, y, w, h), styled(style));
                 let id = self.scene.add(el);
                 if let Some(t) = text.filter(|t| !t.is_empty()) {
                     self.add_bound_label(id, WBounds::new(x, y, w, h), t);
@@ -520,7 +525,8 @@ impl BoardView {
             CanvasOp::Line { points, style, text } => {
                 let pts: Vec<WPoint> = points.into_iter().map(Into::into).collect();
                 if pts.len() >= 2 {
-                    let el = Element::from_absolute_points(
+                    let el = Element::from_absolute_points_with_id(
+                        pre_assigned_id.unwrap_or_default(),
                         |p| ElementKind::Line { points: p },
                         pts,
                         styled(style),
@@ -541,7 +547,8 @@ impl BoardView {
             } => {
                 let pts: Vec<WPoint> = points.into_iter().map(Into::into).collect();
                 if pts.len() >= 2 {
-                    let el = Element::from_absolute_points(
+                    let el = Element::from_absolute_points_with_id(
+                        pre_assigned_id.unwrap_or_default(),
                         |p| ElementKind::Arrow {
                             points: p,
                             start_arrowhead,
@@ -568,6 +575,10 @@ impl BoardView {
                 let fs = font_size.unwrap_or(self.text_font_size).max(4.0);
                 let ta = align.map(Into::into).unwrap_or(self.text_align);
                 let mut el = Element::new_text(WPoint::new(x, y), text, styled(style));
+                // Override the auto-generated id with the pre-assigned one.
+                if let Some(id) = pre_assigned_id {
+                    el.id = id;
+                }
                 if let ElementKind::Text {
                     font_size: ref mut fs2,
                     text_align: ref mut ta2,
@@ -588,6 +599,75 @@ impl BoardView {
                 el.bounds.h = lines as f64 * fs * LINE_HEIGHT;
                 let id = self.scene.add(el);
                 self.pending_measure.push(id);
+            }
+            CanvasOp::UpdateElement { id, x, y, text } => {
+                if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
+                    // Phase 1: update position (needs a mutable borrow of the element).
+                    let mut needs_label_update = false;
+                    if let Some(el) = self.scene.get_mut(uuid) {
+                        if let Some(nx) = x {
+                            el.bounds.x = nx;
+                        }
+                        if let Some(ny) = y {
+                            el.bounds.y = ny;
+                        }
+                        // Determine if this is a standalone text element.
+                        if let Some(nt) = &text {
+                            if let ElementKind::Text { text: ref mut t, .. } = el.kind {
+                                *t = nt.clone();
+                            } else {
+                                needs_label_update = true;
+                            }
+                        }
+                    }
+                    // Phase 2: if the element is a shape (not Text), update or
+                    // create its bound label. Done in a separate scope so the
+                    // earlier mutable borrow is released.
+                    if needs_label_update {
+                        if let Some(nt) = &text {
+                            // Find existing bound label for this container.
+                            let label_id = self.scene.elements.iter().find_map(|e| {
+                                if let ElementKind::Text { container_id: Some(cid), .. } = &e.kind {
+                                    if *cid == uuid { Some(e.id) } else { None }
+                                } else { None }
+                            });
+                            if let Some(lid) = label_id {
+                                if let Some(label) = self.scene.get_mut(lid) {
+                                    if let ElementKind::Text { text: ref mut t, .. } = label.kind {
+                                        *t = nt.clone();
+                                    }
+                                }
+                                let cb = self.scene.get(uuid).map(|e| e.bounds);
+                                if let Some(cb) = cb {
+                                    if let Some(label) = self.scene.get_mut(lid) {
+                                        place_label(&mut label.bounds, cb, TextAlign::Center);
+                                    }
+                                }
+                                self.pending_measure.push(lid);
+                            } else if let Some(cb) = self.scene.get(uuid).map(|e| e.bounds) {
+                                self.add_bound_label(uuid, cb, nt.clone());
+                            }
+                        }
+                    }
+                    // Phase 3: move bound labels to follow the (possibly moved) container.
+                    if x.is_some() || y.is_some() {
+                        let cb = self.scene.get(uuid).map(|e| e.bounds);
+                        if let Some(cb) = cb {
+                            for e in self.scene.elements.iter_mut() {
+                                if let ElementKind::Text { container_id: Some(cid), .. } = &e.kind {
+                                    if *cid == uuid {
+                                        place_label(&mut e.bounds, cb, TextAlign::Center);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            CanvasOp::DeleteElement { id } => {
+                if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
+                    self.remove_element(uuid);
+                }
             }
         }
         self.mark_dirty();
@@ -634,6 +714,33 @@ impl BoardView {
         place_label(&mut el.bounds, bounds, TextAlign::Center);
         let id = self.scene.add(el);
         self.pending_measure.push(id);
+    }
+
+    /// Build a lightweight snapshot of all canvas elements for the AI agent's
+    /// `list_elements` tool. Each entry carries the element's short id, kind
+    /// label, optional text, and bounding box.
+    pub fn element_snapshot(&self) -> Vec<crate::ai::tools::ElementSnapshot> {
+        use crate::ai::tools::ElementSnapshot;
+        self.scene.elements.iter().map(|el| {
+            let (kind, text) = match &el.kind {
+                ElementKind::Rectangle => ("rectangle", el.text().map(|t| t.to_string())),
+                ElementKind::Ellipse => ("ellipse", el.text().map(|t| t.to_string())),
+                ElementKind::Diamond => ("diamond", el.text().map(|t| t.to_string())),
+                ElementKind::Arrow { .. } => ("arrow", el.text().map(|t| t.to_string())),
+                ElementKind::Line { .. } => ("line", el.text().map(|t| t.to_string())),
+                ElementKind::Text { text, .. } => ("text", Some(text.clone())),
+                ElementKind::Freedraw { .. } => ("freedraw", None),
+            };
+            ElementSnapshot {
+                id: el.id.to_string()[..8].to_string(),
+                kind: kind.to_string(),
+                text,
+                x: el.bounds.x,
+                y: el.bounds.y,
+                w: el.bounds.w,
+                h: el.bounds.h,
+            }
+        }).collect()
     }
 
     /// World-space point at the center of the visible canvas. Kept for future

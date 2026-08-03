@@ -334,7 +334,18 @@ impl AiPanel {
             .rev()
             .collect();
 
-        match BoundlessAgent::stream(&self.settings, prompt, history) {
+        // Build a snapshot of the current canvas elements so the agent can
+        // query them via the `list_elements` tool and reference their ids.
+        let snapshot = self
+            .board
+            .update(cx, |board, _cx| board.element_snapshot())
+            .unwrap_or_default();
+        match BoundlessAgent::stream(
+            &self.settings,
+            prompt,
+            history,
+            std::sync::Arc::new(snapshot),
+        ) {
             Ok(request) => self.start_stream_task(request, cx),
             Err(e) => {
                 self.error = Some(format!("{e:#}"));
@@ -498,9 +509,9 @@ impl AiPanel {
     ) -> bool {
         match event {
             AgentEvent::Delta(_) | AgentEvent::Reasoning(_) => true,
-            AgentEvent::CanvasOp(op) => {
+            AgentEvent::CanvasOp { op, pre_assigned_id } => {
                 board
-                    .update(cx, |board, cx| board.apply_canvas_op(op, cx))
+                    .update(cx, |board, cx| board.apply_canvas_op(op, pre_assigned_id, cx))
                     .ok();
                 cx.notify();
                 true
