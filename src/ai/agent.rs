@@ -56,8 +56,10 @@ pub const SYSTEM_PROMPT: &str = r##"你是 boundless 白板应用的绘图助手
 ## 行动准则
 1. 用户提到任何图表、流程图、示意图时，**立即调用绘图工具**，不要只回复文字。
 2. 先画图，后说明。哪怕只画出一部分也比只说不画好。
-3. 每次调用一个工具，简短思考下一步，再调下一个。用户能看到你的每一步操作。
-4. 用中文简要说明你画了什么，不要逐条复述坐标。
+3. **禁止只说「马上开始」「我来画」之类的话却不调用工具**——你的回复里必须包含至少一次工具调用，否则视为失败。
+4. 用户的请求如果比较模糊（如「画一幅画」「随便画点东西」），不要追问或只口头规划，**直接选一个合理主题（如简单流程图、示意图）开始画**。
+5. 每次调用一个工具，简短思考下一步，再调下一个。用户能看到你的每一步操作。
+6. 用中文简要说明你画了什么，不要逐条复述坐标。
 
 ## 工具说明
 - draw_ellipse(x, y, w, h, text?)：画椭圆。用 text 参数写内部文字，如「开始」「结束」。
@@ -174,6 +176,12 @@ impl BoundlessAgent {
             // Each tool call is now a separate turn (the system prompt encourages
             // step-by-step drawing), so a complex diagram needs many rounds.
             .default_max_turns(100)
+            // Reasoning models can burn through a provider's default token
+            // limit during the thinking phase, truncating the response before
+            // any tool call is emitted - the agent then ends having only
+            // narrated ("马上开画") without drawing. A generous ceiling lets
+            // the reasoning finish and the tool call land.
+            .max_tokens(16000)
             // Reasoning effort (low/medium/high) flattened to the top-level
             // request body as `reasoning_effort`. Non-reasoning models ignore
             // the extra field; the `flatten` in rig's OpenAI request struct

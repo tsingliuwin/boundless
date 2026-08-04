@@ -596,7 +596,7 @@ impl AiPanel {
         }
     }
 
-    fn finish_streaming(&mut self, final_text: String, _drew_anything: bool, cx: &mut Context<Self>) {
+    fn finish_streaming(&mut self, final_text: String, drew_anything: bool, cx: &mut Context<Self>) {
         if let Some(s) = self.streaming.take() {
             // Prefer the aggregated final text; fall back to the streamed buffer
             // (some providers only emit deltas, never a final response).
@@ -608,10 +608,17 @@ impl AiPanel {
             if !text.trim().is_empty() {
                 let mut msg = ChatMessage::assistant(text);
                 // Preserve the ordered reasoning/tool steps so they survive
-                // after streaming — the user can re-expand any step.
+                // after streaming - the user can re-expand any step.
                 msg.steps = s.steps;
                 self.persist(&msg);
                 self.messages.push(msg);
+            }
+            // The model narrated but never called a drawing tool - surface it
+            // instead of silently ending, so the user knows nothing was drawn
+            // (common with reasoning models that truncate before the tool call,
+            // or when the model just plans verbally).
+            if !drew_anything {
+                self.error = Some("模型未调用任何绘图工具，没有内容被画到画布上。可以再试一次或把需求说得更具体。".to_string());
             }
             // Steps of the finished turn are now persisted; drop live toggles.
             self.open_done_steps.clear();
