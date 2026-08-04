@@ -198,13 +198,12 @@ pub fn paths_for_element(
                         &points,
                         points.len() - 1,
                         head_len,
-                        curved,
                         &mut push_drawable,
                         &mut out,
                     );
                 }
                 if *start_arrowhead && points.len() >= 2 {
-                    push_arrowhead(&gen, &points, 0, head_len, curved, &mut push_drawable, &mut out);
+                    push_arrowhead(&gen, &points, 0, head_len, &mut push_drawable, &mut out);
                 }
             }
         }
@@ -221,22 +220,21 @@ fn push_arrowhead(
     points: &[WPoint],
     tip_index: usize,
     head_len: f64,
-    curved: bool,
     push: &mut impl FnMut(&rough_piet::KurboDrawable<f64>, &mut Vec<ReadyPath>),
     out: &mut Vec<ReadyPath>,
 ) {
     let tip = points[tip_index];
     // Direction of the segment at the tip: for the end arrowhead it's the
     // incoming direction, for the start arrowhead it's the reverse of the
-    // outgoing segment (both are "tip minus its neighbor"). For curved
-    // polylines the neighbor is the *second*-nearest point: the smoothed
-    // tangent at the tip sits between the last two chords, and the longer
-    // baseline approximates it much better than the raw final segment.
-    let back = if curved { 2 } else { 1 };
+    // outgoing segment (both are "tip minus its neighbor"). This is correct
+    // for BOTH straight and curved lines: roughr's `curve` duplicates the
+    // first/last points, which clamps the spline's end tangents to the
+    // first/last segment - so the curve's tip tangent IS the last segment
+    // direction, not some averaged neighbor direction.
     let neighbor = if tip_index == 0 {
-        points[back.min(points.len() - 1)]
+        points[1.min(points.len() - 1)]
     } else {
-        points[tip_index.saturating_sub(back)]
+        points[tip_index - 1]
     };
     let dir = tip - neighbor;
     let len = (dir.x * dir.x + dir.y * dir.y).sqrt();
