@@ -3,13 +3,13 @@
 
 use gpui::{px, Hsla, Path, PathBuilder, Pixels, Point};
 use rough_piet::KurboGenerator;
-use roughr::core::{FillStyle, OpSetType, Options};
 use roughr::Srgba;
 
 use crate::camera::Camera;
 use crate::scene::{
     diamond_polygon, Element, ElementKind, ElementStyle, LineType, StrokeStyle, WPoint,
 };
+use roughr::core::{FillStyle, LineCap, LineJoin, OpSetType, Options};
 
 /// One tessellated path ready to paint.
 pub struct ReadyPath {
@@ -38,14 +38,29 @@ fn to_euclid(p: WPoint) -> euclid::default::Point2D<f64> {
     euclid::default::Point2D::new(p.x, p.y)
 }
 
-fn options_for(style: &ElementStyle, seed: u64, force_single_stroke: bool) -> Options {
+fn options_for(style: &ElementStyle, seed: u64, is_freedraw: bool) -> Options {
     let mut options = Options::default();
     let roughness = style.roughness.clamp(0.0, 3.0);
     options.roughness = Some(roughness);
     options.seed = Some(seed);
     options.stroke = Some(srgba(style.stroke, style.opacity));
     options.stroke_width = Some(style.stroke_width as f32);
-    options.disable_multi_stroke = Some(roughness <= 0.01 || force_single_stroke);
+    // Only disable multi-stroke for the "architect" (smooth) look. Freedraw
+    // keeps the double-pass: two slightly-offset strokes are what give
+    // hand-drawn ink its characteristic texture (Excalidraw does the same).
+    options.disable_multi_stroke = Some(roughness <= 0.01);
+    // Round caps/joins for all strokes — smoother endpoints and corners,
+    // matching Excalidraw's look. The default (Butt/Miter) looks harsh.
+    options.line_cap = Some(LineCap::Round);
+    options.line_join = Some(LineJoin::Round);
+    // Freedraw: keep the actual pointer vertices fixed so the stroke
+    // follows the user's hand precisely, while the control-point jitter
+    // between vertices still gives the hand-drawn texture. Without this
+    // every sample point is randomly offset ±2px → a jittery, unstable
+    // line (Excalidraw sets preserveVertices: true for freedraw).
+    if is_freedraw {
+        options.preserve_vertices = Some(true);
+    }
     if let Some(bg) = style.background {
         options.fill = Some(srgba(bg, style.opacity));
         options.fill_style = Some(FillStyle::Hachure);
