@@ -7,7 +7,8 @@ use roughr::Srgba;
 
 use crate::camera::Camera;
 use crate::scene::{
-    diamond_polygon, Element, ElementKind, ElementStyle, LineType, StrokeStyle, WPoint,
+    curve_samples, diamond_polygon, Element, ElementKind, ElementStyle, LineType, StrokeStyle,
+    WPoint,
 };
 use roughr::core::{FillStyle, LineCap, LineJoin, OpSetType, Options};
 
@@ -201,14 +202,42 @@ pub fn paths_for_element(
             let is_freedraw = matches!(el.kind, ElementKind::Freedraw { .. });
             // Lines/arrows render as straight polylines by default; the
             // "curved" line type fits a smooth curve through the points
-            // (Excalidraw). Freedraw strokes are always curved.
+            // (Excalidraw). Freedraw strokes are always smoothed.
             let curved = is_freedraw || style.line_type == LineType::Curved;
-            let gen = KurboGenerator::new(options_for(style, el.seed, is_freedraw));
-            let euclid_points: Vec<_> = points.iter().map(|p| to_euclid(*p)).collect();
-            if curved {
-                push_drawable(&gen.curve(&euclid_points), &mut out);
+
+            if is_freedraw {
+                // Freedraw bypasses roughr entirely: roughr's curve()
+                // applies random control-point jitter that, while seeded,
+                // produces slightly different paths across re-renders (the
+                // flatten tolerance changes with zoom, and the multi-stroke
+                // second pass inherits the first pass's advanced RNG state).
+                // Instead, sample a deterministic Catmull-Rom spline through
+                // the pointer points and stroke it directly. A committed
+                // stroke never moves.
+                let samples = curve_samples(&points, 12);
+                let mut builder = PathBuilder::stroke(stroke_width_px);
+                let origin = canvas_origin;
+                let screen = |p: &WPoint| camera.world_to_screen(*p, origin);
+                if let Some(first) = samples.first() {
+                    builder.move_to(screen(first));
+                    for p in samples.iter().skip(1) {
+                        builder.line_to(screen(p));
+                    }
+                    if let Ok(path) = builder.build() {
+                        out.push(ReadyPath {
+                            path,
+                            color: stroke_color,
+                        });
+                    }
+                }
             } else {
-                push_drawable(&gen.linear_path(&euclid_points, false), &mut out);
+                let gen = KurboGenerator::new(options_for(style, el.seed, false));
+                let euclid_points: Vec<_> = points.iter().map(|p| to_euclid(*p)).collect();
+                if curved {
+                    push_drawable(&gen.curve(&euclid_points), &mut out);
+                } else {
+                    push_drawable(&gen.linear_path(&euclid_points, false), &mut out);
+                }
             }
 
             if let ElementKind::Arrow {
@@ -217,6 +246,7 @@ pub fn paths_for_element(
                 ..
             } = &el.kind
             {
+                let gen = KurboGenerator::new(options_for(style, el.seed, false));
                 let head_len = (16.0 + style.stroke_width * 3.0).max(20.0);
                 if *end_arrowhead && points.len() >= 2 {
                     push_arrowhead(
