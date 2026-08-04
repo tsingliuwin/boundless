@@ -152,7 +152,7 @@ impl BoardView {
             temp_pan: false,
             modifiers: Modifiers::default(),
             context_menu: None,
-            show_grid: true,
+            show_grid: false,
         }
     }
 

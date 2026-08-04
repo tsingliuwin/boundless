@@ -155,10 +155,10 @@ impl Scene {
     }
 }
 
-/// Serde default for `SceneFile::show_grid`: old scenes (pre-grid-toggle)
-/// load with the grid visible, matching the previous always-on behavior.
-fn default_true() -> bool {
-    true
+/// Serde default for `SceneFile::show_grid`: scenes default to a clean
+/// (no-dots) canvas, matching Excalidraw's default.
+fn default_false() -> bool {
+    false
 }
 
 /// On-disk scene format (`.boundless`, JSON).
@@ -172,7 +172,7 @@ pub struct SceneFile {
     pub elements: Vec<Element>,
     /// Whether the dot grid is visible. Defaults to true for scenes saved
     /// before this field existed.
-    #[serde(default = "default_true")]
+    #[serde(default = "default_false")]
     pub show_grid: bool,
 }
 
@@ -183,7 +183,7 @@ impl SceneFile {
             version: SCENE_VERSION,
             camera,
             elements: scene.elements.clone(),
-            show_grid: true,
+            show_grid: false,
         }
     }
 
