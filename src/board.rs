@@ -2523,6 +2523,7 @@ impl Render for BoardView {
             .child(canvas_el)
             .child(self.render_toolbar(cx))
             .child(self.render_style_bar(cx))
+            .child(self.render_element_info(cx))
             .child(self.render_zoom_bar(cx))
             .child(self.render_notice_bar())
             .children(self.ai_panel.clone())
@@ -3180,6 +3181,100 @@ impl BoardView {
             .flex()
             .when(show, |d| d.child(bar));
         wrapper
+    }
+
+    /// A floating read-only info card (top-right) that shows the selected
+    /// element's type, short id, position/size, and text. Only renders when
+    /// exactly one element is selected. Avoids the AI panel when it's open.
+    fn render_element_info(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // Show only for a single selection.
+        let el_ref = if self.selection.len() == 1 {
+            self.scene.get(self.selection[0])
+        } else {
+            None
+        };
+        let panel_open = self.ai_panel.is_some();
+        let panel_width = self.ai_panel_width(cx);
+        let el_ref = match el_ref {
+            Some(e) => e,
+            None => return div().absolute().top_3().into_any_element(),
+        };
+        // Build a human-readable type label.
+        let kind_label = match &el_ref.kind {
+            ElementKind::Rectangle => "矩形",
+            ElementKind::Ellipse => "椭圆",
+            ElementKind::Diamond => "菱形",
+            ElementKind::Arrow { .. } => "箭头",
+            ElementKind::Line { .. } => "直线",
+            ElementKind::Text { .. } => "文本",
+            ElementKind::Freedraw { .. } => "手绘",
+        };
+        let short_id = &el_ref.id.to_string()[..8];
+        let b = &el_ref.bounds;
+        let pos_text = format!("({:.0}, {:.0})", b.x, b.y);
+        let size_text = format!("{:.0} × {:.0}", b.w, b.h);
+        let text_content = el_ref.text().map(|t| t.to_string());
+
+        let mut card = div()
+            .absolute()
+            .top_3()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .px_3()
+            .py_2()
+            .bg(rgb(0xffffff))
+            .border_1()
+            .border_color(rgb(0xe3e2df))
+            .rounded_lg()
+            .shadow_lg()
+            .text_xs()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .items_center()
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child(kind_label))
+                    .child(
+                        div()
+                            .id("element-info-id")
+                            .text_color(rgb(0x999999))
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(rgb(0x1a5fd7)))
+                            .child(format!("#{short_id} 📋"))
+                            .on_click({
+                                let full_id = el_ref.id.to_string();
+                                move |_, _, cx| {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(full_id.clone()));
+                                }
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_3()
+                    .text_color(rgb(0x666666))
+                    .child(div().child(pos_text))
+                    .child(div().child(size_text)),
+            );
+        if let Some(t) = text_content {
+            card = card.child(
+                div()
+                    .text_color(rgb(0x444444))
+                    .child(format!("文字: {t}")),
+            );
+        }
+        // Position: right-aligned, but avoid the AI panel.
+        if panel_open {
+            card = card.right(px(panel_width + 12.0));
+        } else {
+            card = card.right_3();
+        }
+        card.into_any_element()
     }
 
     fn render_zoom_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
