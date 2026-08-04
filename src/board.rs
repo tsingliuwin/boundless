@@ -1604,7 +1604,16 @@ impl BoardView {
                     recorded = true;
                     self.mark_dirty();
                 }
-                let pivot = WPoint::new(original_bounds.x, original_bounds.y);
+                // The rescale pivot is the dragged handle's opposite corner
+                // (the anchor kept fixed by resize_bounds). It must NOT be
+                // hardcoded to the top-left: e.g. dragging the NE handle
+                // anchors the SW corner, so scaling must pivot about SW.
+                // Matches the anchor computation in Handle::resize_bounds.
+                let (fx, fy) = handle.fraction();
+                let pivot = WPoint::new(
+                    original_bounds.x + original_bounds.w * (1.0 - fx),
+                    original_bounds.y + original_bounds.h * (1.0 - fy),
+                );
                 let is_corner = matches!(
                     handle,
                     crate::render::Handle::Nw
