@@ -1200,26 +1200,21 @@ impl AiPanel {
                 .into_any_element()
             }
             super::client::AssistantStep::Tool { name, args, done, result, .. } => {
-                // Each tool call is its own full-width expandable step — like a
-                // reasoning panel, but with a tool label + status glyph.
+                // Each tool call is its own full-width expandable step - like a
+                // reasoning panel, but with a tool label + status glyph. The
+                // header's icon/verb/color identify add/modify/delete/query.
                 let open = self.open_stream_steps.contains(&idx);
-                let label = tool_label(name);
-                let preview = tool_chip_preview(name, args);
                 let body_text = tool_body_text(name, args, result);
                 let status = if *done { "✓" } else { "⏳" };
                 let status_color = if *done { rgb(0x2f9e44) } else { rgb(0x999999) };
-                let title = if preview.is_empty() {
-                    format!("✏️ {label}")
-                } else {
-                    format!("✏️ {label} {preview}")
-                };
+                let (title, title_color) = tool_header(name, args);
                 step_toggle(
                     ElementId::named_usize("tool-toggle", idx),
                     format!("tool-header-{idx}"),
                     None,
                     title,
                     open,
-                    rgb(0x1a5fd7),
+                    title_color,
                     Some(div().text_color(status_color).child(status)),
                     cx.listener(move |this, _, _, cx| {
                         if this.open_stream_steps.contains(&idx) {
@@ -1320,23 +1315,17 @@ impl AiPanel {
             }
             super::client::AssistantStep::Tool { name, args, done, result, .. } => {
                 let open = self.open_done_steps.contains(&key);
-                let label = tool_label(name);
-                let preview = tool_chip_preview(name, args);
                 let body_text = tool_body_text(name, args, result);
                 let status = if *done { "✓" } else { "⏳" };
                 let status_color = if *done { rgb(0x2f9e44) } else { rgb(0x999999) };
-                let title = if preview.is_empty() {
-                    format!("✏️ {label}")
-                } else {
-                    format!("✏️ {label} {preview}")
-                };
+                let (title, title_color) = tool_header(name, args);
                 step_toggle(
                     ElementId::named_usize("tool-toggle-done", msg_idx * 100000 + step_idx),
                     format!("tool-header-done-{msg_idx}-{step_idx}"),
                     None,
                     title,
                     open,
-                    rgb(0x1a5fd7),
+                    title_color,
                     Some(div().text_color(status_color).child(status)),
                     cx.listener(move |this, _, _, cx| {
                         if this.open_done_steps.contains(&key) {
@@ -1546,6 +1535,124 @@ fn tool_label(name: &str) -> &'static str {
         "draw_text" => "文本",
         _ => "图形",
     }
+}
+
+/// The kind of canvas operation a tool performs - drives the step header's
+/// icon, verb and color so add/modify/delete/query are distinguishable at a
+/// glance instead of all reading "✏️ 图形".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolOp {
+    Add,
+    Update,
+    Delete,
+    Query,
+    Other,
+}
+
+fn tool_op(name: &str) -> ToolOp {
+    match name {
+        "draw_rectangle" | "draw_ellipse" | "draw_diamond" | "draw_line"
+        | "draw_arrow" | "draw_text" => ToolOp::Add,
+        "update_element" => ToolOp::Update,
+        "delete_element" => ToolOp::Delete,
+        "list_elements" => ToolOp::Query,
+        _ => ToolOp::Other,
+    }
+}
+
+impl ToolOp {
+    fn icon(&self) -> &'static str {
+        match self {
+            ToolOp::Add => "➕",
+            ToolOp::Update => "✎",
+            ToolOp::Delete => "🗑",
+            ToolOp::Query => "📋",
+            ToolOp::Other => "🔧",
+        }
+    }
+    fn verb(&self) -> &'static str {
+        match self {
+            ToolOp::Add => "新增",
+            ToolOp::Update => "修改",
+            ToolOp::Delete => "删除",
+            ToolOp::Query => "查询",
+            ToolOp::Other => "操作",
+        }
+    }
+    fn color(&self) -> Rgba {
+        match self {
+            ToolOp::Add => rgb(0x2f9e44),   // green
+            ToolOp::Update => rgb(0x1a5fd7), // blue
+            ToolOp::Delete => rgb(0xc92a2a), // red
+            ToolOp::Query => rgb(0x888888),  // gray
+            ToolOp::Other => rgb(0x1a5fd7),
+        }
+    }
+}
+
+/// Build the step-header title and its color for a tool call. The icon + verb
+/// identify the operation type; the trailing detail identifies the target
+/// (shape + position for adds, element id for update/delete).
+fn tool_header(name: &str, args: &serde_json::Value) -> (String, Rgba) {
+    let op = tool_op(name);
+    let title = match op {
+        ToolOp::Add => {
+            let label = tool_label(name);
+            let preview = tool_chip_preview(name, args);
+            if preview.is_empty() {
+                format!("{} {}{}", op.icon(), op.verb(), label)
+            } else {
+                format!("{} {}{} {}", op.icon(), op.verb(), label, preview)
+            }
+        }
+        ToolOp::Update => {
+            let id = short_id(args);
+            let change = update_change_preview(args);
+            if change.is_empty() {
+                format!("{} {} #{}", op.icon(), op.verb(), id)
+            } else {
+                format!("{} {} #{} {}", op.icon(), op.verb(), id, change)
+            }
+        }
+        ToolOp::Delete => format!("{} {} #{}", op.icon(), op.verb(), short_id(args)),
+        ToolOp::Query => format!("{} {}元素", op.icon(), op.verb()),
+        ToolOp::Other => format!("{} {}{}", op.icon(), op.verb(), tool_label(name)),
+    };
+    (title, op.color())
+}
+
+/// Short (8-char) id prefix from a tool's args, if present (draw tools return
+/// the full id; update/delete carry it in `id`).
+fn short_id(args: &serde_json::Value) -> String {
+    args.get("id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.chars().take(8).collect::<String>())
+        .unwrap_or_else(|| "?".to_string())
+}
+
+/// What an `update_element` call changes, for the chip: new position and/or
+/// new text. Omitted fields come through as null/absent and are skipped.
+fn update_change_preview(args: &serde_json::Value) -> String {
+    let obj = match args.as_object() {
+        Some(o) => o,
+        None => return String::new(),
+    };
+    let x = obj.get("x").and_then(|v| v.as_f64());
+    let y = obj.get("y").and_then(|v| v.as_f64());
+    let text = obj.get("text").and_then(|v| v.as_str());
+    let mut parts = Vec::new();
+    if let (Some(x), Some(y)) = (x, y) {
+        parts.push(format!("位置 ({x:.0},{y:.0})"));
+    }
+    if let Some(t) = text {
+        let one_line: String = t.chars().filter(|c| *c != '\n').take(10).collect();
+        if t.chars().count() > 10 {
+            parts.push(format!("文字「{one_line}…」"));
+        } else {
+            parts.push(format!("文字「{one_line}」"));
+        }
+    }
+    parts.join(" ")
 }
 
 /// Which flavor of expanded body a step shows — reasoning text, or a tool-call
@@ -1870,6 +1977,16 @@ fn tool_call_detail(name: &str, args: &serde_json::Value) -> String {
             }
             out
         }
+        "update_element" => {
+            let mut out = format!("元素 #{}", short_id(args));
+            let change = update_change_preview(args);
+            if !change.is_empty() {
+                out.push_str(&format!("：{change}"));
+            }
+            out
+        }
+        "delete_element" => format!("元素 #{}", short_id(args)),
+        "list_elements" => "查询画布上的所有元素".to_string(),
         _ => String::new(),
     };
     if out.trim().is_empty() {
@@ -1899,7 +2016,7 @@ fn push_style(out: &mut String, style: Option<&serde_json::Value>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{tool_body_text, tool_call_detail, tool_chip_preview};
+    use super::{tool_body_text, tool_call_detail, tool_chip_preview, tool_header, tool_op, ToolOp};
 
     #[test]
     fn tool_detail_describes_rectangle_with_coords_and_size() {
@@ -1971,12 +2088,56 @@ mod tests {
     #[test]
     fn body_text_appends_result_when_present() {
         let args = serde_json::from_str(r#"{"x":100.0,"y":200.0,"w":120.0,"h":60.0}"#).unwrap();
-        // No result → just the detail, no "→".
+        // No result -> just the detail, no arrow.
         let without = tool_body_text("draw_rectangle", &args, "");
-        assert!(!without.contains("→ 已添加到画布"));
-        // With result → detail + "→ 已添加到画布" on a new line.
+        assert!(!without.contains("\u{2192} 已添加到画布"));
+        // With result -> detail + "-> 已添加到画布" on a new line.
         let with = tool_body_text("draw_rectangle", &args, "已添加到画布");
         assert!(with.contains("矩形"));
-        assert!(with.contains("→ 已添加到画布"));
+        assert!(with.contains("\u{2192} 已添加到画布"));
+    }
+
+    #[test]
+    fn tool_header_distinguishes_add_update_delete_query() {
+        // Add: "➕ 新增矩形 (100,200)"
+        let (title, _) = tool_header(
+            "draw_rectangle",
+            &serde_json::from_str(r#"{"x":100.0,"y":200.0,"w":10.0,"h":20.0}"#).unwrap(),
+        );
+        assert_eq!(title, "➕ 新增矩形 (100,200)");
+
+        // Update carries the id + what changed (position, no arrow).
+        let (title, _) = tool_header(
+            "update_element",
+            &serde_json::from_str(r#"{"id":"abc12345-aaaa-bbbb","x":5.0,"y":6.0}"#).unwrap(),
+        );
+        assert_eq!(title, "✎ 修改 #abc12345 位置 (5,6)");
+
+        // Update of text only.
+        let (title, _) = tool_header(
+            "update_element",
+            &serde_json::from_str(r#"{"id":"abc12345","text":"开始"}"#).unwrap(),
+        );
+        assert_eq!(title, "✎ 修改 #abc12345 文字「开始」");
+
+        // Delete carries the id.
+        let (title, _) = tool_header(
+            "delete_element",
+            &serde_json::from_str(r#"{"id":"abc12345-aaaa-bbbb"}"#).unwrap(),
+        );
+        assert_eq!(title, "🗑 删除 #abc12345");
+
+        // Query needs no args.
+        let (title, _) = tool_header("list_elements", &serde_json::Value::Null);
+        assert_eq!(title, "📋 查询元素");
+    }
+
+    #[test]
+    fn tool_op_colors_differ_by_operation() {
+        // Add (green) != Update (blue) != Delete (red) != Query (gray).
+        assert_ne!(tool_op("draw_rectangle").color(), tool_op("update_element").color());
+        assert_ne!(tool_op("draw_rectangle").color(), tool_op("delete_element").color());
+        assert_ne!(tool_op("draw_rectangle").color(), tool_op("list_elements").color());
+        assert_eq!(tool_op("list_elements"), ToolOp::Query);
     }
 }
