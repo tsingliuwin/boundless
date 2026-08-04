@@ -1239,6 +1239,26 @@ impl BoardView {
             }
         }
 
+        // 1b. Drag-to-move the existing selection from anywhere inside its
+        // bbox (not just on the stroke). This matters for point elements
+        // (lines/arrows) whose hit_test only matches the thin stroke: a
+        // click inside the bbox but off the line would otherwise start a
+        // marquee and clear the selection. Excalidraw also lets you grab
+        // anywhere inside the selection box to move it.
+        if !self.selection.is_empty()
+            && !event.modifiers.shift
+            && self
+                .selection_bounds_world()
+                .is_some_and(|b| b.inflate(self.hit_tolerance(), self.hit_tolerance()).contains(world))
+        {
+            self.drag = DragState::Moving {
+                last_world: world,
+                recorded: false,
+            };
+            cx.notify();
+            return;
+        }
+
         // 2. element hit test.
         let hit = self.scene.hit_test(world, self.hit_tolerance());
         // Remember when the raw hit is a bound label: a single click on the
