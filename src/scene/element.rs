@@ -556,7 +556,21 @@ impl Element {
                     || point_near_ellipse(p, &self.bounds, stroke_tol, true)
             }
             ElementKind::Line { .. } | ElementKind::Arrow { .. } | ElementKind::Freedraw { .. } => {
-                let pts = self.absolute_points();
+                // Curved lines/arrows render as a Catmull-Rom spline that
+                // bulges away from the vertex-to-vertex chords, so hit-testing
+                // against the raw points would miss the visible stroke (you'd
+                // have to click on the invisible chord instead). Densify into
+                // a sampled polyline that follows the rendered curve.
+                // Freedraw strokes are already dense, so they're left as-is.
+                let abs = self.absolute_points();
+                let pts = if self.style.line_type == LineType::Curved
+                    && matches!(self.kind, ElementKind::Line { .. } | ElementKind::Arrow { .. })
+                    && abs.len() >= 2
+                {
+                    curve_samples(&abs, 16)
+                } else {
+                    abs
+                };
                 distance_to_polygon(p, &pts, false) <= stroke_tol
             }
             ElementKind::Text { .. } => self.bounds.inflate(tol, tol).contains(p),
@@ -636,6 +650,45 @@ pub fn distance_to_polygon(p: WPoint, pts: &[WPoint], closed: bool) -> f64 {
         min = min.min(point_segment_distance(p, *pts.last().unwrap(), pts[0]));
     }
     min
+}
+
+/// Densely sample the smoothing spline a curved line/arrow renders as, for
+/// hit-testing. Mirrors roughr's `_curve`: Catmull-Rom (tightness 0) converted
+/// to cubic Béziers, with endpoints duplicated (so the end tangents follow the
+/// first/last segment). `samples_per_seg` controls fidelity. The renderer also
+/// applies seeded roughness jitter (±2×roughness world units), which the hit
+/// tolerance absorbs.
+pub fn curve_samples(points: &[WPoint], samples_per_seg: usize) -> Vec<WPoint> {
+    let n = points.len();
+    if n < 2 || samples_per_seg == 0 {
+        return points.to_vec();
+    }
+    let last = n - 1;
+    let mut out = Vec::with_capacity(last * samples_per_seg + 1);
+    out.push(points[0]);
+    for seg in 0..last {
+        let p0 = points[seg.saturating_sub(1)];
+        let p1 = points[seg];
+        let p2 = points[seg + 1];
+        let p3 = points[(seg + 2).min(last)];
+        // Catmull-Rom -> cubic Bézier control points (s = 1, tightness 0).
+        let c1 = WPoint::new(p1.x + (p2.x - p0.x) / 6.0, p1.y + (p2.y - p0.y) / 6.0);
+        let c2 = WPoint::new(p2.x - (p3.x - p1.x) / 6.0, p2.y - (p3.y - p1.y) / 6.0);
+        for k in 1..=samples_per_seg {
+            let t = k as f64 / samples_per_seg as f64;
+            let u = 1.0 - t;
+            let x = u * u * u * p1.x
+                + 3.0 * u * u * t * c1.x
+                + 3.0 * u * t * t * c2.x
+                + t * t * t * p2.x;
+            let y = u * u * u * p1.y
+                + 3.0 * u * u * t * c1.y
+                + 3.0 * u * t * t * c2.y
+                + t * t * t * p2.y;
+            out.push(WPoint::new(x, y));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -894,6 +947,40 @@ mod tests {
         let el: Element = serde_json::from_str(json).unwrap();
         assert_eq!(el.style.line_type, LineType::Straight);
         assert_eq!(el.absolute_points().len(), 2);
+    }
+
+    #[test]
+    fn curved_line_hit_test_follows_the_spline_not_the_chord() {
+        let mut style = ElementStyle::default();
+        style.line_type = LineType::Curved;
+        let el = Element::from_absolute_points(
+            |points| ElementKind::Line { points },
+            vec![
+                WPoint::new(0.0, 0.0),
+                WPoint::new(50.0, 50.0),
+                WPoint::new(100.0, 0.0),
+            ],
+            style,
+        );
+        // The spline bulges up to (21.875, 28.125) at t=0.5 of segment 0.
+        // With tol=1 the stroke_tol is 3; the nearest chord (segment 0, the
+        // line y=x) is ~4.42 away, so a chord-only test would miss - but the
+        // sampled curve hits.
+        let on_curve = WPoint::new(21.875, 28.125);
+        assert!(el.hit_test(on_curve, 1.0));
+        // The straight-line version of the same element does NOT hit that
+        // point at this tolerance (it's off the chord).
+        let mut straight = Element::from_absolute_points(
+            |points| ElementKind::Line { points },
+            vec![
+                WPoint::new(0.0, 0.0),
+                WPoint::new(50.0, 50.0),
+                WPoint::new(100.0, 0.0),
+            ],
+            ElementStyle::default(),
+        );
+        straight.seed = el.seed;
+        assert!(!straight.hit_test(on_curve, 1.0));
     }
 
     #[test]
