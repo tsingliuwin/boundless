@@ -40,6 +40,18 @@ impl Scene {
         self.elements.iter_mut().find(|e| e.id == id)
     }
 
+    /// Resolve an element by the short id prefix the AI tools use (draw tools
+    /// report only the first 8 chars back to the model). Accepts either the
+    /// 8-char prefix or the full UUID string (a full id is a prefix of itself).
+    /// Returns the first match - UUID v4 collisions on 8 hex chars are
+    /// astronomically unlikely for a whiteboard's element count.
+    pub fn find_by_id_prefix(&self, prefix: &str) -> Option<ElementId> {
+        self.elements
+            .iter()
+            .find(|e| e.id.to_string().starts_with(prefix))
+            .map(|e| e.id)
+    }
+
     /// Topmost element at the given world point.
     pub fn hit_test(&self, p: WPoint, tol: f64) -> Option<ElementId> {
         self.elements
@@ -148,5 +160,23 @@ mod tests {
         assert_eq!(scene.hit_test(WPoint::new(50.0, 50.0), 1.0), Some(top));
         assert_eq!(scene.hit_test(WPoint::new(5.0, 5.0), 1.0), Some(bottom));
         assert_eq!(scene.hit_test(WPoint::new(500.0, 500.0), 1.0), None);
+    }
+
+    #[test]
+    fn find_by_id_prefix_matches_short_prefix_and_full_id() {
+        // The AI draw tools report only the first 8 chars of an element's UUID
+        // back to the model, so update/delete must resolve by that prefix.
+        let mut scene = Scene::new();
+        let id = scene.add(Element::new(
+            ElementKind::Rectangle,
+            WBounds::new(0.0, 0.0, 10.0, 10.0),
+            ElementStyle::default(),
+        ));
+        let full = id.to_string();
+        let prefix = &full[..8];
+
+        assert_eq!(scene.find_by_id_prefix(prefix), Some(id));
+        assert_eq!(scene.find_by_id_prefix(&full), Some(id)); // full id is a prefix of itself
+        assert_eq!(scene.find_by_id_prefix("deadbeef"), None); // no match
     }
 }

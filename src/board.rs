@@ -607,63 +607,66 @@ impl BoardView {
                 self.pending_measure.push(id);
             }
             CanvasOp::UpdateElement { id, x, y, text } => {
-                if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
-                    // Phase 1: update position (needs a mutable borrow of the element).
-                    let mut needs_label_update = false;
-                    if let Some(el) = self.scene.get_mut(uuid) {
-                        if let Some(nx) = x {
-                            el.bounds.x = nx;
-                        }
-                        if let Some(ny) = y {
-                            el.bounds.y = ny;
-                        }
-                        // Determine if this is a standalone text element.
-                        if let Some(nt) = &text {
-                            if let ElementKind::Text { text: ref mut t, .. } = el.kind {
-                                *t = nt.clone();
-                            } else {
-                                needs_label_update = true;
-                            }
+                // The model only knows the 8-char id prefix draw tools report
+                // back, so resolve by prefix (also accepts a full UUID).
+                let Some(uuid) = self.scene.find_by_id_prefix(&id) else {
+                    return;
+                };
+                // Phase 1: update position (needs a mutable borrow of the element).
+                let mut needs_label_update = false;
+                if let Some(el) = self.scene.get_mut(uuid) {
+                    if let Some(nx) = x {
+                        el.bounds.x = nx;
+                    }
+                    if let Some(ny) = y {
+                        el.bounds.y = ny;
+                    }
+                    // Determine if this is a standalone text element.
+                    if let Some(nt) = &text {
+                        if let ElementKind::Text { text: ref mut t, .. } = el.kind {
+                            *t = nt.clone();
+                        } else {
+                            needs_label_update = true;
                         }
                     }
-                    // Phase 2: if the element is a shape (not Text), update or
-                    // create its bound label. Done in a separate scope so the
-                    // earlier mutable borrow is released.
-                    if needs_label_update {
-                        if let Some(nt) = &text {
-                            // Find existing bound label for this container.
-                            let label_id = self.scene.elements.iter().find_map(|e| {
-                                if let ElementKind::Text { container_id: Some(cid), .. } = &e.kind {
-                                    if *cid == uuid { Some(e.id) } else { None }
-                                } else { None }
-                            });
-                            if let Some(lid) = label_id {
+                }
+                // Phase 2: if the element is a shape (not Text), update or
+                // create its bound label. Done in a separate scope so the
+                // earlier mutable borrow is released.
+                if needs_label_update {
+                    if let Some(nt) = &text {
+                        // Find existing bound label for this container.
+                        let label_id = self.scene.elements.iter().find_map(|e| {
+                            if let ElementKind::Text { container_id: Some(cid), .. } = &e.kind {
+                                if *cid == uuid { Some(e.id) } else { None }
+                            } else { None }
+                        });
+                        if let Some(lid) = label_id {
+                            if let Some(label) = self.scene.get_mut(lid) {
+                                if let ElementKind::Text { text: ref mut t, .. } = label.kind {
+                                    *t = nt.clone();
+                                }
+                            }
+                            let cb = self.scene.get(uuid).map(|e| e.bounds);
+                            if let Some(cb) = cb {
                                 if let Some(label) = self.scene.get_mut(lid) {
-                                    if let ElementKind::Text { text: ref mut t, .. } = label.kind {
-                                        *t = nt.clone();
-                                    }
+                                    place_label(&mut label.bounds, cb, TextAlign::Center);
                                 }
-                                let cb = self.scene.get(uuid).map(|e| e.bounds);
-                                if let Some(cb) = cb {
-                                    if let Some(label) = self.scene.get_mut(lid) {
-                                        place_label(&mut label.bounds, cb, TextAlign::Center);
-                                    }
-                                }
-                                self.pending_measure.push(lid);
-                            } else if let Some(cb) = self.scene.get(uuid).map(|e| e.bounds) {
-                                self.add_bound_label(uuid, cb, nt.clone());
                             }
+                            self.pending_measure.push(lid);
+                        } else if let Some(cb) = self.scene.get(uuid).map(|e| e.bounds) {
+                            self.add_bound_label(uuid, cb, nt.clone());
                         }
                     }
-                    // Phase 3: move bound labels to follow the (possibly moved) container.
-                    if x.is_some() || y.is_some() {
-                        let cb = self.scene.get(uuid).map(|e| e.bounds);
-                        if let Some(cb) = cb {
-                            for e in self.scene.elements.iter_mut() {
-                                if let ElementKind::Text { container_id: Some(cid), .. } = &e.kind {
-                                    if *cid == uuid {
-                                        place_label(&mut e.bounds, cb, TextAlign::Center);
-                                    }
+                }
+                // Phase 3: move bound labels to follow the (possibly moved) container.
+                if x.is_some() || y.is_some() {
+                    let cb = self.scene.get(uuid).map(|e| e.bounds);
+                    if let Some(cb) = cb {
+                        for e in self.scene.elements.iter_mut() {
+                            if let ElementKind::Text { container_id: Some(cid), .. } = &e.kind {
+                                if *cid == uuid {
+                                    place_label(&mut e.bounds, cb, TextAlign::Center);
                                 }
                             }
                         }
@@ -671,7 +674,7 @@ impl BoardView {
                 }
             }
             CanvasOp::DeleteElement { id } => {
-                if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
+                if let Some(uuid) = self.scene.find_by_id_prefix(&id) {
                     self.remove_element(uuid);
                 }
             }
