@@ -214,10 +214,29 @@ pub fn paths_for_element(
                 // Instead, sample a deterministic Catmull-Rom spline through
                 // the pointer points and stroke it directly. A committed
                 // stroke never moves.
+                //
+                // Roughness is honored via a deterministic sinusoidal offset
+                // (seed + point position → sin/cos), so the three roughness
+                // presets still look different, but the offset is stable
+                // across re-renders (unlike roughr's RNG). sin/cos varies
+                // smoothly between adjacent samples, so no jagged edges.
+                let roughness = style.roughness.clamp(0.0, 3.0) as f64;
+                let seed_f = el.seed as f64;
                 let samples = curve_samples(&points, 12);
+                let offset = |p: &WPoint| {
+                    if roughness < 0.01 {
+                        *p
+                    } else {
+                        let amp = roughness * 1.5;
+                        let phase = p.x * 0.04 + seed_f * 0.1;
+                        let dx = amp * phase.sin();
+                        let dy = amp * (phase * 1.3 + 1.5).cos();
+                        WPoint::new(p.x + dx, p.y + dy)
+                    }
+                };
                 let mut builder = PathBuilder::stroke(stroke_width_px);
                 let origin = canvas_origin;
-                let screen = |p: &WPoint| camera.world_to_screen(*p, origin);
+                let screen = |p: &WPoint| camera.world_to_screen(offset(p), origin);
                 if let Some(first) = samples.first() {
                     builder.move_to(screen(first));
                     for p in samples.iter().skip(1) {
