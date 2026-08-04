@@ -3386,6 +3386,40 @@ impl BoardView {
             });
         let show_shape_options = (!text_tool && !only_text) || bound_labels_only;
 
+        // Background fill only applies to closed shapes (rectangle/ellipse/
+        // diamond). Lines, arrows and freedraw strokes are open polylines
+        // with no fillable interior, so hide the background-color row when
+        // the selection (or active tool) is purely linear.
+        let linear_tool = matches!(self.tool, ActiveTool::Arrow | ActiveTool::Line | ActiveTool::Pen);
+        let linear_sel = !self.selection.is_empty()
+            && self
+                .selection
+                .iter()
+                .filter_map(|id| self.scene.get(*id))
+                .all(|e| {
+                    matches!(
+                        e.kind,
+                        ElementKind::Line { .. } | ElementKind::Arrow { .. } | ElementKind::Freedraw { .. }
+                    )
+                });
+        // When bound labels are selected, the shape targets are their
+        // containers — check those instead.
+        let linear_targets = if bound_labels_only {
+            self.panel_shape_ids()
+                .iter()
+                .filter_map(|id| self.scene.get(*id))
+                .all(|e| {
+                    matches!(
+                        e.kind,
+                        ElementKind::Line { .. } | ElementKind::Arrow { .. }
+                    )
+                })
+        } else {
+            linear_sel
+        };
+        let show_background = show_shape_options && !(linear_tool && self.selection.is_empty()) && !linear_targets;
+        let _ = linear_sel; // used via linear_targets when applicable
+
         let mut bar = bar_container().flex_col().items_start().gap_2().p_2();
 
         // Stroke colors.
@@ -3414,39 +3448,42 @@ impl BoardView {
         }
         bar = bar.child(row);
 
-        // Background colors.
-        let mut row = div().flex().flex_row().gap_1();
-        for (ix, color) in BG_COLORS.iter().enumerate() {
-            let weak = weak.clone();
-            let color = *color;
-            let active = self.style.background == color;
-            let mut swatch = div()
-                .id(gpui::ElementId::named_usize("bg", ix))
-                .size_5()
-                .rounded_sm()
-                .border_1()
-                .cursor_pointer()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_xs();
-            swatch = match color {
-                Some(c) => swatch.bg(rgb(c)).child(""),
-                None => swatch.bg(rgb(0xffffff)).text_color(rgb(0x999999)).child("无"),
-            };
-            swatch = if active {
-                swatch.border_color(rgb(SELECTION_COLOR)).border_2()
-            } else {
-                swatch.border_color(rgb(0xcccccc))
-            };
-            row = row.child(swatch.on_click(move |_, _, cx| {
-                weak.update(cx, |this, cx| {
-                    this.apply_style_to_selection(|s| s.background = color, cx)
-                })
-                .ok();
-            }));
+        // Background colors — hidden for linear elements (lines/arrows/pen)
+        // which have no fillable interior.
+        if show_background {
+            let mut row = div().flex().flex_row().gap_1();
+            for (ix, color) in BG_COLORS.iter().enumerate() {
+                let weak = weak.clone();
+                let color = *color;
+                let active = self.style.background == color;
+                let mut swatch = div()
+                    .id(gpui::ElementId::named_usize("bg", ix))
+                    .size_5()
+                    .rounded_sm()
+                    .border_1()
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_xs();
+                swatch = match color {
+                    Some(c) => swatch.bg(rgb(c)).child(""),
+                    None => swatch.bg(rgb(0xffffff)).text_color(rgb(0x999999)).child("无"),
+                };
+                swatch = if active {
+                    swatch.border_color(rgb(SELECTION_COLOR)).border_2()
+                } else {
+                    swatch.border_color(rgb(0xcccccc))
+                };
+                row = row.child(swatch.on_click(move |_, _, cx| {
+                    weak.update(cx, |this, cx| {
+                        this.apply_style_to_selection(|s| s.background = color, cx)
+                    })
+                    .ok();
+                }));
+            }
+            bar = bar.child(row);
         }
-        bar = bar.child(row);
 
         // Text options: font size presets + font family + alignment, shown
         // as glyph icons. With no selection (Text tool active) the buttons
