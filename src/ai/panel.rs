@@ -39,8 +39,10 @@ struct StreamingState {
     /// step; a tool call always starts a fresh step. This keeps the
     /// "think → tool → think → tool" loop visible.
     steps: Vec<super::client::AssistantStep>,
-    /// True while the model is actively emitting reasoning deltas. The live
-    /// reasoning step is expanded while this is true, auto-collapsed on Done.
+    /// True from the first reasoning delta until the model moves on to text
+    /// output, a tool call, or Done. The live reasoning step stays expanded
+    /// while this is true — it must NOT flip off on mere streaming pauses
+    /// (network chunking), or the panel flickers collapse/expand.
     reasoning_active: bool,
     _task: Task<()>,
 }
@@ -81,6 +83,10 @@ pub struct AiPanel {
     open_done_steps: std::collections::HashSet<(usize, usize)>,
     /// Scroll handle for the messages area, used to auto-scroll to bottom.
     messages_scroll: ScrollHandle,
+    /// Scroll handle for the live (actively streaming) reasoning body. Pinned
+    /// to the body's bottom on every reasoning flush, and shared with the
+    /// body's wheel handler for nested-scroll containment.
+    live_reasoning_scroll: ScrollHandle,
     /// Current panel width in px. User-resizable via the left edge handle.
     width: f32,
     _subscriptions: Vec<Subscription>,
@@ -90,6 +96,11 @@ pub struct AiPanel {
 pub const DEFAULT_WIDTH: f32 = 360.0;
 const MIN_WIDTH: f32 = 280.0;
 const MAX_WIDTH: f32 = 640.0;
+
+/// Maximum height of a step body (streaming reasoning, or an expanded
+/// reasoning/tool detail). Longer content scrolls inside the body instead of
+/// filling the whole messages area.
+const STEP_BODY_MAX_H: f32 = 320.0;
 
 /// Marker value carried by the resize drag. The width is computed statelessly
 /// from the live pointer position in `on_drag_move` (panel is right-docked), so
@@ -177,6 +188,7 @@ impl AiPanel {
             open_stream_steps: HashSet::new(),
             open_done_steps: HashSet::new(),
             messages_scroll: ScrollHandle::new(),
+            live_reasoning_scroll: ScrollHandle::new(),
             width: DEFAULT_WIDTH,
             _subscriptions: subscriptions,
         }
@@ -359,6 +371,8 @@ impl AiPanel {
         // Reset the user's step toggles so each new stream starts from the
         // defaults (reasoning open while streaming, tools collapsed).
         self.open_stream_steps.clear();
+        // Fresh scroll handle for the new stream's live reasoning body.
+        self.live_reasoning_scroll = ScrollHandle::new();
         let mut events = request.events;
         let cancel = request.cancel;
         let board = self.board.clone();
@@ -377,28 +391,33 @@ impl AiPanel {
             let mut pending_delta = String::new();
             let flush_duration = std::time::Duration::from_millis(50);
             loop {
-                // Race the next agent event against the flush timer. If deltas
-                // are pending, the timer fires to flush them; otherwise we just
-                // wait for the next event.
+                // Race the next agent event against the flush timer — but only
+                // arm the timer when deltas are actually pending. (An always-on
+                // timer that acts on empty ticks makes the reasoning panel
+                // collapse on every brief network pause and re-expand on the
+                // next token — visible as constant flickering.)
                 let next = if pending_delta.is_empty() && pending_reasoning.is_empty() {
-                    futures::future::Either::Left(events.next().await.map(|e| (e,)))
+                    futures::future::Either::Left(events.next().await)
                 } else {
                     let timer = cx.background_executor().timer(flush_duration);
                     futures::future::Either::Right(
                         futures::future::select(events.next(), timer).await,
                     )
                 };
-                // Normalize into an optional event (None = timer fired or stream ended).
+                // Normalize into an optional event (None = timer fired).
                 let event = match next {
-                    futures::future::Either::Left(Some((e,))) => Some(e),
-                    futures::future::Either::Left(None) => break,
-                    futures::future::Either::Right(futures::future::Either::Left((e, _))) => {
-                        Some(e.unwrap_or(AgentEvent::Done {
-                            text: String::new(),
-                            drew_anything: false,
-                        }))
+                    futures::future::Either::Left(Some(e)) => Some(e),
+                    futures::future::Either::Left(None) => break, // stream ended
+                    futures::future::Either::Right(futures::future::Either::Left((Some(e), _))) => {
+                        Some(e)
                     }
-                    futures::future::Either::Right(futures::future::Either::Right(_)) => None, // timer
+                    // The agent always emits Done/Error before the stream ends
+                    // (and pending deltas were flushed before it), so a None
+                    // here carries no data loss.
+                    futures::future::Either::Right(futures::future::Either::Left((None, _))) => {
+                        break
+                    }
+                    futures::future::Either::Right(futures::future::Either::Right(_)) => None,
                 };
                 match event {
                     Some(AgentEvent::Delta(text)) => {
@@ -420,17 +439,23 @@ impl AiPanel {
                                 if !pd.is_empty() {
                                     Self::apply_delta(panel, &pd);
                                 }
-                                Self::handle_event(panel, ev, &board, cx)
+                                let go = Self::handle_event(panel, ev, &board, cx);
+                                panel.messages_scroll.scroll_to_bottom();
+                                go
                             })
                             .unwrap_or(false);
-                        this.update(cx, |panel, _| panel.messages_scroll.scroll_to_bottom())
-                            .ok();
                         if !keep_going {
                             break;
                         }
                     }
                     None => {
                         // Timer fired — flush pending deltas in one update.
+                        // Note: `reasoning_active` is deliberately NOT touched
+                        // here. Reasoning streams pause naturally between
+                        // network chunks; collapsing the panel on a pause and
+                        // re-expanding on the next token is what caused the
+                        // visible flickering. It flips only on real event
+                        // boundaries (text delta / tool call / Done).
                         let pd = std::mem::take(&mut pending_delta);
                         let pr = std::mem::take(&mut pending_reasoning);
                         if !pd.is_empty() || !pr.is_empty() {
@@ -441,11 +466,14 @@ impl AiPanel {
                                 if !pd.is_empty() {
                                     Self::apply_delta(panel, &pd);
                                 }
+                                // Scroll the parent message list to follow
+                                // both reasoning and text output. (The live
+                                // reasoning body additionally scrolls itself
+                                // via its own handle — see apply_reasoning.)
+                                panel.messages_scroll.scroll_to_bottom();
                                 cx.notify();
                             })
                             .ok();
-                            this.update(cx, |panel, _| panel.messages_scroll.scroll_to_bottom())
-                                .ok();
                         }
                     }
                 }
@@ -497,6 +525,10 @@ impl AiPanel {
                 }),
             }
         }
+        // Keep the live reasoning body pinned to its bottom as it grows. The
+        // flag is applied during the next prepaint against the freshly
+        // measured content size, so this is exact (no one-frame lag).
+        panel.live_reasoning_scroll.scroll_to_bottom();
     }
 
     /// Handle a discrete (non-delta) event: tool call, canvas op, done, error.
@@ -1113,31 +1145,39 @@ impl AiPanel {
                     .open_stream_steps
                     .contains(&idx)
                     ^ default_open;
-                // While actively streaming into this step, render as plain text
-                // (raw SharedString) so each token flush shows instantly — no
-                // TextView markdown debounce. Once the step is done (not the
-                // active one), use styled_body for selectable markdown rendering.
+                // Collapsed = header only (no body). Expanded = text in a
+                // height-capped, internally scrolling box. While actively
+                // streaming, use plain_body (instant SharedString, pinned to
+                // its bottom); once done, use styled_body (selectable
+                // markdown, manual scroll).
                 let body: Option<AnyElement> = if open {
-                    Some(
-                        plain_body(
-                            ElementId::named_usize("reasoning-scroll", idx),
-                            StyledBodyKind::Reasoning,
-                            text.clone(),
+                    if default_open {
+                        Some(
+                            plain_body(
+                                StyledBodyKind::Reasoning,
+                                text.clone(),
+                                &self.live_reasoning_scroll,
+                                cx.entity_id(),
+                            )
+                            .into_any_element(),
                         )
-                        .into_any_element(),
-                    )
+                    } else {
+                        Some(
+                            styled_body(
+                                "reasoning-body",
+                                idx,
+                                StyledBodyKind::Reasoning,
+                                text.clone(),
+                                cx.entity_id(),
+                                window,
+                                cx,
+                            )
+                            .into_any_element(),
+                        )
+                    }
                 } else {
-                    Some(
-                        styled_body(
-                            ElementId::named_usize("reasoning-scroll", idx),
-                            ElementId::named_usize("reasoning-text", idx),
-                            StyledBodyKind::Reasoning,
-                            text.clone(),
-                            window,
-                            cx,
-                        )
-                        .into_any_element(),
-                    )
+                    // Collapsed: no body shown.
+                    None
                 };
                 step_toggle(
                     ElementId::named_usize("reasoning-toggle", idx),
@@ -1191,10 +1231,11 @@ impl AiPanel {
                     }),
                     open.then(|| {
                         styled_body(
-                            ElementId::named_usize("tool-scroll", idx),
-                            ElementId::named_usize("tool-text", idx),
+                            "tool-body",
+                            idx,
                             StyledBodyKind::Tool,
                             body_text,
+                            cx.entity_id(),
                             window,
                             cx,
                         )
@@ -1265,16 +1306,11 @@ impl AiPanel {
                     }),
                     open.then(|| {
                         styled_body(
-                            ElementId::named_usize(
-                                "reasoning-scroll-done",
-                                msg_idx * 100000 + step_idx,
-                            ),
-                            ElementId::named_usize(
-                                "reasoning-text-done",
-                                msg_idx * 100000 + step_idx,
-                            ),
+                            "reasoning-body-done",
+                            msg_idx * 100000 + step_idx,
                             StyledBodyKind::Reasoning,
                             text.clone(),
+                            cx.entity_id(),
                             window,
                             cx,
                         )
@@ -1312,16 +1348,11 @@ impl AiPanel {
                     }),
                     open.then(|| {
                         styled_body(
-                            ElementId::named_usize(
-                                "tool-scroll-done",
-                                msg_idx * 100000 + step_idx,
-                            ),
-                            ElementId::named_usize(
-                                "tool-text-done",
-                                msg_idx * 100000 + step_idx,
-                            ),
+                            "tool-body-done",
+                            msg_idx * 100000 + step_idx,
                             StyledBodyKind::Tool,
                             body_text,
+                            cx.entity_id(),
                             window,
                             cx,
                         )
@@ -1398,9 +1429,13 @@ impl AiPanel {
                 .iter()
                 .any(|s| matches!(s, super::client::AssistantStep::Text { .. }));
             if !has_text_step {
+                // NB: a distinct id namespace from the "ai-msg-text" used by
+                // Text steps above — TextView keys its parsed-content state by
+                // ElementId, and msg_idx*100000+step_idx can numerically
+                // collide with a plain message index.
                 step = step.child(
                     div().text_sm().child(
-                        TextView::markdown(("ai-msg-text", idx), content, window, cx)
+                        TextView::markdown(("ai-msg-content", idx), content, window, cx)
                             .selectable(true),
                     ),
                 );
@@ -1521,15 +1556,69 @@ enum StyledBodyKind {
     Tool,
 }
 
-/// The expandable body under a step header: left vertical border + scrollable.
-/// Uses `TextView::markdown` for selectable, formatted text — for steps whose
-/// content is final (won't grow). The markdown parse is debounced 200ms in a
-/// background thread by TextView, so it's smooth even for large text.
+/// Wheel handler giving a nested scroll body proper containment: scroll the
+/// inner box while it can move, then stop the event so the outer messages
+/// area doesn't scroll too. (GPUI's built-in scroll listener never stops
+/// propagation, so without this both containers scroll at once.) When the
+/// inner box is at its limit — or has no overflow — the event falls through
+/// and the outer area scrolls as usual.
+///
+/// Custom `on_scroll_wheel` listeners are registered after the element's
+/// built-in scroll listener and therefore run before it in the bubble phase,
+/// so this applies the scroll itself and then stops the event. Mirrors
+/// gpui-component's `InputState::on_scroll_wheel`.
+///
+/// `notify` is the panel's EntityId, captured at render time. Do NOT use
+/// `window.current_view()` here instead: it unwraps the render-stack, which
+/// is empty when a wheel event is dispatched outside a paint (e.g. during
+/// window creation) — a hard panic, and an abort across the Windows FFI
+/// boundary.
+fn contained_scroll(
+    handle: &ScrollHandle,
+    notify: EntityId,
+    event: &ScrollWheelEvent,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let delta = event.delta.pixel_delta(window.line_height());
+    // Match the built-in listener: with only vertical scrolling enabled, a
+    // horizontal wheel delta scrolls vertically.
+    let dy = if delta.y != px(0.0) { delta.y } else { delta.x };
+    let old = handle.offset();
+    let max = handle.max_offset();
+    let new_y = (old.y + dy).clamp(-max.height, px(0.0));
+    if new_y != old.y {
+        handle.set_offset(point(old.x, new_y));
+        cx.stop_propagation();
+        cx.notify(notify);
+    }
+}
+
+/// The expandable body under a step header: left vertical border + selectable
+/// markdown text, for steps whose content is final (won't grow). The markdown
+/// parse is debounced 200ms in a background thread by TextView, so it's smooth
+/// even for large text. Capped at [`STEP_BODY_MAX_H`]; longer content scrolls
+/// inside the body.
+///
+/// Structural constraints baked in here (each was a past bug):
+///
+/// - `base_id` + `index` must be unique per step. Both the scroll state and
+///   TextView's parsed-content cache are keyed by ElementId — sharing ids
+///   across bodies makes every expanded body render the same (last-parsed)
+///   text.
+/// - The TextView sits inside a natural-height wrapper div. TextView's root
+///   is `size_full()`; resolved directly against this max-height container it
+///   would take the *container's* height, clipping the content with zero
+///   scroll range.
+/// - The wheel handler provides nested-scroll containment (see
+///   [`contained_scroll`]); without it wheeling over the body also scrolls
+///   the outer messages area.
 fn styled_body(
-    scroll_id: impl Into<ElementId>,
-    text_id: impl Into<ElementId>,
+    base_id: &'static str,
+    index: usize,
     kind: StyledBodyKind,
     text: String,
+    notify: EntityId,
     window: &mut Window,
     cx: &mut App,
 ) -> impl IntoElement {
@@ -1537,38 +1626,73 @@ fn styled_body(
         StyledBodyKind::Reasoning => rgb(0x666666),
         StyledBodyKind::Tool => rgb(0x444444),
     };
+    // Persisted per-body scroll handle: the wheel handler scrolls the box
+    // manually, and the offset survives re-renders.
+    let scroll = window
+        .use_keyed_state(
+            ElementId::named_usize(format!("{base_id}-handle"), index),
+            cx,
+            |_, _| ScrollHandle::new(),
+        )
+        .read(cx)
+        .clone();
+    let wheel = scroll.clone();
     div()
-        .id(scroll_id)
-        .max_h(px(200.0))
+        .id(ElementId::named_usize(format!("{base_id}-scroll"), index))
+        .max_h(px(STEP_BODY_MAX_H))
         .overflow_y_scroll()
+        .track_scroll(&scroll)
+        .on_scroll_wheel(move |event, window, cx| {
+            contained_scroll(&wheel, notify, event, window, cx)
+        })
         .text_xs()
         .text_color(color)
         .border_l_1()
         .border_color(rgb(0xeeeeec))
         .pl_2()
         .py_1()
-        .child(TextView::markdown(text_id, text, window, cx).selectable(true))
+        .child(
+            div().child(
+                TextView::markdown(
+                    ElementId::named_usize(format!("{base_id}-text"), index),
+                    text,
+                    window,
+                    cx,
+                )
+                .selectable(true),
+            ),
+        )
 }
 
 /// Same visual style as [`styled_body`] but renders the text as a raw
-/// `SharedString` — no markdown parsing, no `TextView`, no 200ms debounce.
-/// Used for the **active** (still-streaming) reasoning/text step so each token
-/// flush shows instantly instead of waiting for TextView's background parse.
-/// The tradeoff: no markdown formatting and no text selection during streaming;
-/// both are restored once the step completes and is rendered via `styled_body`.
+/// `SharedString` — no markdown parsing, no `TextView`, no 200ms debounce —
+/// so each token flush of the **active** (still-streaming) reasoning step
+/// shows instantly. Capped at [`STEP_BODY_MAX_H`] with its own scroll;
+/// `scroll` is the panel's live-reasoning handle, pinned to the bottom on
+/// every flush. Plain text has intrinsic height, so the scroll range is
+/// always correct (unlike TextView's `size_full()` root, which needs the
+/// wrapper div used in [`styled_body`]).
 fn plain_body(
-    scroll_id: impl Into<ElementId>,
     kind: StyledBodyKind,
     text: impl Into<SharedString>,
+    scroll: &ScrollHandle,
+    notify: EntityId,
 ) -> Stateful<Div> {
     let color = match kind {
         StyledBodyKind::Reasoning => rgb(0x666666),
         StyledBodyKind::Tool => rgb(0x444444),
     };
+    let wheel = scroll.clone();
     div()
-        .id(scroll_id)
-        .max_h(px(200.0))
+        // Only one live reasoning body exists at a time (the last step while
+        // reasoning is active), so this id is unique.
+        .id("live-reasoning-body")
+        .max_h(px(STEP_BODY_MAX_H))
         .overflow_y_scroll()
+        .track_scroll(scroll)
+        .on_scroll_wheel(move |event, window, cx| {
+            contained_scroll(&wheel, notify, event, window, cx)
+        })
         .text_xs()
         .text_color(color)
         .border_l_1()
