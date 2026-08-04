@@ -206,57 +206,53 @@ pub fn paths_for_element(
             let curved = is_freedraw || style.line_type == LineType::Curved;
 
             if is_freedraw {
-                // Freedraw bypasses roughr entirely: roughr's curve()
-                // applies random control-point jitter that, while seeded,
-                // produces slightly different paths across re-renders (the
-                // flatten tolerance changes with zoom, and the multi-stroke
-                // second pass inherits the first pass's advanced RNG state).
-                // Instead, sample a deterministic Catmull-Rom spline through
-                // the pointer points and stroke it directly. A committed
-                // stroke never moves.
+                // Freedraw bypasses roughr entirely (see below): sample a
+                // deterministic Catmull-Rom spline through the pointer
+                // points and stroke it directly. A committed stroke never
+                // moves across re-renders.
                 //
-                // Roughness is honored via a deterministic sinusoidal offset
-                // (seed + point position → sin/cos), so the three roughness
-                // presets still look different, but the offset is stable
-                // across re-renders (unlike roughr's RNG). sin/cos varies
-                // smoothly between adjacent samples, so no jagged edges.
+                // Roughness presets, all fully deterministic (sin/cos of
+                // point position + seed, so the same seed always gives the
+                // same offset):
+                //   r0 → single smooth stroke, no offset (architect).
+                //   r1 → single stroke with a smooth wave offset (delicate).
+                //   r2 → double stroke: two slightly-offset wavy strokes,
+                //        mimicking rough.js's two-pass hand-drawn look.
                 let roughness = style.roughness.clamp(0.0, 3.0) as f64;
                 let seed_f = el.seed as f64;
                 let samples = curve_samples(&points, 12);
-                let offset = |p: &WPoint| {
-                    if roughness < 0.01 {
-                        *p
-                    } else {
-                        // Low-frequency smooth wave: the primary hand-drawn
-                        // undulation. Amplitude scales with roughness so the
-                        // three presets are visually distinct.
-                        let amp = roughness * 2.5;
-                        let lf = p.x * 0.03 + seed_f * 0.1;
-                        let mut dx = amp * lf.sin();
-                        let mut dy = amp * (lf * 1.3 + 1.5).cos();
-                        // High-frequency detail for the sketchiest preset:
-                        // adds fine wiggle on top of the smooth wave.
-                        if roughness >= 2.0 {
-                            let hf = p.x * 0.15 + seed_f * 0.3;
-                            dx += amp * 0.5 * hf.sin();
-                            dy += amp * 0.5 * (hf * 1.2 + 2.0).cos();
+                let amp = roughness * 3.0;
+                let n_passes = if roughness >= 2.0 { 2 } else { 1 };
+                for pass in 0..n_passes {
+                    let pass_f = pass as f64;
+                    let offset_fn = |p: &WPoint| {
+                        if roughness < 0.01 {
+                            *p
+                        } else {
+                            // Each pass uses a different phase + a constant
+                            // shift so the two strokes diverge instead of
+                            // overlapping into a single blob.
+                            let phase = p.x * 0.05 + seed_f * 0.1 + pass_f * 1.7;
+                            let shift = pass_f * roughness * 2.0;
+                            let dx = amp * phase.sin() + shift * 0.5;
+                            let dy = amp * (phase * 1.3 + 1.5).cos() + shift * 0.5;
+                            WPoint::new(p.x + dx, p.y + dy)
                         }
-                        WPoint::new(p.x + dx, p.y + dy)
-                    }
-                };
-                let mut builder = PathBuilder::stroke(stroke_width_px);
-                let origin = canvas_origin;
-                let screen = |p: &WPoint| camera.world_to_screen(offset(p), origin);
-                if let Some(first) = samples.first() {
-                    builder.move_to(screen(first));
-                    for p in samples.iter().skip(1) {
-                        builder.line_to(screen(p));
-                    }
-                    if let Ok(path) = builder.build() {
-                        out.push(ReadyPath {
-                            path,
-                            color: stroke_color,
-                        });
+                    };
+                    let mut builder = PathBuilder::stroke(stroke_width_px);
+                    let origin = canvas_origin;
+                    let screen = |p: &WPoint| camera.world_to_screen(offset_fn(p), origin);
+                    if let Some(first) = samples.first() {
+                        builder.move_to(screen(first));
+                        for p in samples.iter().skip(1) {
+                            builder.line_to(screen(p));
+                        }
+                        if let Ok(path) = builder.build() {
+                            out.push(ReadyPath {
+                                path,
+                                color: stroke_color,
+                            });
+                        }
                     }
                 }
             } else {
