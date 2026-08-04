@@ -3128,7 +3128,9 @@ impl BoardView {
             for id in &self.selection {
                 if let Some(el) = self.scene.get_mut(*id) {
                     apply(&mut el.style);
-                    el.seed = crate::scene::new_seed();
+                    // Do NOT regenerate the seed: roughr (and our freedraw
+                    // sinusoidal offset) use it to control jitter. Changing
+                    // the color or stroke width should not alter the shape.
                 }
             }
             self.mark_dirty();
@@ -3151,7 +3153,7 @@ impl BoardView {
             for id in &targets {
                 if let Some(el) = self.scene.get_mut(*id) {
                     apply(&mut el.style);
-                    el.seed = crate::scene::new_seed();
+                    // Seed preserved — see apply_style_to_selection.
                 }
             }
             self.mark_dirty();
