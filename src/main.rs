@@ -13,9 +13,9 @@ mod text;
 mod tools;
 
 use board::{
-    ArrowTool, BoardView, CancelOp, DeleteSelection, DiamondTool, EllipseTool, EraserTool,
-    HandTool, LineTool, OpenScene, PenTool, RectTool, Redo, SaveScene, SelectTool, TextTool,
-    ToggleAi, Undo, ZoomIn, ZoomOut, ZoomReset,
+    ArrowTool, BoardView, BringForward, BringToFront, CancelOp, DeleteSelection, DiamondTool,
+    EllipseTool, EraserTool, HandTool, LineTool, OpenScene, PenTool, RectTool, Redo, SaveScene,
+    SelectTool, SendBackward, SendToBack, TextTool, ToggleAi, Undo, ZoomIn, ZoomOut, ZoomReset,
 };
 use gpui::*;
 use gpui_component::Root;
@@ -51,6 +51,10 @@ fn main() {
             KeyBinding::new("delete", DeleteSelection, Some(CANVAS)),
             KeyBinding::new("backspace", DeleteSelection, Some(CANVAS)),
             KeyBinding::new("escape", CancelOp, Some(CANVAS)),
+            KeyBinding::new("ctrl-shift-]", BringToFront, Some(CANVAS)),
+            KeyBinding::new("ctrl-shift-[", SendToBack, Some(CANVAS)),
+            KeyBinding::new("ctrl-]", BringForward, Some(CANVAS)),
+            KeyBinding::new("ctrl-[", SendBackward, Some(CANVAS)),
             KeyBinding::new("ctrl-=", ZoomIn, Some("Board")),
             KeyBinding::new("ctrl--", ZoomOut, Some("Board")),
             KeyBinding::new("ctrl-0", ZoomReset, Some("Board")),

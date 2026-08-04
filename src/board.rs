@@ -15,6 +15,7 @@ use crate::render::rough::{color_u32, paths_for_element, ReadyPath};
 use crate::render::{
     dot_grid, handle_rects, measure_text, point_handle_rects, shape_text, ShapedTextLine,
 };
+use gpui_component::{Icon, IconName};
 use crate::scene::{
     Element, ElementId, ElementKind, ElementStyle, LineType, Scene, SceneFile, StrokeStyle,
     TextAlign, WBounds, WPoint, DEFAULT_FONT_SIZE, LINE_HEIGHT,
@@ -27,7 +28,7 @@ actions!(
     [
         Undo, Redo, SaveScene, OpenScene, DeleteSelection, CancelOp, ZoomIn, ZoomOut, ZoomReset,
         SelectTool, HandTool, RectTool, DiamondTool, EllipseTool, ArrowTool, LineTool, PenTool,
-        TextTool, EraserTool, ToggleAi,
+        TextTool, EraserTool, ToggleAi, BringToFront, SendToBack, BringForward, SendBackward,
     ]
 );
 
@@ -47,6 +48,24 @@ pub struct EditingState {
     pub text_align: TextAlign,
     /// True when the text element was created by this editing session.
     pub is_new: bool,
+}
+
+/// Which way to reorder the selection in the z-stack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayerOp {
+    ToFront,
+    ToBack,
+    Forward,
+    Backward,
+}
+
+/// An open right-click context menu: anchored at a screen position, with an
+/// optional vertex target (when right-clicked on a vertex handle of a
+/// selected line/arrow).
+#[derive(Clone, Debug)]
+pub struct ContextMenuState {
+    pub position: Point<Pixels>,
+    pub vertex: Option<usize>,
 }
 
 pub struct BoardView {
@@ -94,6 +113,9 @@ pub struct BoardView {
     /// render-time cursor can hint the pending gesture (Ctrl => pan hand,
     /// Shift => pen crosshair) before the button is pressed.
     modifiers: Modifiers,
+    /// Open right-click context menu (layer ops / delete / delete-vertex).
+    /// None when closed.
+    context_menu: Option<ContextMenuState>,
 }
 
 impl BoardView {
@@ -126,6 +148,7 @@ impl BoardView {
             temp_pen: false,
             temp_pan: false,
             modifiers: Modifiers::default(),
+            context_menu: None,
         }
     }
 
@@ -200,6 +223,59 @@ impl BoardView {
         cx.notify();
     }
 
+    /// Delete one vertex of the single selected line/arrow (keeping >= 2
+    /// points), re-placing any bound label. Used by the context menu's
+    /// "delete vertex" item.
+    fn delete_vertex(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(id) = self.selection.first().copied() else {
+            return;
+        };
+        let can = self
+            .scene
+            .get(id)
+            .map(|el| el.is_point_based() && el.absolute_points().len() > 2)
+            .unwrap_or(false);
+        if !can {
+            return;
+        }
+        self.history.record(&self.scene);
+        if let Some(el) = self.scene.get_mut(id) {
+            el.remove_point(index);
+        }
+        self.update_container_labels(&[id]);
+        self.context_menu = None;
+        self.mark_dirty();
+        cx.notify();
+    }
+
+    /// Reorder the selected elements in the z-stack. No-op (and no history
+    /// entry) when the selection is empty or the move can't apply.
+    fn reorder_layers(&mut self, op: LayerOp, cx: &mut Context<Self>) {
+        if self.selection.is_empty() {
+            return;
+        }
+        let ids = self.selection.clone();
+        let can = match op {
+            LayerOp::ToFront => self.scene.can_front(&ids),
+            LayerOp::ToBack => self.scene.can_back(&ids),
+            LayerOp::Forward => self.scene.can_forward(&ids),
+            LayerOp::Backward => self.scene.can_backward(&ids),
+        };
+        if !can {
+            return;
+        }
+        self.history.record(&self.scene);
+        match op {
+            LayerOp::ToFront => self.scene.move_to_front(&ids),
+            LayerOp::ToBack => self.scene.send_to_back(&ids),
+            LayerOp::Forward => self.scene.bring_forward(&ids),
+            LayerOp::Backward => self.scene.send_backward(&ids),
+        }
+        self.context_menu = None;
+        self.mark_dirty();
+        cx.notify();
+    }
+
     fn undo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.commit_editing(window, cx);
         if self.history.undo(&mut self.scene) {
@@ -219,6 +295,13 @@ impl BoardView {
     }
 
     fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // An open context menu absorbs Esc: close it instead of clearing the
+        // selection / committing an edit.
+        if self.context_menu.is_some() {
+            self.context_menu = None;
+            cx.notify();
+            return;
+        }
         if self.editing.is_some() {
             // Esc commits the edit; switch to Select and select a freshly
             // created text element so it can be moved/styled immediately.
@@ -970,7 +1053,13 @@ impl BoardView {
     // mouse handlers
 
     fn on_left_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        // Ignore clicks that land on the AI panel — the panel owns those (its
+        // A left click closes any open context menu (the backdrop normally
+        // intercepts this, but guard anyway for clicks reaching the canvas).
+        if self.context_menu.is_some() {
+            self.context_menu = None;
+            cx.notify();
+        }
+        // Ignore clicks that land on the AI panel - the panel owns those (its
         // input field, selectable text, buttons). Returning before the focus
         // grab below keeps the panel's widgets focused and interactive.
         if self.over_ai_panel(event.position, window, cx) {
@@ -1217,39 +1306,62 @@ impl BoardView {
         cx.notify();
     }
 
-    /// Right-click on the canvas: delete a vertex of the single selected
-    /// line/arrow when a vertex handle is hit (at least two points must
-    /// remain). Right-click has no other canvas binding.
+    /// Right-click: open a context menu (layer ops / delete / delete-vertex).
+    /// Right-clicking an element selects it first (Excalidraw behavior);
+    /// right-clicking a vertex handle of a selected line/arrow adds a
+    /// "delete vertex" item. Right-clicking empty canvas with no selection
+    /// opens nothing.
     fn on_right_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.over_ai_panel(event.position, window, cx) {
             return;
         }
-        let Some((id, handles)) = self.selected_line_point_handles() else {
-            return;
-        };
-        for (target, rect) in handles {
-            let PointTarget::Vertex(index) = target else {
-                continue;
-            };
-            if !rect.contains(&event.position) {
-                continue;
+        let world = self.to_world(event.position);
+
+        // Vertex handle hit on a single selected line/arrow: open the menu
+        // with a "delete vertex" item, without changing the selection.
+        if let Some((id, handles)) = self.selected_line_point_handles() {
+            for (target, rect) in &handles {
+                if let PointTarget::Vertex(index) = target {
+                    if rect.contains(&event.position) {
+                        let can_delete = self
+                            .scene
+                            .get(id)
+                            .map(|el| el.absolute_points().len() > 2)
+                            .unwrap_or(false);
+                        if can_delete {
+                            self.context_menu = Some(ContextMenuState {
+                                position: event.position,
+                                vertex: Some(*index),
+                            });
+                            cx.notify();
+                        }
+                        return;
+                    }
+                }
             }
-            let point_count = self
+        }
+
+        // Otherwise: right-click selects the element under the cursor (if any
+        // and not already selected, no shift), then opens the menu if there
+        // is a selection.
+        if let Some(id) = self.scene.hit_test(world, self.hit_tolerance()) {
+            // Resolve bound labels to their container (labels aren't
+            // independently selectable).
+            let id = self
                 .scene
                 .get(id)
-                .map(|el| el.absolute_points().len())
-                .unwrap_or(0);
-            if point_count <= 2 {
-                return; // a line needs both ends
+                .and_then(|e| e.container_id())
+                .unwrap_or(id);
+            if !event.modifiers.shift && !self.selection.contains(&id) {
+                self.selection = vec![id];
             }
-            self.history.record(&self.scene);
-            if let Some(el) = self.scene.get_mut(id) {
-                el.remove_point(index);
-            }
-            self.update_container_labels(&[id]);
-            self.mark_dirty();
+        }
+        if !self.selection.is_empty() {
+            self.context_menu = Some(ContextMenuState {
+                position: event.position,
+                vertex: None,
+            });
             cx.notify();
-            return;
         }
     }
 
@@ -2717,6 +2829,10 @@ impl Render for BoardView {
             .on_action(cx.listener(|this, _: &SaveScene, _window, cx| this.save(false, cx)))
             .on_action(cx.listener(|this, _: &OpenScene, window, cx| this.open(window, cx)))
             .on_action(cx.listener(|this, _: &DeleteSelection, _window, cx| this.delete_selection(cx)))
+            .on_action(cx.listener(|this, _: &BringToFront, _window, cx| this.reorder_layers(LayerOp::ToFront, cx)))
+            .on_action(cx.listener(|this, _: &SendToBack, _window, cx| this.reorder_layers(LayerOp::ToBack, cx)))
+            .on_action(cx.listener(|this, _: &BringForward, _window, cx| this.reorder_layers(LayerOp::Forward, cx)))
+            .on_action(cx.listener(|this, _: &SendBackward, _window, cx| this.reorder_layers(LayerOp::Backward, cx)))
             .on_action(cx.listener(|this, _: &CancelOp, window, cx| this.cancel(window, cx)))
             .on_action(cx.listener(|this, _: &ZoomIn, _window, cx| this.zoom_by(1.25, cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, _window, cx| this.zoom_by(0.8, cx)))
@@ -2747,6 +2863,7 @@ impl Render for BoardView {
             .child(self.render_element_info(cx))
             .child(self.render_zoom_bar(cx))
             .child(self.render_notice_bar())
+            .children(self.render_context_menu(cx))
             .children(self.ai_panel.clone())
     }
 }
@@ -2877,6 +2994,73 @@ fn bar_icon_button(
 /// Icon color: blue when active, dark gray otherwise.
 fn icon_color(active: bool) -> Hsla {
     color_u32(if active { ICON_ACTIVE } else { ICON_NORMAL }, 1.0)
+}
+
+/// A horizontal separator for the context menu.
+fn menu_separator() -> Div {
+    div().h(px(1.0)).w_full().bg(rgb(0xe3e2df))
+}
+
+/// One row of the right-click context menu: an optional leading icon, a
+/// label, an optional right-aligned shortcut hint, and a disabled state.
+/// Disabled rows are greyed and don't register a click / hover.
+fn context_menu_row(
+    id: impl Into<gpui::ElementId>,
+    icon: Option<IconName>,
+    label: SharedString,
+    shortcut: Option<SharedString>,
+    enabled: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    let label_color = if enabled {
+        rgb(0x1e1e1e)
+    } else {
+        rgb(0xbbbbbb)
+    };
+    let icon_color = if enabled {
+        rgb(0x3b3b3b)
+    } else {
+        rgb(0xbbbbbb)
+    };
+    let shortcut_color = if enabled {
+        rgb(0x999999)
+    } else {
+        rgb(0xcccccc)
+    };
+    let mut row = div()
+        .id(id)
+        .h_7()
+        .px_2()
+        .rounded_md()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .text_sm()
+        .text_color(label_color);
+    if enabled {
+        row = row
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(0xf1f0ee)))
+            .on_click(on_click);
+    }
+    // Fixed-width icon column keeps labels aligned whether or not a row has
+    // an icon.
+    let mut icon_col = div()
+        .w(px(16.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_color(icon_color);
+    if let Some(name) = icon {
+        icon_col = icon_col.child(Icon::new(name));
+    }
+    row = row.child(icon_col);
+    row = row.child(div().flex_1().child(label));
+    if let Some(sc) = shortcut {
+        row = row.child(div().text_xs().text_color(shortcut_color).child(sc));
+    }
+    row
 }
 
 impl BoardView {
@@ -3525,6 +3709,120 @@ impl BoardView {
             card = card.right_3();
         }
         card.into_any_element()
+    }
+
+    /// The right-click context menu: layer ops (front/forward/backward/back),
+    /// delete, and a contextual "delete vertex" when right-clicked on a vertex
+    /// handle of a selected line/arrow. Dismissed by `on_mouse_down_out`
+    /// (any click outside the card), Esc, or picking an item.
+    fn render_context_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let cm = self.context_menu.as_ref()?;
+        let weak = cx.weak_entity();
+        let ids = self.selection.clone();
+
+        // Clamp the menu inside the window so it never overflows the edge.
+        let menu_w = px(190.0);
+        let menu_h = px(260.0);
+        let win = self.canvas_bounds.size;
+        let left = if cm.position.x + menu_w > win.width {
+            (win.width - menu_w).max(px(0.0))
+        } else {
+            cm.position.x
+        };
+        let top = if cm.position.y + menu_h > win.height {
+            (win.height - menu_h).max(px(0.0))
+        } else {
+            cm.position.y
+        };
+
+        let mut card = div()
+            .id("context-menu")
+            .absolute()
+            .left(left)
+            .top(top)
+            .min_w(menu_w)
+            .bg(rgb(0xffffff))
+            .border_1()
+            .border_color(rgb(0xe3e2df))
+            .rounded_md()
+            .shadow_lg()
+            .p_1()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            // Clicks on the menu itself don't bubble to the canvas (so a
+            // right-click on the menu doesn't reopen it, and a left-click on
+            // an item doesn't also select/marquee on the canvas).
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+            // Any mouse-down outside the card closes the menu (click-away).
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.context_menu = None;
+                cx.notify();
+            }));
+
+        // Contextual: delete the vertex under the cursor (selected line/arrow).
+        if let Some(idx) = cm.vertex {
+            let weak = weak.clone();
+            card = card.child(context_menu_row(
+                "cm-vertex",
+                None,
+                "删除顶点".into(),
+                None,
+                true,
+                move |_, _, cx| {
+                    let _ = weak.update(cx, |b, cx| b.delete_vertex(idx, cx));
+                },
+            ));
+            card = card.child(menu_separator());
+        }
+
+        // Layer ops. Disabled (greyed, non-interactive) when the move can't apply.
+        let layer_ops: [(LayerOp, &str, IconName, &str); 4] = [
+            (LayerOp::ToFront, "置于顶层", IconName::ArrowUp, "Ctrl+Shift+]"),
+            (LayerOp::Forward, "上移一层", IconName::ChevronUp, "Ctrl+]"),
+            (LayerOp::Backward, "下移一层", IconName::ChevronDown, "Ctrl+["),
+            (LayerOp::ToBack, "置于底层", IconName::ArrowDown, "Ctrl+Shift+["),
+        ];
+        for (i, (op, label, icon, sc)) in layer_ops.into_iter().enumerate() {
+            let enabled = match op {
+                LayerOp::ToFront => self.scene.can_front(&ids),
+                LayerOp::ToBack => self.scene.can_back(&ids),
+                LayerOp::Forward => self.scene.can_forward(&ids),
+                LayerOp::Backward => self.scene.can_backward(&ids),
+            };
+            let weak = weak.clone();
+            card = card.child(context_menu_row(
+                gpui::ElementId::named_usize("cm-layer", i),
+                Some(icon),
+                label.into(),
+                Some(sc.into()),
+                enabled,
+                move |_, _, cx| {
+                    let _ = weak.update(cx, |b, cx| b.reorder_layers(op, cx));
+                },
+            ));
+        }
+
+        card = card.child(menu_separator());
+
+        // Delete selection.
+        let weak = weak.clone();
+        card = card.child(context_menu_row(
+            "cm-delete",
+            Some(IconName::Delete),
+            "删除".into(),
+            Some("Delete".into()),
+            !ids.is_empty(),
+            move |_, _, cx| {
+                let _ = weak.update(cx, |b, cx| {
+                    b.delete_selection(cx);
+                    b.context_menu = None;
+                });
+            },
+        ));
+
+        Some(card.into_any_element())
     }
 
     fn render_zoom_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {

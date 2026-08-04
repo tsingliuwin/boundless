@@ -79,6 +79,80 @@ impl Scene {
     pub fn restore(&mut self, elements: Vec<Element>) {
         self.elements = elements;
     }
+
+    // -----------------------------------------------------------------
+    // Z-order (layer) operations on a selection set. The Vec index is the
+    // z-order (later = on top). All four preserve the selected elements'
+    // relative order and operate on the group as a whole.
+    // -----------------------------------------------------------------
+
+    /// Move all selected elements to the top (end of the Vec), preserving
+    /// their relative order. Stable sort: non-selected (false=0) first,
+    /// selected (true=1) last = on top.
+    pub fn move_to_front(&mut self, ids: &[ElementId]) {
+        self.elements.sort_by_key(|e| ids.contains(&e.id));
+    }
+
+    /// Move all selected elements to the bottom (start of the Vec).
+    pub fn send_to_back(&mut self, ids: &[ElementId]) {
+        self.elements.sort_by_key(|e| !ids.contains(&e.id));
+    }
+
+    /// Move the selected group one layer toward the top. Process from the
+    /// highest index down so each swap frees the slot for the next, keeping
+    /// the group contiguous-ish and ordered.
+    pub fn bring_forward(&mut self, ids: &[ElementId]) {
+        for i in (0..self.elements.len().saturating_sub(1)).rev() {
+            if ids.contains(&self.elements[i].id) && !ids.contains(&self.elements[i + 1].id) {
+                self.elements.swap(i, i + 1);
+            }
+        }
+    }
+
+    /// Move the selected group one layer toward the bottom.
+    pub fn send_backward(&mut self, ids: &[ElementId]) {
+        for i in 1..self.elements.len() {
+            if ids.contains(&self.elements[i].id) && !ids.contains(&self.elements[i - 1].id) {
+                self.elements.swap(i, i - 1);
+            }
+        }
+    }
+
+    /// Can the selected group move to the front? (Not if every selected
+    /// element is already at the top, i.e. the tail of the Vec is all
+    /// selected with no non-selected after the last selected.)
+    pub fn can_front(&self, ids: &[ElementId]) -> bool {
+        self.elements
+            .iter()
+            .rev()
+            .take_while(|e| ids.contains(&e.id))
+            .count()
+            < ids.iter().filter(|id| self.elements.iter().any(|e| e.id == **id)).count()
+    }
+
+    /// Can the selected group move to the back?
+    pub fn can_back(&self, ids: &[ElementId]) -> bool {
+        self.elements
+            .iter()
+            .take_while(|e| ids.contains(&e.id))
+            .count()
+            < ids.iter().filter(|id| self.elements.iter().any(|e| e.id == **id)).count()
+    }
+
+    /// Can the selected group move one layer up? (Some selected element has a
+    /// non-selected element immediately above it.)
+    pub fn can_forward(&self, ids: &[ElementId]) -> bool {
+        (0..self.elements.len().saturating_sub(1)).any(|i| {
+            ids.contains(&self.elements[i].id) && !ids.contains(&self.elements[i + 1].id)
+        })
+    }
+
+    /// Can the selected group move one layer down?
+    pub fn can_backward(&self, ids: &[ElementId]) -> bool {
+        (1..self.elements.len()).any(|i| {
+            ids.contains(&self.elements[i].id) && !ids.contains(&self.elements[i - 1].id)
+        })
+    }
 }
 
 /// On-disk scene format (`.boundless`, JSON).
@@ -178,5 +252,78 @@ mod tests {
         assert_eq!(scene.find_by_id_prefix(prefix), Some(id));
         assert_eq!(scene.find_by_id_prefix(&full), Some(id)); // full id is a prefix of itself
         assert_eq!(scene.find_by_id_prefix("deadbeef"), None); // no match
+    }
+
+    fn scene_with_ids(n: usize) -> (Scene, Vec<ElementId>) {
+        let mut scene = Scene::new();
+        let mut ids = Vec::new();
+        for _ in 0..n {
+            ids.push(scene.add(Element::new(
+                ElementKind::Rectangle,
+                WBounds::new(0.0, 0.0, 10.0, 10.0),
+                ElementStyle::default(),
+            )));
+        }
+        (scene, ids)
+    }
+
+    #[test]
+    fn move_to_front_and_send_to_back_preserve_relative_order() {
+        let (mut scene, ids) = scene_with_ids(4); // [a, b, c, d] bottom->top
+        // Bring b and d (non-contiguous) to the front: order should be
+        // [a, c, b, d] (non-selected keep order, selected keep order).
+        scene.move_to_front(&[ids[1], ids[3]]);
+        assert_eq!(
+            scene.elements.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![ids[0], ids[2], ids[1], ids[3]]
+        );
+        // Send b and d to the back: [b, d, a, c].
+        scene.send_to_back(&[ids[1], ids[3]]);
+        assert_eq!(
+            scene.elements.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![ids[1], ids[3], ids[0], ids[2]]
+        );
+    }
+
+    #[test]
+    fn bring_forward_and_send_backward_shift_group_one_layer() {
+        let (mut scene, ids) = scene_with_ids(5); // [a, b, c, d, e]
+        // Select b and d. bring_forward once: each swaps up if the slot above
+        // is free. b->above is c (free) => b swaps with c. d->above is e
+        // (free) => d swaps with e. Result: [a, c, b, e, d].
+        scene.bring_forward(&[ids[1], ids[3]]);
+        assert_eq!(
+            scene.elements.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![ids[0], ids[2], ids[1], ids[4], ids[3]]
+        );
+        // send_backward on b, d: b->below is a (free) => swap. d->below is e
+        // (free) => swap. Result: [b, a, d, c, e]... process low->high:
+        // i=1 (b): below a free => swap => [a,b,c,e,d] wait recompute.
+        // Start: [a, c, b, e, d]. send_backward([b, d]):
+        //   i=1 c? not selected. i=2 b: below=c free => swap => [a, b, c, e, d]
+        //   i=3 e? not selected. i=4 d: below=e free => swap => [a, b, c, d, e]
+        // Back to original order.
+        scene.send_backward(&[ids[1], ids[3]]);
+        assert_eq!(
+            scene.elements.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![ids[0], ids[1], ids[2], ids[3], ids[4]]
+        );
+    }
+
+    #[test]
+    fn can_front_back_forward_backward_at_boundaries() {
+        let (mut scene, ids) = scene_with_ids(4); // [a, b, c, d]
+
+        // Bottom element a: can_back false, can_backward false; can_front/forward true.
+        assert!(!scene.can_back(&[ids[0]]) && !scene.can_backward(&[ids[0]]));
+        assert!(scene.can_front(&[ids[0]]) && scene.can_forward(&[ids[0]]));
+
+        // Top element d: can_front false, can_forward false; can_back/backward true.
+        assert!(!scene.can_front(&[ids[3]]) && !scene.can_forward(&[ids[3]]));
+        assert!(scene.can_back(&[ids[3]]) && scene.can_backward(&[ids[3]]));
+
+        // After moving a to front, a is on top: can_front now false.
+        scene.move_to_front(&[ids[0]]);
+        assert!(!scene.can_front(&[ids[0]]) && !scene.can_forward(&[ids[0]]));
     }
 }
