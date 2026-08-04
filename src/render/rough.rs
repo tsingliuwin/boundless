@@ -56,10 +56,21 @@ fn options_for(style: &ElementStyle, seed: u64, is_freedraw: bool) -> Options {
     // Freedraw: keep the actual pointer vertices fixed so the stroke
     // follows the user's hand precisely, while the control-point jitter
     // between vertices still gives the hand-drawn texture. Without this
-    // every sample point is randomly offset ±2px → a jittery, unstable
+    // every sample point is randomly offset → a jittery, unstable
     // line (Excalidraw sets preserveVertices: true for freedraw).
     if is_freedraw {
         options.preserve_vertices = Some(true);
+        // Subtler jitter than the shape default: the multi-stroke double-pass
+        // is kept (gives a hand-drawn feel), but the offset is small so the
+        // two passes stay close together → fine, delicate texture rather
+        // than a visibly shaky line. Excalidraw's pen uses a similar low
+        // amplitude (its roughness for freedraw ≈ 0.5-1.0 with reduced
+        // randomness).
+        options.max_randomness_offset = Some(0.6);
+        // No bowing for freedraw: the curve already follows the hand, and
+        // bowing would add a perpendicular bulge that looks wrong on a
+        // freehand stroke.
+        options.bowing = Some(0.0);
     }
     if let Some(bg) = style.background {
         options.fill = Some(srgba(bg, style.opacity));
