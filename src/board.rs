@@ -1458,10 +1458,24 @@ impl BoardView {
                 let new_over_element = new_handle.is_none()
                     && new_point.is_none()
                     && self.tool == ActiveTool::Select
-                    && self
+                    && (self
                         .scene
                         .hit_test(world, self.hit_tolerance())
-                        .is_some();
+                        .is_some()
+                        // Also treat the inside of the selection bbox as
+                        // "over an element" so the move cursor shows even
+                        // where a thin line's hit_test misses (the bbox is
+                        // the draggable area per select_down's 1b step).
+                        || (!self.selection.is_empty()
+                            && self
+                                .selection_bounds_world()
+                                .is_some_and(|b| {
+                                    b.inflate(
+                                        self.hit_tolerance(),
+                                        self.hit_tolerance(),
+                                    )
+                                    .contains(world)
+                                })));
                 if new_over_element != self.hover_over_element
                     || new_handle != self.hover_handle
                     || new_point != self.hover_point
