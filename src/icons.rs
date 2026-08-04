@@ -304,6 +304,23 @@ pub fn zoom_fit(c: Hsla) -> impl IntoElement {
     })
 }
 
+/// Grid toggle: a 2x2 cell grid (border + cross dividers).
+pub fn grid(c: Hsla) -> impl IntoElement {
+    icon(c, |b| {
+        // Border.
+        b.mv(4.0, 4.0);
+        b.ln(16.0, 4.0);
+        b.ln(16.0, 16.0);
+        b.ln(4.0, 16.0);
+        b.cp();
+        // Cross dividers -> four cells.
+        b.mv(4.0, 10.0);
+        b.ln(16.0, 10.0);
+        b.mv(10.0, 4.0);
+        b.ln(10.0, 16.0);
+    })
+}
+
 // ---------------------------------------------------------------------
 // Stroke-width visualization (replaces "细/中/粗" text)
 // ---------------------------------------------------------------------

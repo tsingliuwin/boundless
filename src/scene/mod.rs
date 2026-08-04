@@ -155,6 +155,12 @@ impl Scene {
     }
 }
 
+/// Serde default for `SceneFile::show_grid`: old scenes (pre-grid-toggle)
+/// load with the grid visible, matching the previous always-on behavior.
+fn default_true() -> bool {
+    true
+}
+
 /// On-disk scene format (`.boundless`, JSON).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SceneFile {
@@ -164,6 +170,10 @@ pub struct SceneFile {
     pub camera: Camera,
     #[serde(default)]
     pub elements: Vec<Element>,
+    /// Whether the dot grid is visible. Defaults to true for scenes saved
+    /// before this field existed.
+    #[serde(default = "default_true")]
+    pub show_grid: bool,
 }
 
 impl SceneFile {
@@ -173,6 +183,7 @@ impl SceneFile {
             version: SCENE_VERSION,
             camera,
             elements: scene.elements.clone(),
+            show_grid: true,
         }
     }
 

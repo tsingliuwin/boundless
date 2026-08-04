@@ -116,6 +116,9 @@ pub struct BoardView {
     /// Open right-click context menu (layer ops / delete / delete-vertex).
     /// None when closed.
     context_menu: Option<ContextMenuState>,
+    /// Whether the dot grid is painted behind the canvas. Toggled from the
+    /// zoom-bar; persisted in the scene file.
+    show_grid: bool,
 }
 
 impl BoardView {
@@ -149,6 +152,7 @@ impl BoardView {
             temp_pan: false,
             modifiers: Modifiers::default(),
             context_menu: None,
+            show_grid: true,
         }
     }
 
@@ -986,6 +990,7 @@ impl BoardView {
             self.file_path.clone().unwrap()
         };
         let file = SceneFile::new(&self.scene, self.camera);
+        let file = SceneFile { show_grid: self.show_grid, ..file };
         let result = serde_json::to_string_pretty(&file)
             .map_err(anyhow::Error::from)
             .and_then(|json| std::fs::write(&path, json).map_err(anyhow::Error::from));
@@ -1014,6 +1019,7 @@ impl BoardView {
             Ok(file) => {
                 self.scene.restore(file.elements);
                 self.camera = file.camera;
+                self.show_grid = file.show_grid;
                 self.selection.clear();
                 self.history = History::new();
                 self.file_path = Some(path.clone());
@@ -2370,7 +2376,11 @@ impl BoardView {
         );
         let view_world = WBounds::from_corners(view_world_tl, view_world_br);
 
-        let grid = dot_grid(&self.camera, viewport, color_u32(GRID_COLOR, 1.0));
+        let grid = if self.show_grid {
+            dot_grid(&self.camera, viewport, color_u32(GRID_COLOR, 1.0))
+        } else {
+            Vec::new()
+        };
 
         let editing_id = self.editing.as_ref().map(|e| e.element_id);
         let mut paths = Vec::new();
@@ -3834,6 +3844,8 @@ impl BoardView {
         let weak_in = weak.clone();
         let weak_reset = weak.clone();
         let weak_fit = weak.clone();
+        let weak_grid = weak.clone();
+        let grid_on = self.show_grid;
 
         // Dock above/below the AI panel rather than under it: when the panel
         // is open, push the zoom bar to the left of it so it stays visible.
@@ -3888,7 +3900,19 @@ impl BoardView {
                             }
                         })
                         .ok();
-                })),
+                }))
+                .child(
+                    bar_icon_button("toggle-grid", grid_on, ic::grid(icon_color(grid_on)))
+                        .on_click(move |_, _, cx| {
+                            weak_grid
+                                .update(cx, |this, cx| {
+                                    this.show_grid = !this.show_grid;
+                                    this.mark_dirty();
+                                    cx.notify();
+                                })
+                                .ok();
+                        }),
+                ),
         )
     }
 
