@@ -359,6 +359,35 @@ pub fn roughness_icon(c: Hsla, roughness: f32) -> impl IntoElement {
     .size_full()
 }
 
+/// Line-type icon for linear elements: a sharp polyline corner (straight)
+/// or a smooth arc through the same endpoints (curved, drawn by sampling a
+/// quadratic Bézier). One draw closure with a runtime branch keeps a single
+/// opaque return type (same trick as [`align_icon`]).
+pub fn line_type_icon(c: Hsla, line_type: crate::scene::LineType) -> impl IntoElement {
+    icon(c, move |b| match line_type {
+        crate::scene::LineType::Straight => {
+            b.mv(3.0, 14.0);
+            b.ln(10.0, 5.0);
+            b.ln(17.0, 14.0);
+        }
+        crate::scene::LineType::Curved => {
+            // Quadratic Bézier from (3,14) via control (10,3) to (17,14).
+            let n = 12;
+            for i in 0..=n {
+                let t = i as f32 / n as f32;
+                let u = 1.0 - t;
+                let x = u * u * 3.0 + 2.0 * u * t * 10.0 + t * t * 17.0;
+                let y = u * u * 14.0 + 2.0 * u * t * 3.0 + t * t * 14.0;
+                if i == 0 {
+                    b.mv(x, y);
+                } else {
+                    b.ln(x, y);
+                }
+            }
+        }
+    })
+}
+
 /// Text alignment icon: three horizontal bars aligned to the given side.
 pub fn align_icon(c: Hsla, align: crate::scene::TextAlign) -> impl IntoElement {
     use crate::scene::TextAlign;

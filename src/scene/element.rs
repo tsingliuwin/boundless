@@ -149,6 +149,17 @@ pub enum StrokeStyle {
     Dashed,
 }
 
+/// How a polyline (line/arrow) connects its points: sharp straight segments
+/// or a smooth curve through them (Excalidraw's "line type" property).
+/// Only affects Line/Arrow rendering; freedraw strokes are always curved.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LineType {
+    #[default]
+    Straight,
+    Curved,
+}
+
 /// Visual style shared by all elements. Colors are 0xRRGGBB.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ElementStyle {
@@ -158,6 +169,9 @@ pub struct ElementStyle {
     pub roughness: f32,
     pub stroke_style: StrokeStyle,
     pub opacity: f32,
+    /// Straight vs curved polylines (lines/arrows only).
+    #[serde(default)]
+    pub line_type: LineType,
 }
 
 impl Default for ElementStyle {
@@ -169,6 +183,7 @@ impl Default for ElementStyle {
             roughness: 1.0,
             stroke_style: StrokeStyle::Solid,
             opacity: 1.0,
+            line_type: LineType::Straight,
         }
     }
 }
@@ -466,6 +481,61 @@ impl Element {
         self.bounds = new_bounds;
     }
 
+    /// Set the `index`-th vertex of a point-based element to the absolute
+    /// (world-space) point `p`, then renormalize bounds (the origin may move
+    /// when the vertex leaves the old bounds). No-op for non-point-based
+    /// elements and out-of-range indices.
+    pub fn set_absolute_point(&mut self, index: usize, p: WPoint) {
+        let origin = WPoint::new(self.bounds.x, self.bounds.y);
+        match &mut self.kind {
+            ElementKind::Line { points }
+            | ElementKind::Arrow { points, .. }
+            | ElementKind::Freedraw { points } => match points.get_mut(index) {
+                Some(pt) => *pt = p - origin,
+                None => return,
+            },
+            _ => return,
+        }
+        self.normalize_point_bounds();
+    }
+
+    /// Insert the absolute (world-space) point `p` after segment `seg` (as
+    /// the new vertex at index `seg + 1`), then renormalize bounds. No-op
+    /// for non-point-based elements and out-of-range segment indices.
+    pub fn insert_absolute_point_after(&mut self, seg: usize, p: WPoint) {
+        let origin = WPoint::new(self.bounds.x, self.bounds.y);
+        match &mut self.kind {
+            ElementKind::Line { points }
+            | ElementKind::Arrow { points, .. }
+            | ElementKind::Freedraw { points } => {
+                if seg + 1 > points.len() {
+                    return;
+                }
+                points.insert(seg + 1, p - origin);
+            }
+            _ => return,
+        }
+        self.normalize_point_bounds();
+    }
+
+    /// Remove the `index`-th vertex of a point-based element, keeping at
+    /// least two points (a line needs both ends). No-op for non-point-based
+    /// elements, out-of-range indices, or when only two points remain.
+    pub fn remove_point(&mut self, index: usize) {
+        match &mut self.kind {
+            ElementKind::Line { points }
+            | ElementKind::Arrow { points, .. }
+            | ElementKind::Freedraw { points } => {
+                if points.len() <= 2 || index >= points.len() {
+                    return;
+                }
+                points.remove(index);
+            }
+            _ => return,
+        }
+        self.normalize_point_bounds();
+    }
+
     /// Hit test in world coordinates. `tol` is a world-space tolerance.
     pub fn hit_test(&self, p: WPoint, tol: f64) -> bool {
         let stroke_tol = (self.style.stroke_width / 2.0).max(2.0) + tol;
@@ -724,5 +794,118 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    fn line(points: Vec<WPoint>) -> Element {
+        Element::from_absolute_points(
+            |points| ElementKind::Line { points },
+            points,
+            rect_style(),
+        )
+    }
+
+    #[test]
+    fn set_absolute_point_inside_bounds_keeps_origin() {
+        let mut el = line(vec![
+            WPoint::new(0.0, 0.0),
+            WPoint::new(50.0, 20.0),
+            WPoint::new(100.0, 0.0),
+        ]);
+        // Move the middle vertex while staying inside the current bounds.
+        el.set_absolute_point(1, WPoint::new(50.0, 10.0));
+        assert_eq!(
+            el.absolute_points(),
+            vec![
+                WPoint::new(0.0, 0.0),
+                WPoint::new(50.0, 10.0),
+                WPoint::new(100.0, 0.0)
+            ]
+        );
+        // Origin unchanged (bounds still start at the same min corner).
+        assert_eq!((el.bounds.x, el.bounds.y), (0.0, 0.0));
+    }
+
+    #[test]
+    fn set_absolute_point_outside_bounds_moves_origin() {
+        let mut el = line(vec![WPoint::new(50.0, 50.0), WPoint::new(100.0, 60.0)]);
+        // Drag the first vertex up-left past the current bounds.
+        el.set_absolute_point(0, WPoint::new(-20.0, -10.0));
+        let abs = el.absolute_points();
+        assert_eq!(abs, vec![WPoint::new(-20.0, -10.0), WPoint::new(100.0, 60.0)]);
+        // Bounds renormalized to enclose the new points exactly.
+        assert_eq!((el.bounds.x, el.bounds.y), (-20.0, -10.0));
+        assert_eq!((el.bounds.w, el.bounds.h), (120.0, 70.0));
+    }
+
+    #[test]
+    fn insert_absolute_point_after_bends_segment() {
+        let mut el = line(vec![WPoint::new(0.0, 0.0), WPoint::new(100.0, 0.0)]);
+        el.insert_absolute_point_after(0, WPoint::new(50.0, 40.0));
+        assert_eq!(
+            el.absolute_points(),
+            vec![
+                WPoint::new(0.0, 0.0),
+                WPoint::new(50.0, 40.0),
+                WPoint::new(100.0, 0.0)
+            ]
+        );
+        // Bounds grew to include the new vertex.
+        assert_eq!((el.bounds.h, el.bounds.y), (40.0, 0.0));
+        // Out-of-range segment index is a no-op.
+        el.insert_absolute_point_after(5, WPoint::new(0.0, 0.0));
+        assert_eq!(el.absolute_points().len(), 3);
+    }
+
+    #[test]
+    fn remove_point_keeps_at_least_two() {
+        let mut el = line(vec![
+            WPoint::new(0.0, 0.0),
+            WPoint::new(50.0, 40.0),
+            WPoint::new(100.0, 0.0),
+        ]);
+        el.remove_point(1);
+        assert_eq!(
+            el.absolute_points(),
+            vec![WPoint::new(0.0, 0.0), WPoint::new(100.0, 0.0)]
+        );
+        // Bounds shrink after the peak vertex is gone.
+        assert_eq!(el.bounds.h, 0.0);
+        // Only two points left: further removal is refused.
+        el.remove_point(0);
+        assert_eq!(el.absolute_points().len(), 2);
+        // Out-of-range index is a no-op.
+        el.remove_point(9);
+        assert_eq!(el.absolute_points().len(), 2);
+    }
+
+    #[test]
+    fn legacy_element_without_line_type_loads_as_straight() {
+        // Elements saved before the `line_type` style field existed must
+        // still deserialize (flattened style + serde default).
+        let json = r#"{
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "x": 10.0, "y": 20.0, "w": 100.0, "h": 50.0,
+            "seed": 7,
+            "stroke": 1973790, "background": null, "stroke_width": 2.0,
+            "roughness": 1.0, "stroke_style": "solid", "opacity": 1.0,
+            "kind": "line",
+            "points": [{"x": 0.0, "y": 0.0}, {"x": 100.0, "y": 50.0}]
+        }"#;
+        let el: Element = serde_json::from_str(json).unwrap();
+        assert_eq!(el.style.line_type, LineType::Straight);
+        assert_eq!(el.absolute_points().len(), 2);
+    }
+
+    #[test]
+    fn point_edits_noop_for_shapes() {
+        let mut el = Element::new(
+            ElementKind::Rectangle,
+            WBounds::new(0.0, 0.0, 100.0, 50.0),
+            rect_style(),
+        );
+        el.set_absolute_point(0, WPoint::new(5.0, 5.0));
+        el.insert_absolute_point_after(0, WPoint::new(5.0, 5.0));
+        el.remove_point(0);
+        assert_eq!(el.bounds, WBounds::new(0.0, 0.0, 100.0, 50.0));
     }
 }

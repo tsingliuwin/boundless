@@ -8,7 +8,7 @@ use roughr::Srgba;
 
 use crate::camera::Camera;
 use crate::scene::{
-    diamond_polygon, Element, ElementKind, ElementStyle, StrokeStyle, WPoint,
+    diamond_polygon, Element, ElementKind, ElementStyle, LineType, StrokeStyle, WPoint,
 };
 
 /// One tessellated path ready to paint.
@@ -173,9 +173,13 @@ pub fn paths_for_element(
                 return out;
             }
             let is_freedraw = matches!(el.kind, ElementKind::Freedraw { .. });
+            // Lines/arrows render as straight polylines by default; the
+            // "curved" line type fits a smooth curve through the points
+            // (Excalidraw). Freedraw strokes are always curved.
+            let curved = is_freedraw || style.line_type == LineType::Curved;
             let gen = KurboGenerator::new(options_for(style, el.seed, is_freedraw));
             let euclid_points: Vec<_> = points.iter().map(|p| to_euclid(*p)).collect();
-            if is_freedraw {
+            if curved {
                 push_drawable(&gen.curve(&euclid_points), &mut out);
             } else {
                 push_drawable(&gen.linear_path(&euclid_points, false), &mut out);
@@ -194,12 +198,13 @@ pub fn paths_for_element(
                         &points,
                         points.len() - 1,
                         head_len,
+                        curved,
                         &mut push_drawable,
                         &mut out,
                     );
                 }
                 if *start_arrowhead && points.len() >= 2 {
-                    push_arrowhead(&gen, &points, 0, head_len, &mut push_drawable, &mut out);
+                    push_arrowhead(&gen, &points, 0, head_len, curved, &mut push_drawable, &mut out);
                 }
             }
         }
@@ -216,17 +221,22 @@ fn push_arrowhead(
     points: &[WPoint],
     tip_index: usize,
     head_len: f64,
+    curved: bool,
     push: &mut impl FnMut(&rough_piet::KurboDrawable<f64>, &mut Vec<ReadyPath>),
     out: &mut Vec<ReadyPath>,
 ) {
     let tip = points[tip_index];
     // Direction of the segment at the tip: for the end arrowhead it's the
     // incoming direction, for the start arrowhead it's the reverse of the
-    // outgoing segment (both are "tip minus its neighbor").
+    // outgoing segment (both are "tip minus its neighbor"). For curved
+    // polylines the neighbor is the *second*-nearest point: the smoothed
+    // tangent at the tip sits between the last two chords, and the longer
+    // baseline approximates it much better than the raw final segment.
+    let back = if curved { 2 } else { 1 };
     let neighbor = if tip_index == 0 {
-        points[1.min(points.len() - 1)]
+        points[back.min(points.len() - 1)]
     } else {
-        points[tip_index - 1]
+        points[tip_index.saturating_sub(back)]
     };
     let dir = tip - neighbor;
     let len = (dir.x * dir.x + dir.y * dir.y).sqrt();
@@ -304,5 +314,49 @@ mod tests {
         let a = paths_for_element(&el, &camera, origin);
         let b = paths_for_element(&el, &camera, origin);
         assert_eq!(a.len(), b.len(), "same seed must give same path count");
+    }
+
+    #[test]
+    fn curved_line_type_renders_for_lines_and_arrows() {
+        let camera = Camera::default();
+        let origin = gpui::point(px(0.0), px(0.0));
+        let pts = || {
+            vec![
+                WPoint::new(0.0, 0.0),
+                WPoint::new(50.0, 40.0),
+                WPoint::new(100.0, 0.0),
+            ]
+        };
+        let mut style = ElementStyle::default();
+        style.line_type = LineType::Curved;
+        let line = Element::from_absolute_points(
+            |points| ElementKind::Line { points },
+            pts(),
+            style.clone(),
+        );
+        assert!(!paths_for_element(&line, &camera, origin).is_empty());
+        // A curved arrow also renders both arrowheads (end + start).
+        let arrow = Element::from_absolute_points(
+            |points| ElementKind::Arrow {
+                points,
+                end_arrowhead: true,
+                start_arrowhead: true,
+            },
+            pts(),
+            style,
+        );
+        // stroke path + 2 heads × 2 lines each.
+        assert!(paths_for_element(&arrow, &camera, origin).len() >= 5);
+    }
+
+    #[test]
+    fn straight_is_the_default_line_type() {
+        // Old scene files (no line_type field) and fresh styles are straight.
+        assert_eq!(ElementStyle::default().line_type, LineType::Straight);
+        let style: ElementStyle = serde_json::from_str(
+            r#"{"stroke":0,"background":null,"stroke_width":2.0,"roughness":1.0,"stroke_style":"solid","opacity":1.0}"#,
+        )
+        .unwrap();
+        assert_eq!(style.line_type, LineType::Straight);
     }
 }

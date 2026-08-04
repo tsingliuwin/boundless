@@ -75,6 +75,16 @@ impl ActiveTool {
     }
 }
 
+/// Which control point of a selected line/arrow is being targeted. Vertex(i)
+/// is the i-th polyline point; Midpoint(seg) is the midpoint handle of the
+/// segment between points `seg` and `seg + 1` — dragging it inserts a new
+/// vertex there (Excalidraw-style bending).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointTarget {
+    Vertex(usize),
+    Midpoint(usize),
+}
+
 /// In-progress pointer interaction.
 pub enum DragState {
     /// No active drag.
@@ -103,6 +113,17 @@ pub enum DragState {
         handle: Handle,
         original_bounds: WBounds,
         originals: Vec<Element>,
+        recorded: bool,
+    },
+    /// Dragging a vertex/midpoint control handle of a single selected
+    /// line/arrow. `original` is the stable base element: every move
+    /// recomputes from it, which makes midpoint drags idempotent (each move
+    /// re-inserts the new vertex at the same segment). History is recorded
+    /// lazily on the first actual move.
+    EditingPoint {
+        element: ElementId,
+        original: Element,
+        target: PointTarget,
         recorded: bool,
     },
     /// Rubber-band selection.

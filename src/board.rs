@@ -12,13 +12,15 @@ use crate::ai::panel::AiPanel;
 use crate::camera::Camera;
 use crate::history::History;
 use crate::render::rough::{color_u32, paths_for_element, ReadyPath};
-use crate::render::{dot_grid, handle_rects, measure_text, shape_text, ShapedTextLine};
+use crate::render::{
+    dot_grid, handle_rects, measure_text, point_handle_rects, shape_text, ShapedTextLine,
+};
 use crate::scene::{
-    Element, ElementId, ElementKind, ElementStyle, Scene, SceneFile, StrokeStyle, TextAlign,
-    WBounds, WPoint, DEFAULT_FONT_SIZE, LINE_HEIGHT,
+    Element, ElementId, ElementKind, ElementStyle, LineType, Scene, SceneFile, StrokeStyle,
+    TextAlign, WBounds, WPoint, DEFAULT_FONT_SIZE, LINE_HEIGHT,
 };
 use crate::text::{utf16_to_utf8, utf8_to_utf16, TextEditSession};
-use crate::tools::{ActiveTool, DragState};
+use crate::tools::{ActiveTool, DragState, PointTarget};
 
 actions!(
     boundless,
@@ -77,6 +79,9 @@ pub struct BoardView {
     /// hints the available action: move over an element, resize over a handle.
     hover_over_element: bool,
     hover_handle: Option<crate::render::Handle>,
+    /// Hovered vertex/midpoint control handle of a single selected
+    /// line/arrow (wins over `hover_handle` where they overlap).
+    hover_point: Option<PointTarget>,
     /// True while a temporary pen stroke is in progress (Shift + left-drag from
     /// any non-Pen tool). The current tool is left untouched, so releasing the
     /// mouse returns to it — Excalidraw's "hold a modifier to sketch" gesture.
@@ -117,6 +122,7 @@ impl BoardView {
             pending_measure: Vec::new(),
             hover_over_element: false,
             hover_handle: None,
+            hover_point: None,
             temp_pen: false,
             temp_pan: false,
             modifiers: Modifiers::default(),
@@ -822,6 +828,7 @@ impl BoardView {
             // hand cursor is the best available hint on Windows.
             (DragState::Panning { .. }, _) => CursorStyle::PointingHand,
             (DragState::Moving { .. }, _) => CursorStyle::PointingHand,
+            (DragState::EditingPoint { .. }, _) => CursorStyle::PointingHand,
             (DragState::Resizing { handle, .. }, _) => match handle {
                 crate::render::Handle::N | crate::render::Handle::S => CursorStyle::ResizeUpDown,
                 crate::render::Handle::E | crate::render::Handle::W => CursorStyle::ResizeLeftRight,
@@ -835,7 +842,9 @@ impl BoardView {
             // Panning comment above), so use PointingHand to get a hand cursor.
             (_, ActiveTool::Hand) => CursorStyle::PointingHand,
             (_, ActiveTool::Select) => {
-                if let Some(h) = self.hover_handle {
+                if self.hover_point.is_some() {
+                    CursorStyle::PointingHand
+                } else if let Some(h) = self.hover_handle {
                     match h {
                         crate::render::Handle::N | crate::render::Handle::S => {
                             CursorStyle::ResizeUpDown
@@ -1088,7 +1097,28 @@ impl BoardView {
     }
 
     fn select_down(&mut self, event: &MouseDownEvent, world: WPoint, cx: &mut Context<Self>) {
-        // 1. resize handles first (screen-space hit test).
+        // 0. vertex/midpoint control handles of a single selected line/arrow
+        // (screen-space hit test, ahead of the bbox resize handles they may
+        // overlap).
+        if let Some((id, handles)) = self.selected_line_point_handles() {
+            for (target, rect) in handles {
+                if rect.contains(&event.position) {
+                    let original = self.scene.get(id).cloned();
+                    if let Some(original) = original {
+                        self.drag = DragState::EditingPoint {
+                            element: id,
+                            original,
+                            target,
+                            recorded: false,
+                        };
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+        }
+
+        // 1. resize handles (screen-space hit test).
         if !self.selection.is_empty() {
             if let Some(bounds) = self.selection_bounds_world() {
                 let screen_bounds = self.world_bounds_to_screen(bounds);
@@ -1113,16 +1143,6 @@ impl BoardView {
 
         // 2. element hit test.
         let hit = self.scene.hit_test(world, self.hit_tolerance());
-        {
-            use std::io::Write as _;
-            let _ = writeln!(
-                std::fs::OpenOptions::new().create(true).append(true).open("hit.log").unwrap(),
-                "select_down: world={:?} hit={:?} sel_bounds={:?}",
-                world,
-                hit,
-                self.selection_bounds_world()
-            );
-        }
         // Remember when the raw hit is a bound label: a single click on the
         // label of an *already-selected* container edits it (Excalidraw).
         let label_hit = hit.and_then(|id| {
@@ -1194,6 +1214,42 @@ impl BoardView {
         cx.notify();
     }
 
+    /// Right-click on the canvas: delete a vertex of the single selected
+    /// line/arrow when a vertex handle is hit (at least two points must
+    /// remain). Right-click has no other canvas binding.
+    fn on_right_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.over_ai_panel(event.position, window, cx) {
+            return;
+        }
+        let Some((id, handles)) = self.selected_line_point_handles() else {
+            return;
+        };
+        for (target, rect) in handles {
+            let PointTarget::Vertex(index) = target else {
+                continue;
+            };
+            if !rect.contains(&event.position) {
+                continue;
+            }
+            let point_count = self
+                .scene
+                .get(id)
+                .map(|el| el.absolute_points().len())
+                .unwrap_or(0);
+            if point_count <= 2 {
+                return; // a line needs both ends
+            }
+            self.history.record(&self.scene);
+            if let Some(el) = self.scene.get_mut(id) {
+                el.remove_point(index);
+            }
+            self.update_container_labels(&[id]);
+            self.mark_dirty();
+            cx.notify();
+            return;
+        }
+    }
+
     fn on_middle_down(
         &mut self,
         event: &MouseDownEvent,
@@ -1229,8 +1285,21 @@ impl BoardView {
             DragState::Idle => {
                 // Hover detection: which element/handle is under the cursor?
                 // Used by render() to pick a move/resize cursor that hints the
-                // available action.
-                let new_handle = if !self.selection.is_empty()
+                // available action. Control-point handles of a single selected
+                // line/arrow win over the bbox resize handles where they
+                // overlap.
+                let new_point = if self.tool == ActiveTool::Select {
+                    self.selected_line_point_handles().and_then(|(_, handles)| {
+                        handles
+                            .into_iter()
+                            .find(|(_, rect)| rect.contains(&event.position))
+                            .map(|(t, _)| t)
+                    })
+                } else {
+                    None
+                };
+                let new_handle = if new_point.is_none()
+                    && !self.selection.is_empty()
                     && self.tool == ActiveTool::Select
                 {
                     if let Some(bounds) = self.selection_bounds_world() {
@@ -1246,6 +1315,7 @@ impl BoardView {
                     None
                 };
                 let new_over_element = new_handle.is_none()
+                    && new_point.is_none()
                     && self.tool == ActiveTool::Select
                     && self
                         .scene
@@ -1253,10 +1323,12 @@ impl BoardView {
                         .is_some();
                 if new_over_element != self.hover_over_element
                     || new_handle != self.hover_handle
+                    || new_point != self.hover_point
                     || modifiers_changed
                 {
                     self.hover_over_element = new_over_element;
                     self.hover_handle = new_handle;
+                    self.hover_point = new_point;
                     cx.notify();
                 }
                 self.drag = DragState::Idle;
@@ -1317,6 +1389,43 @@ impl BoardView {
                 }
                 self.drag = DragState::Moving {
                     last_world,
+                    recorded,
+                };
+            }
+            DragState::EditingPoint {
+                element,
+                original,
+                target,
+                mut recorded,
+            } => {
+                // Recompute from the stable original on every move: for a
+                // midpoint drag this re-inserts the new vertex at the same
+                // segment each time, so the drag is idempotent.
+                let mut edited = original.clone();
+                match target {
+                    PointTarget::Vertex(i) => edited.set_absolute_point(i, world),
+                    PointTarget::Midpoint(seg) => edited.insert_absolute_point_after(seg, world),
+                }
+                // Gate on an actual change so a click without movement neither
+                // inserts a vertex nor pollutes the undo history.
+                if edited != original {
+                    if !recorded {
+                        self.history.record(&self.scene);
+                        recorded = true;
+                        self.mark_dirty();
+                    }
+                    if let Some(el) = self.scene.get_mut(element) {
+                        *el = edited;
+                    }
+                    // Bound labels re-wrap/re-center on the (possibly new)
+                    // container bounds.
+                    self.update_container_labels(&[element]);
+                    cx.notify();
+                }
+                self.drag = DragState::EditingPoint {
+                    element,
+                    original,
+                    target,
                     recorded,
                 };
             }
@@ -1771,6 +1880,60 @@ impl BoardView {
         }
     }
 
+    /// Screen-space polyline points of the single selected line/arrow plus
+    /// its curved-line-type flag. None unless exactly one line/arrow is
+    /// selected and no text edit is in progress.
+    fn selected_line_screen_points(&self) -> Option<(ElementId, Vec<Point<Pixels>>, bool)> {
+        if self.selection.len() != 1 || self.editing.is_some() {
+            return None;
+        }
+        let el = self.scene.get(self.selection[0])?;
+        if !matches!(el.kind, ElementKind::Line { .. } | ElementKind::Arrow { .. }) {
+            return None;
+        }
+        let origin = self.canvas_origin();
+        Some((
+            el.id,
+            el.absolute_points()
+                .iter()
+                .map(|p| self.camera.world_to_screen(*p, origin))
+                .collect(),
+            el.style.line_type == LineType::Curved,
+        ))
+    }
+
+    /// Screen-space control-point handle rects (vertices + segment midpoints)
+    /// of the single selected line/arrow, for hit-testing and rendering.
+    fn selected_line_point_handles(
+        &self,
+    ) -> Option<(ElementId, Vec<(PointTarget, Bounds<Pixels>)>)> {
+        let (id, pts, curved) = self.selected_line_screen_points()?;
+        Some((id, point_handle_rects(&pts, curved)))
+    }
+
+    /// Re-wrap and re-place the bound labels of the given containers after
+    /// their bounds changed (vertex edits). Mirrors the tail of the Resizing
+    /// drag arm; the render measure pass re-centers each label.
+    fn update_container_labels(&mut self, container_ids: &[ElementId]) {
+        let bounds: Vec<(ElementId, WBounds)> = container_ids
+            .iter()
+            .filter_map(|id| self.scene.get(*id).map(|c| (*id, c.bounds)))
+            .collect();
+        for el in &mut self.scene.elements {
+            if container_ids.contains(&el.id) {
+                continue;
+            }
+            let Some(cid) = el.container_id() else { continue };
+            let Some((_, cb)) = bounds.iter().find(|(id, _)| *id == cid) else {
+                continue;
+            };
+            if let ElementKind::Text { wrap_width, .. } = &mut el.kind {
+                *wrap_width = Some(cb.w.max(10.0));
+                self.pending_measure.push(el.id);
+            }
+        }
+    }
+
     /// Screen-space origin of the text being edited. A bound label is
     /// centered in its container using the *live* content size, so the text
     /// stays centered while typing. Pass `content` (width, height in screen
@@ -2185,16 +2348,70 @@ impl BoardView {
                     size: size(screen.size.width + pad * 2.0, screen.size.height + pad * 2.0),
                 };
                 let sel = color_u32(SELECTION_COLOR, 1.0);
-                selection_outline = Some(outline(screen, sel, BorderStyle::Solid));
-                for (_, rect) in handle_rects(screen) {
-                    handle_quads.push(quad(
-                        rect,
-                        px(2.0),
-                        color_u32(0xffffff, 1.0),
-                        px(1.0),
-                        sel,
-                        BorderStyle::Solid,
-                    ));
+                // While a control point is being dragged, hide both the bbox
+                // outline and the resize handles: they overlap the point
+                // handles and the stale bbox would be visual noise mid-drag
+                // (the points themselves are the frame of reference then).
+                let dragging_point = matches!(self.drag, DragState::EditingPoint { .. });
+                if !dragging_point {
+                    selection_outline = Some(outline(screen, sel, BorderStyle::Solid));
+                }
+                if !dragging_point {
+                    for (_, rect) in handle_rects(screen) {
+                        handle_quads.push(quad(
+                            rect,
+                            px(2.0),
+                            color_u32(0xffffff, 1.0),
+                            px(1.0),
+                            sel,
+                            BorderStyle::Solid,
+                        ));
+                    }
+                }
+                // Vertex + midpoint control handles of a single selected
+                // line/arrow. Painted after the resize handles so they sit on
+                // top where they overlap; iterated in reverse so vertices
+                // (first in the vec) are painted last, above midpoints.
+                if let Some((_, handles)) = self.selected_line_point_handles() {
+                    // The handle to highlight: the dragged one (a midpoint
+                    // drag highlights the vertex it inserted at seg+1), else
+                    // the hovered one.
+                    let active = match &self.drag {
+                        DragState::EditingPoint { target, .. } => Some(match target {
+                            PointTarget::Midpoint(seg) => PointTarget::Vertex(seg + 1),
+                            t => *t,
+                        }),
+                        _ => self.hover_point,
+                    };
+                    let white = color_u32(0xffffff, 1.0);
+                    for (target, rect) in handles.into_iter().rev() {
+                        let is_active = active == Some(target);
+                        let q = match target {
+                            PointTarget::Vertex(_) => quad(
+                                rect,
+                                px(2.0),
+                                if is_active { sel } else { white },
+                                px(1.0),
+                                sel,
+                                BorderStyle::Solid,
+                            ),
+                            // Midpoints: smaller, translucent blue; solid
+                            // while hovered/dragged.
+                            PointTarget::Midpoint(_) => quad(
+                                rect,
+                                px(3.0),
+                                if is_active {
+                                    sel
+                                } else {
+                                    color_u32(SELECTION_COLOR, 0.45)
+                                },
+                                px(1.0),
+                                sel,
+                                BorderStyle::Solid,
+                            ),
+                        };
+                        handle_quads.push(q);
+                    }
                 }
             }
         }
@@ -2513,6 +2730,7 @@ impl Render for BoardView {
             .on_action(cx.listener(|this, _: &EraserTool, window, cx| this.set_tool(ActiveTool::Eraser, window, cx)))
             .on_action(cx.listener(|this, _: &ToggleAi, window, cx| this.toggle_ai_panel(window, cx)))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_left_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_down))
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_left_up))
             .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_middle_up))
@@ -2895,21 +3113,6 @@ impl BoardView {
         let weak = cx.weak_entity();
         let text_tool = self.tool == ActiveTool::Text;
         let show = self.tool.is_drawing() || text_tool || !self.selection.is_empty();
-        // Diagnostic: log the style bar state each render (first 30 frames).
-        {
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            static N: AtomicUsize = AtomicUsize::new(0);
-            let n = N.fetch_add(1, Ordering::Relaxed);
-            if n < 30 {
-                use std::io::Write as _;
-                let _ = writeln!(
-                    std::fs::OpenOptions::new().create(true).append(true).open("stylebar.log").unwrap(),
-                    "[{}] show={} only_text={} sel={} tool={:?} editing={}",
-                    n, show, !self.selection.is_empty() && self.selection.iter().all(|id| self.scene.get(*id).is_some_and(|e| e.is_text())),
-                    self.selection.len(), self.tool, self.editing.is_some()
-                );
-            }
-        }
         // Text options show when: the Text tool is active, a container tool
         // is active (presetting the label style before drawing), the
         // selection is only text, or a single container is selected (they
@@ -3166,6 +3369,50 @@ impl BoardView {
                     .on_click(move |_, _, cx| {
                         weak.update(cx, |this, cx| {
                             this.apply_shape_style(|s| s.roughness = roughness, cx)
+                        })
+                        .ok();
+                    }),
+                );
+            }
+            bar = bar.child(row);
+        }
+
+        // Line type (straight/curved): only in linear contexts — the
+        // Arrow/Line tool is active (presetting the default for new
+        // elements) or the selection contains a line/arrow.
+        let line_context = matches!(self.tool, ActiveTool::Arrow | ActiveTool::Line)
+            || self.selection.iter().any(|id| {
+                self.scene.get(*id).is_some_and(|e| {
+                    matches!(e.kind, ElementKind::Line { .. } | ElementKind::Arrow { .. })
+                })
+            });
+        if show_shape_options && line_context {
+            use crate::icons as ic;
+            // Current value: the first selected line/arrow's, else the
+            // default applied to new elements.
+            let current = self
+                .selection
+                .iter()
+                .filter_map(|id| self.scene.get(*id))
+                .find(|e| matches!(e.kind, ElementKind::Line { .. } | ElementKind::Arrow { .. }))
+                .map(|e| e.style.line_type)
+                .unwrap_or(self.style.line_type);
+            let mut row = div().flex().flex_row().gap_1();
+            for (ix, lt) in [LineType::Straight, LineType::Curved]
+                .into_iter()
+                .enumerate()
+            {
+                let weak = weak.clone();
+                let active = current == lt;
+                row = row.child(
+                    bar_icon_button(
+                        gpui::ElementId::named_usize("lt", ix),
+                        active,
+                        ic::line_type_icon(icon_color(active), lt),
+                    )
+                    .on_click(move |_, _, cx| {
+                        weak.update(cx, |this, cx| {
+                            this.apply_shape_style(|s| s.line_type = lt, cx)
                         })
                         .ok();
                     }),

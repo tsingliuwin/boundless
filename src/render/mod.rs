@@ -3,7 +3,8 @@
 pub mod rough;
 
 use gpui::{
-    fill, point, px, Bounds, Font, Hsla, PaintQuad, Pixels, ShapedLine, Size, TextRun, Window,
+    fill, point, px, Bounds, Font, Hsla, PaintQuad, Pixels, Point, ShapedLine, Size, TextRun,
+    Window,
 };
 
 use crate::camera::Camera;
@@ -344,6 +345,81 @@ pub fn handle_rects(screen_bounds: Bounds<Pixels>) -> Vec<(Handle, Bounds<Pixels
         .collect()
 }
 
+/// Screen-space handle rects for the control points of a selected line/arrow
+/// polyline: one square per vertex (same size as resize handles) plus a
+/// smaller square per segment midpoint. Dragging a midpoint inserts a new
+/// vertex there (Excalidraw-style bending). Vertices come first so
+/// hit-testing prioritizes them over midpoints where they overlap.
+///
+/// `curved` must match the element's rendered line type: for curved lines
+/// the midpoint is evaluated ON the smoothing spline (the chord midpoint
+/// would float off the visible stroke, increasingly so for sharp bends).
+pub fn point_handle_rects(
+    screen_points: &[Point<Pixels>],
+    curved: bool,
+) -> Vec<(crate::tools::PointTarget, Bounds<Pixels>)> {
+    let vs = px(8.0); // vertex handle box size
+    let ms = px(6.0); // midpoint handle box size
+    let mut out = Vec::with_capacity(screen_points.len() * 2);
+    for (i, p) in screen_points.iter().enumerate() {
+        out.push((
+            crate::tools::PointTarget::Vertex(i),
+            Bounds {
+                origin: point(p.x - vs * 0.5, p.y - vs * 0.5),
+                size: Size {
+                    width: vs,
+                    height: vs,
+                },
+            },
+        ));
+    }
+    for seg in 0..screen_points.len().saturating_sub(1) {
+        let mid = if curved {
+            curve_segment_midpoint(screen_points, seg)
+        } else {
+            let a = screen_points[seg];
+            let b = screen_points[seg + 1];
+            point((a.x + b.x) * 0.5, (a.y + b.y) * 0.5)
+        };
+        out.push((
+            crate::tools::PointTarget::Midpoint(seg),
+            Bounds {
+                origin: point(mid.x - ms * 0.5, mid.y - ms * 0.5),
+                size: Size {
+                    width: ms,
+                    height: ms,
+                },
+            },
+        ));
+    }
+    out
+}
+
+/// Midpoint of segment `seg` evaluated ON the smoothed curve the renderer
+/// draws. Mirrors roughr's `_curve`: a Catmull-Rom spline converted to cubic
+/// Béziers with tightness 0 (control points at 1/6 of the neighbor span) and
+/// duplicated endpoints. Bézier evaluation is affine-invariant, so doing this
+/// in screen space matches the rendered curve exactly (up to the renderer's
+/// seeded roughness jitter, which is part of the hand-drawn look).
+fn curve_segment_midpoint(pts: &[Point<Pixels>], seg: usize) -> Point<Pixels> {
+    let last = pts.len() - 1;
+    let get = |i: usize| {
+        let p = pts[i.min(last)];
+        (f32::from(p.x), f32::from(p.y))
+    };
+    let p0 = get(seg.saturating_sub(1));
+    let p1 = get(seg);
+    let p2 = get(seg + 1);
+    let p3 = get(seg + 2);
+    let c1 = (p1.0 + (p2.0 - p0.0) / 6.0, p1.1 + (p2.1 - p0.1) / 6.0);
+    let c2 = (p2.0 - (p3.0 - p1.0) / 6.0, p2.1 - (p3.1 - p1.1) / 6.0);
+    // Cubic Bézier at t = 0.5: (p1 + 3·c1 + 3·c2 + p2) / 8.
+    point(
+        px((p1.0 + 3.0 * c1.0 + 3.0 * c2.0 + p2.0) / 8.0),
+        px((p1.1 + 3.0 * c1.1 + 3.0 * c2.1 + p2.1) / 8.0),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,5 +440,37 @@ mod tests {
         // Edge handles only move one axis.
         let n = Handle::N.resize_bounds(original, WPoint::new(999.0, -20.0));
         assert_eq!(n, WBounds::new(0.0, -20.0, 100.0, 70.0));
+    }
+
+    #[test]
+    fn curve_midpoint_stays_on_line_for_collinear_segment() {
+        // Collinear points: the spline follows the straight chord (y = 0),
+        // though its parametric midpoint is not the geometric one
+        // (Catmull-Rom tangents use the neighbor span, so t=0.5 sits at
+        // x = 21.875 here, not 25).
+        let pts = vec![
+            point(px(0.0), px(0.0)),
+            point(px(50.0), px(0.0)),
+            point(px(100.0), px(0.0)),
+        ];
+        let m = curve_segment_midpoint(&pts, 0);
+        assert!((f32::from(m.x) - 21.875).abs() < 0.01);
+        assert!(f32::from(m.y).abs() < 0.01);
+    }
+
+    #[test]
+    fn curve_midpoint_leaves_the_chord_on_bends() {
+        // A bent segment: the spline bulges upward, so the on-curve midpoint
+        // (where the handle goes) sits above the chord midpoint (25, 25).
+        // Hand-computed Catmull-Rom (tightness 0, endpoints duplicated):
+        // c1 = (50/6, 50/6), c2 = (50-100/6, 50) → B(0.5) = (21.875, 28.125).
+        let pts = vec![
+            point(px(0.0), px(0.0)),
+            point(px(50.0), px(50.0)),
+            point(px(100.0), px(0.0)),
+        ];
+        let m = curve_segment_midpoint(&pts, 0);
+        assert!((f32::from(m.x) - 21.875).abs() < 0.01);
+        assert!((f32::from(m.y) - 28.125).abs() < 0.01);
     }
 }
