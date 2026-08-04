@@ -227,10 +227,20 @@ pub fn paths_for_element(
                     if roughness < 0.01 {
                         *p
                     } else {
-                        let amp = roughness * 1.5;
-                        let phase = p.x * 0.04 + seed_f * 0.1;
-                        let dx = amp * phase.sin();
-                        let dy = amp * (phase * 1.3 + 1.5).cos();
+                        // Low-frequency smooth wave: the primary hand-drawn
+                        // undulation. Amplitude scales with roughness so the
+                        // three presets are visually distinct.
+                        let amp = roughness * 2.5;
+                        let lf = p.x * 0.03 + seed_f * 0.1;
+                        let mut dx = amp * lf.sin();
+                        let mut dy = amp * (lf * 1.3 + 1.5).cos();
+                        // High-frequency detail for the sketchiest preset:
+                        // adds fine wiggle on top of the smooth wave.
+                        if roughness >= 2.0 {
+                            let hf = p.x * 0.15 + seed_f * 0.3;
+                            dx += amp * 0.5 * hf.sin();
+                            dy += amp * 0.5 * (hf * 1.2 + 2.0).cos();
+                        }
                         WPoint::new(p.x + dx, p.y + dy)
                     }
                 };
