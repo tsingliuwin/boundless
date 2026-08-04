@@ -65,3 +65,15 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 2
+
+[profile.release]
+# Fast-to-build release profile (adapted from lakemind):
+#   thin LTO: most optimization benefit, far faster link than fat LTO.
+#   strip: drops debug symbols -> faster link + smaller binary.
+#   panic = abort: removes unwinding machinery -> less codegen.
+#   codegen-units = 16: max parallelism for compile speed.
+opt-level = 3
+codegen-units = 16
+lto = "thin"
+panic = "abort"
+strip = true

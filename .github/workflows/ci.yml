@@ -1,0 +1,53 @@
+# Cache Warmer: pre-compiles release-mode dependencies on main so that
+# tag-triggered Release builds (release.yml) hit the cache and only
+# recompile the app crate + link.
+#
+# Triggers:
+#   - push to main when Cargo.lock changes (new/updated deps)
+#   - manual (workflow_dispatch)
+# Skips "chore: bump version" commits (those trigger the full Release build
+# simultaneously - no point warming in parallel).
+
+name: CI Cache Warmer
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "Cargo.lock"
+
+jobs:
+  warm:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.head_commit != null && !startsWith(github.event.head_commit.message, 'chore: bump version'))
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          # Must match release.yml's shared-key exactly for cross-workflow hits.
+          shared-key: "boundless-${{ matrix.target }}"
+          save-if: "true"
+          cache-on-failure: "true"
+
+      - name: Compile release dependencies
+        run: cargo build --release --target ${{ matrix.target }}

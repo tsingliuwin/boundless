@@ -48,6 +48,15 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          # Must match the cache-warmer workflow's shared-key exactly so
+          # tag builds hit the pre-warmed dependency cache.
+          shared-key: "boundless-${{ matrix.target }}"
+          save-if: "true"
+          cache-on-failure: "true"
+
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 

@@ -1,0 +1,7 @@
+# Use rust-lld (ships with the Rust toolchain) as the Windows linker.
+# It is dramatically faster than MSVC's link.exe for large dependency
+# graphs like GPUI, cutting the link step from minutes to seconds.
+# No effect on macOS (ld64 is already fast).
+
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"
