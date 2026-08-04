@@ -3468,7 +3468,9 @@ impl BoardView {
                     .text_xs();
                 swatch = match color {
                     Some(c) => swatch.bg(rgb(c)).child(""),
-                    None => swatch.bg(rgb(0xffffff)).text_color(rgb(0x999999)).child("无"),
+                    None => swatch
+                        .bg(rgb(0xffffff))
+                        .child(crate::icons::no_fill(color_u32(0x999999, 1.0))),
                 };
                 swatch = if active {
                     swatch.border_color(rgb(SELECTION_COLOR)).border_2()

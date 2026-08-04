@@ -304,6 +304,22 @@ pub fn zoom_fit(c: Hsla) -> impl IntoElement {
     })
 }
 
+/// "No fill" indicator: a small box with a diagonal slash through it
+/// (matching Excalidraw's background-none swatch).
+pub fn no_fill(c: Hsla) -> impl IntoElement {
+    icon(c, |b| {
+        // Box outline.
+        b.mv(4.0, 4.0);
+        b.ln(16.0, 4.0);
+        b.ln(16.0, 16.0);
+        b.ln(4.0, 16.0);
+        b.cp();
+        // Diagonal slash.
+        b.mv(5.0, 15.0);
+        b.ln(15.0, 5.0);
+    })
+}
+
 /// Grid toggle: a 2x2 cell grid (border + cross dividers).
 pub fn grid(c: Hsla) -> impl IntoElement {
     icon(c, |b| {
