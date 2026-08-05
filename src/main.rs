@@ -77,6 +77,11 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
                     title: Some("Boundless".into()),
+                    // Transparent titlebar + full-size content view: the canvas
+                    // extends to the top of the window and the traffic lights
+                    // float over it, so there's no separate title strip cutting
+                    // the toolbar off from the top edge.
+                    appears_transparent: true,
                     ..Default::default()
                 }),
                 ..Default::default()

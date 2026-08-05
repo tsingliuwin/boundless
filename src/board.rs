@@ -322,11 +322,26 @@ impl BoardView {
             }
             return;
         }
+        // Nothing in-app left to cancel. Fall through to the system behaviour
+        // that GPUI's key dispatch otherwise swallows: macOS exits fullscreen
+        // (or un-zooms a maximized window) via the window's default
+        // `cancelOperation:`, but GPUI overrides `doCommandBySelector:` without
+        // forwarding it up the responder chain, and this `escape` binding
+        // consumes the event. Restore that cascade here so Esc can leave the
+        // fullscreen/zoomed state the green button put us in.
+        let had_state = !matches!(self.drag, DragState::Idle)
+            || self.draft.is_some()
+            || !self.selection.is_empty();
         self.drag = DragState::Idle;
         self.draft = None;
-        if !self.selection.is_empty() {
-            self.selection.clear();
+        self.selection.clear();
+
+        if had_state {
             cx.notify();
+        } else if window.is_fullscreen() {
+            window.toggle_fullscreen();
+        } else if window.is_maximized() {
+            window.zoom_window();
         }
     }
 
