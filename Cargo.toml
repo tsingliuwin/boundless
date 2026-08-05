@@ -111,3 +111,11 @@ codegen-units = 16
 lto = "thin"
 panic = "abort"
 strip = true
+
+[dev-dependencies]
+# Full minisign crate (generate keypair + sign), used only by the
+# examples/gen_minisign_keypair.rs and examples/sign_release.rs helpers (local
+# keygen + CI signing). The app itself verifies with the lighter
+# `minisign-verify` (a normal dep above). Dev-only so it never ships in a
+# release binary.
+minisign = "0.9.1"

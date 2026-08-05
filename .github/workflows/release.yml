@@ -1,15 +1,24 @@
-# Boundless — automated release builds for Windows + macOS.
+# Boundless - automated release builds for Windows + macOS, with self-hosted
+# auto-update artifacts (minisign-signed, uploaded to a CDN/R2, with a
+# latest.json manifest).
 #
 # Setup:
-#   1. Create a GitHub repo (mirror of your Gitee repo).
-#   2. git remote add github <your-github-url>
-#   3. git push github main
-#   4. git tag v0.1.0 && git push github v0.1.0
-#   5. Actions auto-build → zip artifacts appear on the Releases page.
+#   1. Create a GitHub repo (mirror of your Gitee repo); git remote add github.
+#   2. Generate a minisign keypair locally:
+#        cargo run --example gen_minisign_keypair -- "<password>"
+#      Paste the printed base64 into src/updater.rs::MINISIGN_PUBKEY, and set
+#      GitHub secrets MINISIGN_PRIVATE_KEY (contents of minisign.key) +
+#      MINISIGN_PRIVATE_KEY_PASSWORD.
+#   3. Configure repo Variables + Secrets (see UPDATER_CONFIG.md):
+#        vars.CDN_BASE            public CDN base URL, e.g. https://cdn.example.com
+#        secrets.R2_ENDPOINT / R2_BUCKET / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY
+#   4. git tag v0.2.0 && git push github v0.2.0
+#   5. Actions build -> zips on the Releases page + signed updater artifacts
+#      + latest.json on the CDN. Running clients auto-update from latest.json.
 #
-# The workflow triggers on any tag matching `v*`. It builds release binaries
-# for Windows (x86_64) and macOS (Apple Silicon ARM64), packages each as a
-# zip, and publishes a GitHub Release with both attached.
+# Triggers on any tag matching `v*`. Each platform builds + signs its own
+# updater artifact with the `minisign` crate (examples/sign_release.rs); the
+# release job assembles latest.json and uploads everything to R2.
 
 name: Release
 
@@ -23,21 +32,26 @@ permissions:
 
 jobs:
   # ------------------------------------------------------------------
-  # Build matrix: one job per platform.
+  # Build matrix: one job per platform. Produces the downloadable zip (manual
+  # install), the updater artifact, and its minisign signature.
   # ------------------------------------------------------------------
   build:
     strategy:
-      fail-fast: false # let the other platform finish even if one fails
+      fail-fast: false
       matrix:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: boundless.exe
             archive: boundless-${{ github.ref_name }}-win-x64.zip
+            # The Windows updater artifact is the same zip (bare exe at root).
+            updater_archive: boundless-${{ github.ref_name }}-win-x64.zip
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: boundless
             archive: boundless-${{ github.ref_name }}-macos-arm64.zip
+            # The macOS updater artifact is a .app.tar.gz (preserves perms).
+            updater_archive: boundless-${{ github.ref_name }}-macos-arm64.app.tar.gz
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -51,8 +65,6 @@ jobs:
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
-          # Must match the cache-warmer workflow's shared-key exactly so
-          # tag builds hit the pre-warmed dependency cache.
           shared-key: "boundless-${{ matrix.target }}"
           save-if: "true"
           cache-on-failure: "true"
@@ -64,6 +76,8 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          # The zip stores boundless.exe at the archive root (the updater
+          # extracts it by name). Same file serves manual download + updater.
           Compress-Archive `
             -Path target/${{ matrix.target }}/release/${{ matrix.artifact }} `
             -DestinationPath ${{ matrix.archive }}
@@ -72,9 +86,8 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           # Assemble a proper .app bundle so Finder/Dock show the real icon
-          # and the app is launchable by double-clicking, not just a bare
-          # binary. ditto preserves unix permissions/extended attributes that
-          # plain `zip` would drop (important for a runnable .app).
+          # and the app is launchable by double-clicking. ditto preserves unix
+          # permissions/extended attributes that plain `zip` would drop.
           set -euo pipefail
           APP="Boundless.app"
           rm -rf "$APP"
@@ -83,19 +96,39 @@ jobs:
           cp assets/icon.icns "$APP/Contents/Resources/icon.icns"
           cp assets/Info.plist "$APP/Contents/Info.plist"
           chmod +x "$APP/Contents/MacOS/boundless"
-          # Substitute the version from the git tag (vX.Y.Z -> X.Y.Z).
           VERSION="${GITHUB_REF_NAME#v}"
           /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
+          # Manual-download zip.
           ditto -c -k --keepParent "$APP" "${{ matrix.archive }}"
+          # Updater artifact: .app.tar.gz preserves the executable bit / perms
+          # the client extracts with `tar` + flate2.
+          tar -czf "${{ matrix.updater_archive }}" "$APP"
 
-      - name: Upload artifact
+      - name: Sign updater artifact (minisign)
+        shell: bash
+        env:
+          MINISIGN_PRIVATE_KEY: ${{ secrets.MINISIGN_PRIVATE_KEY }}
+          MINISIGN_PRIVATE_KEY_PASSWORD: ${{ secrets.MINISIGN_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$MINISIGN_PRIVATE_KEY" > minisign.key
+          # sign_release writes <updater_archive>.sig next to the input. It uses
+          # the same `minisign` crate as the keypair generator, so the key KDF
+          # matches (no minisign CLI / password-prompt handling needed).
+          cargo run --release --example sign_release -- "${{ matrix.updater_archive }}" minisign.key "$MINISIGN_PRIVATE_KEY_PASSWORD"
+
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.archive }}
-          path: ${{ matrix.archive }}
+          name: build-${{ matrix.target }}
+          path: |
+            ${{ matrix.archive }}
+            ${{ matrix.updater_archive }}
+            ${{ matrix.updater_archive }}.sig
 
   # ------------------------------------------------------------------
-  # Publish a GitHub Release with both zips attached.
+  # Release: upload everything to the CDN (R2), generate latest.json, and
+  # publish a GitHub Release.
   # ------------------------------------------------------------------
   release:
     needs: build
@@ -114,7 +147,6 @@ jobs:
       - name: Generate changelog
         id: changelog
         run: |
-          # Commits since the previous tag (or all if this is the first tag).
           PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)
           if [ -n "$PREV_TAG" ]; then
             echo "body<<EOF" >> "$GITHUB_OUTPUT"
@@ -126,10 +158,75 @@ jobs:
             echo "EOF" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Upload artifacts + signatures to CDN (R2)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          set -euo pipefail
+          cd artifacts
+          for f in boundless-*.zip boundless-*.app.tar.gz boundless-*.sig; do
+            [ -e "$f" ] || continue
+            aws s3 cp "$f" "s3://$R2_BUCKET/$f" --endpoint-url "$R2_ENDPOINT"
+          done
+
+      - name: Generate latest.json
+        env:
+          CDN_BASE: ${{ vars.CDN_BASE }}
+          RELEASE_NOTES: ${{ steps.changelog.outputs.body }}
+        run: |
+          set -euo pipefail
+          node <<'EOF'
+          const fs = require("fs");
+          const tag = process.env.GITHUB_REF_NAME; // vX.Y.Z
+          const version = tag.replace(/^v/, "");
+          const cdn = process.env.CDN_BASE; // e.g. https://cdn.example.com
+          // Map each signed artifact filename -> manifest platform key + url.
+          const specs = [
+            { re: /-win-x64\.zip$/, platform: "windows-x86_64" },
+            { re: /-macos-arm64\.app\.tar\.gz$/, platform: "darwin-aarch64" },
+          ];
+          const platforms = {};
+          for (const file of fs.readdirSync("artifacts")) {
+            if (!file.endsWith(".sig")) continue;
+            const artifact = file.slice(0, -4); // drop ".sig"
+            const spec = specs.find((s) => s.re.test(artifact));
+            if (!spec) continue;
+            const signature = fs.readFileSync("artifacts/" + file, "utf8").trim();
+            platforms[spec.platform] = { signature, url: `${cdn}/${artifact}` };
+          }
+          if (Object.keys(platforms).length === 0) {
+            console.error("no signed artifacts found; skipping latest.json");
+            process.exit(1);
+          }
+          // Release notes: the commit log since the previous tag (same as the
+          // GitHub Release body). For richer notes, hand-edit a CHANGELOG.md.
+          const notes = process.env.RELEASE_NOTES || `Boundless ${version}`;
+          const manifest = { version, notes, pubdate: new Date().toISOString(), platforms };
+          fs.writeFileSync("latest.json", JSON.stringify(manifest, null, 2) + "\n");
+          console.log(fs.readFileSync("latest.json", "utf8"));
+          EOF
+
+      - name: Upload latest.json to CDN (R2)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          aws s3 cp latest.json "s3://$R2_BUCKET/boundless-latest.json" \
+            --endpoint-url "$R2_ENDPOINT" --content-type "application/json"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*.zip
+          files: |
+            artifacts/*.zip
+            artifacts/*.app.tar.gz
+            artifacts/*.sig
+            latest.json
           body: ${{ steps.changelog.outputs.body }}
           draft: false
           prerelease: false

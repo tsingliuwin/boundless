@@ -447,4 +447,30 @@ mod tests {
             assert!(m.current_platform().is_some());
         }
     }
+
+    #[test]
+    fn sign_verify_roundtrip() {
+        // Confirms the signing chain interops end-to-end: a signature produced
+        // by the `minisign` crate (used by the keygen/sign helpers) verifies
+        // with `minisign-verify` (used by the app at apply time). Uses an
+        // unencrypted keypair since this only exercises the signature format,
+        // not the secret-key KDF.
+        use minisign_verify::{PublicKey, Signature};
+        let kp = minisign::KeyPair::generate_unencrypted_keypair().expect("generate keypair");
+        let pk_b64 = kp.pk.to_base64();
+        let data = b"hello boundless update artifact";
+        let sig_box = minisign::sign(None, &kp.sk, &data[..], None, None).expect("sign");
+        let sig_text = sig_box.to_string();
+
+        let pk = PublicKey::from_base64(&pk_b64).expect("parse pubkey");
+        let sig = Signature::decode(&sig_text).expect("parse signature");
+        assert!(
+            pk.verify(data, &sig, false).is_ok(),
+            "valid signature should verify"
+        );
+        assert!(
+            pk.verify(b"tampered data", &sig, false).is_err(),
+            "tampered data should fail verification"
+        );
+    }
 }
