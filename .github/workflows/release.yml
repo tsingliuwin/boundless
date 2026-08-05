@@ -82,11 +82,6 @@ jobs:
             -Path target/${{ matrix.target }}/release/${{ matrix.artifact }} `
             -DestinationPath ${{ matrix.archive }}
 
-      - name: Install NSIS
-        if: runner.os == 'Windows'
-        shell: bash
-        run: choco install nsis --no-progress -y
-
       - name: Build installer (Windows)
         if: runner.os == 'Windows'
         shell: bash
@@ -94,10 +89,18 @@ jobs:
           # Double-clickable setup exe (NSIS, per-user install - no UAC, and
           # the install dir stays writable so auto-update can replace the exe
           # in place). Output: boundless-<tag>-win-x64-setup.exe.
+          # NSIS ships preinstalled on windows-latest at the path below; choco
+          # installs don't reliably refresh the bash PATH within the same job,
+          # so locate makensis directly with a PATH fallback.
           set -euo pipefail
+          MAKENSIS="/c/Program Files (x86)/NSIS/makensis.exe"
+          if ! [ -x "$MAKENSIS" ]; then
+            if command -v makensis >/dev/null 2>&1; then MAKENSIS=makensis; \
+            else echo "makensis not found"; exit 127; fi
+          fi
           VERSION="${GITHUB_REF_NAME#v}"
           EXEPATH="$(pwd)/target/${{ matrix.target }}/release/${{ matrix.artifact }}"
-          makensis -V2 \
+          "$MAKENSIS" -V2 \
             "/DVERSION=$VERSION" \
             "/DTAG=${GITHUB_REF_NAME}" \
             "/DEXEPATH=$EXEPATH" \
