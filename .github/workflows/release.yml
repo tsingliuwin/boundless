@@ -82,6 +82,27 @@ jobs:
             -Path target/${{ matrix.target }}/release/${{ matrix.artifact }} `
             -DestinationPath ${{ matrix.archive }}
 
+      - name: Install NSIS
+        if: runner.os == 'Windows'
+        shell: bash
+        run: choco install nsis --no-progress -y
+
+      - name: Build installer (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          # Double-clickable setup exe (NSIS, per-user install - no UAC, and
+          # the install dir stays writable so auto-update can replace the exe
+          # in place). Output: boundless-<tag>-win-x64-setup.exe.
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          EXEPATH="$(pwd)/target/${{ matrix.target }}/release/${{ matrix.artifact }}"
+          makensis -V2 \
+            "/DVERSION=$VERSION" \
+            "/DTAG=${GITHUB_REF_NAME}" \
+            "/DEXEPATH=$EXEPATH" \
+            installer/installer.nsi
+
       - name: Package (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -103,6 +124,13 @@ jobs:
           # Updater artifact: .app.tar.gz preserves the executable bit / perms
           # the client extracts with `tar` + flate2.
           tar -czf "${{ matrix.updater_archive }}" "$APP"
+          # Double-clickable DMG: app + Applications symlink for drag-install.
+          DMG="boundless-${GITHUB_REF_NAME}-macos-arm64.dmg"
+          rm -rf dmg-stage && mkdir dmg-stage
+          cp -R "$APP" dmg-stage/
+          ln -s /Applications dmg-stage/Applications
+          hdiutil create -volname "Boundless" -srcfolder dmg-stage -ov -format UDZO "$DMG"
+          rm -rf dmg-stage
 
       - name: Sign updater artifact (minisign)
         shell: bash
@@ -125,6 +153,8 @@ jobs:
             ${{ matrix.archive }}
             ${{ matrix.updater_archive }}
             ${{ matrix.updater_archive }}.sig
+            boundless-*-setup.exe
+            boundless-*.dmg
 
   # ------------------------------------------------------------------
   # Release: upload everything to the CDN (R2), generate latest.json, and
@@ -167,7 +197,8 @@ jobs:
         run: |
           set -euo pipefail
           cd artifacts
-          for f in boundless-*.zip boundless-*.app.tar.gz boundless-*.sig; do
+          for f in boundless-*.zip boundless-*.app.tar.gz boundless-*.sig \
+                   boundless-*-setup.exe boundless-*.dmg; do
             [ -e "$f" ] || continue
             aws s3 cp "$f" "s3://$R2_BUCKET/$f" --endpoint-url "$R2_ENDPOINT"
           done
@@ -226,6 +257,8 @@ jobs:
             artifacts/*.zip
             artifacts/*.app.tar.gz
             artifacts/*.sig
+            artifacts/*-setup.exe
+            artifacts/*.dmg
             latest.json
           body: ${{ steps.changelog.outputs.body }}
           draft: false
