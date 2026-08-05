@@ -14,8 +14,9 @@ mod tools;
 
 use board::{
     ArrowTool, BoardView, BringForward, BringToFront, CancelOp, DeleteSelection, DiamondTool,
-    EllipseTool, EraserTool, HandTool, LineTool, OpenScene, PenTool, RectTool, Redo, SaveScene,
-    SelectTool, SendBackward, SendToBack, TextTool, ToggleAi, Undo, ZoomIn, ZoomOut, ZoomReset,
+    EllipseTool, EraserTool, HandTool, LineTool, OpenScene, PenTool, Quit, RectTool, Redo,
+    SaveScene, SelectTool, SendBackward, SendToBack, TextTool, ToggleAi, Undo, ZoomIn, ZoomOut,
+    ZoomReset,
 };
 use gpui::*;
 use gpui_component::Root;
@@ -43,6 +44,10 @@ fn main() {
         // while typing.
         const CANVAS: &str = "Board && !Input";
         cx.bind_keys([
+            // Cmd-Q quits from anywhere (no context), matching the macOS app
+            // convention. The menu item "退出 Boundless" picks this binding up
+            // automatically for its key-equivalent display.
+            KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("ctrl-z", Undo, Some("Board")),
             KeyBinding::new("ctrl-shift-z", Redo, Some("Board")),
             KeyBinding::new("ctrl-y", Redo, Some("Board")),
@@ -71,6 +76,37 @@ fn main() {
             KeyBinding::new("e", EraserTool, Some(CANVAS)),
         ]);
 
+        // Application main menu. Besides being the conventional place for
+        // File/Edit/View commands, an app with an actual menu bar makes macOS
+        // slide the menu bar back in when the cursor hits the top of the screen
+        // in native fullscreen — without it the menu bar stays hidden (GPUI's
+        // platform layer sets no presentation options, so we rely on having
+        // menu items for the system's auto-show to kick in).
+        cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.set_menus(vec![
+            // First menu is the application menu; macOS renames it to the app
+            // name and bolds it. GPUI does not auto-inject About/Quit, so we
+            // provide the entries we want here. (No "About" item: GPUI exposes
+            // no standard about-panel API.)
+            Menu {
+                name: "Boundless".into(),
+                items: vec![MenuItem::action("退出 Boundless", Quit)],
+            },
+            Menu {
+                name: "文件".into(),
+                items: vec![
+                    MenuItem::action("打开场景…", OpenScene),
+                    MenuItem::action("保存场景", SaveScene),
+                ],
+            },
+            // "Window" is special-cased by GPUI's mac platform layer
+            // (setWindowsMenu:), so the system appends the window list here.
+            Menu {
+                name: "窗口".into(),
+                items: vec![],
+            },
+        ]);
+
         let bounds = Bounds::centered(None, size(px(1440.0), px(900.0)), cx);
         cx.open_window(
             WindowOptions {
@@ -87,6 +123,16 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| {
+                // boundless is a single-window app, but macOS leaves the
+                // process running in the Dock after the last window closes
+                // (GPUI doesn't implement
+                // applicationShouldTerminateAfterLastWindowClosed). Quit when
+                // the window is about to close so the red traffic light
+                // actually exits the app.
+                window.on_window_should_close(cx, |_, cx| {
+                    cx.quit();
+                    true
+                });
                 // Wrap the board in a gpui-component Root so the AI panel's
                 // Input/Button components have theme, focus management, and
                 // overlay layers (notifications/dialogs) available.

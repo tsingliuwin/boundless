@@ -29,6 +29,7 @@ actions!(
         Undo, Redo, SaveScene, OpenScene, DeleteSelection, CancelOp, ZoomIn, ZoomOut, ZoomReset,
         SelectTool, HandTool, RectTool, DiamondTool, EllipseTool, ArrowTool, LineTool, PenTool,
         TextTool, EraserTool, ToggleAi, BringToFront, SendToBack, BringForward, SendBackward,
+        Quit,
     ]
 );
 
