@@ -759,6 +759,7 @@ dependencies = [
  "gpui-component",
  "gpui-component-assets",
  "kurbo 0.11.3",
+ "objc",
  "reqwest 0.12.28",
  "rfd",
  "rig-core",

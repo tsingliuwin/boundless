@@ -1,6 +1,9 @@
 # Rust build artifacts
 /target/
 
+# Locally assembled .app bundles (from scripts/package-macos.sh)
+*.app/
+
 # Debug logs and transient screenshots
 *.log
 screenshot*.png

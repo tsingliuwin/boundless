@@ -54,10 +54,24 @@ windows = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+# macOS interop: set the Dock/application icon at runtime via
+# `[NSApp setApplicationIconImage:]`. Pinned to the version already in
+# Cargo.lock (pulled in transitively by GPUI) so no new dependency enters the
+# graph. Target-gated; no-op on other platforms.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2"
+
 # Windows application icon embedding (see build.rs). Pinned to the version that
 # already exists in Cargo.lock so we don't introduce a new dependency.
 [build-dependencies]
 embed-resource = "=3.0.11"
+
+[lints.rust]
+# objc 0.2's macros emit internal `cfg(feature = "cargo-clippy")` checks that
+# trip `unexpected_cfgs` in downstream crates. The crate is unmaintained
+# (objc2 is its successor), so allow the lint app-wide. boundless has no custom
+# cfgs of its own, so this only silences the upstream macro noise.
+unexpected_cfgs = { level = "allow" }
 
 [profile.dev]
 # GPUI is large; keep local codegen fast while iterating.

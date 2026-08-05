@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Application bundle metadata for the macOS release build.
+
+      The release workflow (release.yml) assembles Boundless.app from the
+      release binary, this Info.plist, and assets/icon.icns. CI substitutes
+      the version placeholders below from the git tag.
+    -->
+    <key>CFBundleName</key>
+    <string>Boundless</string>
+    <key>CFBundleDisplayName</key>
+    <string>Boundless</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.boundless.app</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleSignature</key>
+    <string>????</string>
+    <!-- Must match the binary name (Cargo.toml `name = "boundless"`). -->
+    <key>CFBundleExecutable</key>
+    <string>boundless</string>
+    <!-- Resolved at Resources/icon.icns by the packaging step. -->
+    <key>CFBundleIconFile</key>
+    <string>icon.icns</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+</dict>
+</plist>

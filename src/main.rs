@@ -30,6 +30,10 @@ fn main() {
         // render.
         gpui_component::init(cx);
 
+        // Set the Dock/application icon at runtime (macOS). No-op on other
+        // platforms; Windows embeds its icon via build.rs.
+        crate::platform::set_app_icon();
+
         // Register the embedded Excalifont handwriting font (Excalidraw's
         // default) so text elements use a hand-drawn look for Latin glyphs;
         // CJK falls back to the system KaiTi font via FontFallbacks.
@@ -98,12 +102,6 @@ fn main() {
                     MenuItem::action("打开场景…", OpenScene),
                     MenuItem::action("保存场景", SaveScene),
                 ],
-            },
-            // "Window" is special-cased by GPUI's mac platform layer
-            // (setWindowsMenu:), so the system appends the window list here.
-            Menu {
-                name: "窗口".into(),
-                items: vec![],
             },
         ]);
 

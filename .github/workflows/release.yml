@@ -71,8 +71,22 @@ jobs:
       - name: Package (macOS)
         if: runner.os == 'macOS'
         run: |
-          cd target/${{ matrix.target }}/release
-          zip ../../../${{ matrix.archive }} ${{ matrix.artifact }}
+          # Assemble a proper .app bundle so Finder/Dock show the real icon
+          # and the app is launchable by double-clicking, not just a bare
+          # binary. ditto preserves unix permissions/extended attributes that
+          # plain `zip` would drop (important for a runnable .app).
+          set -euo pipefail
+          APP="Boundless.app"
+          rm -rf "$APP"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "$APP/Contents/MacOS/boundless"
+          cp assets/icon.icns "$APP/Contents/Resources/icon.icns"
+          cp assets/Info.plist "$APP/Contents/Info.plist"
+          chmod +x "$APP/Contents/MacOS/boundless"
+          # Substitute the version from the git tag (vX.Y.Z -> X.Y.Z).
+          VERSION="${GITHUB_REF_NAME#v}"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
+          ditto -c -k --keepParent "$APP" "${{ matrix.archive }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
