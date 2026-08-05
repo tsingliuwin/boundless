@@ -29,7 +29,7 @@ actions!(
         Undo, Redo, SaveScene, OpenScene, DeleteSelection, CancelOp, ZoomIn, ZoomOut, ZoomReset,
         SelectTool, HandTool, RectTool, DiamondTool, EllipseTool, ArrowTool, LineTool, PenTool,
         TextTool, EraserTool, ToggleAi, BringToFront, SendToBack, BringForward, SendBackward,
-        Quit,
+        Quit, CheckForUpdates,
     ]
 );
 
@@ -67,6 +67,16 @@ pub enum LayerOp {
 pub struct ContextMenuState {
     pub position: Point<Pixels>,
     pub vertex: Option<usize>,
+}
+
+/// Progress / completion messages from the updater download task to the GPUI
+/// `cx.spawn` that drains it.
+enum DownloadMsg {
+    /// 0.0..=1.0 of the artifact.
+    Progress(f64),
+    /// Final outcome: the verified artifact path on success, an error string on
+    /// failure (download or signature verification).
+    Done(std::result::Result<std::path::PathBuf, String>),
 }
 
 pub struct BoardView {
@@ -125,13 +135,16 @@ pub struct BoardView {
     /// `set_menus` bar; the field compiles everywhere because the menu-bar
     /// rendering is pure GPUI.
     menubar_open: Option<usize>,
+    /// Auto-update flow state (check / download / ready-to-restart). Driven by
+    /// the `CheckForUpdates` action + a delayed startup poll; see `src/updater.rs`.
+    update_state: crate::updater::UpdateState,
 }
 
 impl BoardView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle);
-        Self {
+        let view = Self {
             scene: Scene::new(),
             camera: Camera::default(),
             tool: ActiveTool::Select,
@@ -160,7 +173,35 @@ impl BoardView {
             context_menu: None,
             show_grid: false,
             menubar_open: None,
-        }
+            update_state: crate::updater::UpdateState::default(),
+        };
+        // Auto-update: poll silently 30s after launch, then every 4h. Only a
+        // real available update surfaces (silent = no "up to date" / transient
+        // error banners). Stops when the view is dropped.
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(30))
+                .await;
+            if this
+                .update(cx, |this, cx| this.check_for_updates(cx, true))
+                .is_err()
+            {
+                return;
+            }
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(4 * 60 * 60))
+                    .await;
+                if this
+                    .update(cx, |this, cx| this.check_for_updates(cx, true))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })
+        .detach();
+        view
     }
 
     // ------------------------------------------------------------------
@@ -906,6 +947,207 @@ impl BoardView {
             .as_ref()
             .map(|p| p.read(cx).width())
             .unwrap_or(crate::ai::panel::DEFAULT_WIDTH)
+    }
+
+    // ------------------------------------------------------------------
+    // Auto-update
+    //
+    // Network/IO runs on the shared tokio runtime (crate::ai::client::
+    // tokio_runtime); results/progress ferry back through futures channels to
+    // a GPUI `cx.spawn` task that updates `update_state` + `cx.notify()`. This
+    // mirrors the AI streaming pattern (src/ai/panel.rs).
+
+    /// Check the manifest for a newer version. Sets `update_state` and, if an
+    /// update exists, starts a silent download. No-op while a check/download is
+    /// already in flight or an update is already ready. When `silent` (the
+    /// automatic startup poll), an up-to-date or error result doesn't raise a
+    /// banner - only a real available update surfaces.
+    fn check_for_updates(&mut self, cx: &mut Context<Self>, silent: bool) {
+        use crate::updater::UpdateState;
+        if matches!(
+            self.update_state,
+            UpdateState::Checking
+                | UpdateState::Downloading { .. }
+                | UpdateState::Installing
+                | UpdateState::Ready { .. }
+        ) {
+            return;
+        }
+        self.update_state = UpdateState::Checking;
+        cx.notify();
+
+        let (tx, rx) = futures::channel::oneshot::channel();
+        crate::ai::client::tokio_runtime().spawn(async move {
+            let res = async {
+                let manifest = crate::updater::fetch_manifest().await?;
+                let entry = manifest
+                    .current_platform()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "no update entry for platform {}",
+                            crate::updater::platform_key()
+                        )
+                    })?
+                    .clone();
+                let newer = crate::updater::is_newer(
+                    &manifest.version,
+                    crate::updater::current_version(),
+                )?;
+                Ok::<_, anyhow::Error>(if newer {
+                    Some((
+                        manifest.version,
+                        manifest.notes,
+                        entry.url,
+                        entry.signature,
+                    ))
+                } else {
+                    None
+                })
+            }
+            .await;
+            let _ = tx.send(res);
+        });
+
+        cx.spawn(async move |this, cx| {
+            let res = rx.await;
+            this.update(cx, |this, cx| {
+                use crate::updater::UpdateState;
+                match res {
+                    Ok(Ok(Some((version, notes, url, sig)))) => {
+                        // Found a newer version - go straight into a silent
+                        // download (no separate "available" banner state).
+                        this.download_update(url, sig, version, notes, cx);
+                    }
+                    Ok(Ok(None)) => {
+                        this.update_state =
+                            if silent { UpdateState::Idle } else { UpdateState::UpToDate };
+                        cx.notify();
+                    }
+                    Ok(Err(e)) => {
+                        this.update_state = if silent {
+                            UpdateState::Idle
+                        } else {
+                            UpdateState::Error {
+                                message: e.to_string(),
+                            }
+                        };
+                        cx.notify();
+                    }
+                    Err(_) => {
+                        // Sender dropped (task cancelled) - back to idle.
+                        this.update_state = UpdateState::Idle;
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Download + minisign-verify the artifact, then leave it `Ready` for the
+    /// user to restart. `version`/`notes` are carried through to the `Ready`
+    /// state for the restart banner.
+    fn download_update(
+        &mut self,
+        url: String,
+        signature: String,
+        version: String,
+        notes: String,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::updater::UpdateState;
+        let ext = if cfg!(target_os = "macos") {
+            "app.tar.gz"
+        } else {
+            "zip"
+        };
+        let dest = std::env::temp_dir().join(format!("boundless-update-{}.{}", std::process::id(), ext));
+        self.update_state = UpdateState::Downloading { fraction: 0.0 };
+        cx.notify();
+
+        let (tx, rx) = futures::channel::mpsc::unbounded::<DownloadMsg>();
+        let url_c = url.clone();
+        let dest_c = dest.clone();
+        let sig_c = signature.clone();
+        crate::ai::client::tokio_runtime().spawn(async move {
+            let tx2 = tx.clone();
+            let res = crate::updater::download(&url_c, &dest_c, move |done, total| {
+                let frac = if total > 0 { done as f64 / total as f64 } else { 0.0 };
+                let _ = tx2.unbounded_send(DownloadMsg::Progress(frac));
+            })
+            .await;
+            let res = res.and_then(|()| crate::updater::verify(&dest_c, &sig_c).map(|()| dest_c));
+            let _ = tx.unbounded_send(DownloadMsg::Done(res.map_err(|e| e.to_string())));
+        });
+
+        cx.spawn(async move |this, cx| {
+            use futures::StreamExt;
+            let mut rx = rx;
+            while let Some(msg) = rx.next().await {
+                match msg {
+                    DownloadMsg::Progress(frac) => {
+                        this.update(cx, |this, cx| {
+                            this.update_state = UpdateState::Downloading { fraction: frac };
+                            cx.notify();
+                        })
+                        .ok();
+                    }
+                    DownloadMsg::Done(res) => {
+                        this.update(cx, |this, cx| {
+                            this.update_state = match res {
+                                Ok(artifact) => UpdateState::Ready {
+                                    version: version.clone(),
+                                    notes: notes.clone(),
+                                    artifact,
+                                },
+                                Err(message) => UpdateState::Error { message },
+                            };
+                            cx.notify();
+                        })
+                        .ok();
+                        break;
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Apply the downloaded artifact and restart. Runs `apply` on a background
+    /// thread (it does file IO then exits); on success the process exits, on
+    /// failure the error is surfaced.
+    fn install_and_restart(&mut self, cx: &mut Context<Self>) {
+        use crate::updater::UpdateState;
+        let artifact = match &self.update_state {
+            UpdateState::Ready { artifact, .. } => artifact.clone(),
+            _ => return,
+        };
+        self.update_state = UpdateState::Installing;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { crate::updater::apply(&artifact) })
+                .await;
+            // apply() exits on success, so we only reach here on error.
+            if let Err(e) = res {
+                this.update(cx, |this, cx| {
+                    this.update_state = UpdateState::Error {
+                        message: e.to_string(),
+                    };
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Dismiss the current update state back to idle (e.g. user clicks "稍后").
+    fn dismiss_update(&mut self, cx: &mut Context<Self>) {
+        self.update_state = crate::updater::UpdateState::Idle;
+        cx.notify();
     }
 
     /// True if `position` (window/content coordinates) lies over the AI panel.
@@ -2964,6 +3206,7 @@ impl Render for BoardView {
             .on_action(cx.listener(|this, _: &TextTool, window, cx| this.set_tool(ActiveTool::Text, window, cx)))
             .on_action(cx.listener(|this, _: &EraserTool, window, cx| this.set_tool(ActiveTool::Eraser, window, cx)))
             .on_action(cx.listener(|this, _: &ToggleAi, window, cx| this.toggle_ai_panel(window, cx)))
+            .on_action(cx.listener(|this, _: &CheckForUpdates, _window, cx| this.check_for_updates(cx, false)))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_left_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_down))
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_down))
@@ -2991,6 +3234,7 @@ impl Render for BoardView {
                     .child(self.render_element_info(cx))
                     .child(self.render_zoom_bar(cx))
                     .child(self.render_notice_bar())
+                    .children(self.render_update_banner(cx))
                     .children(self.render_context_menu(cx))
                     .children(self.ai_panel.clone()),
             )
@@ -4100,7 +4344,7 @@ impl BoardView {
     /// child of the board's outer column so it occupies layout space at the top;
     /// macOS uses the native `set_menus` bar instead and never calls this.
     fn render_menu_bar(&self, window: &Window, cx: &mut Context<Self>) -> Div {
-        let labels: [&str; 3] = ["文件", "编辑", "视图"];
+        let labels: [&str; 4] = ["文件", "编辑", "视图", "帮助"];
         let mut bar = div()
             .flex()
             .flex_row()
@@ -4339,6 +4583,25 @@ impl BoardView {
                     },
                 ));
             }
+            3 => {
+                // 帮助
+                let w = weak.clone();
+                card = card.child(context_menu_row(
+                    "m-check-updates",
+                    None,
+                    "检查更新…".into(),
+                    None,
+                    true,
+                    move |_, _, cx| {
+                        w.update(cx, |this, cx| {
+                            this.menubar_open = None;
+                            this.check_for_updates(cx, false);
+                            cx.notify();
+                        })
+                        .ok();
+                    },
+                ));
+            }
             _ => return None,
         }
 
@@ -4453,5 +4716,107 @@ impl BoardView {
             .text_xs()
             .text_color(rgb(0x888888))
             .child(text)
+    }
+
+    /// A small bottom-center banner for the auto-update flow: download
+    /// progress, a "ready to restart" prompt, or an error. Hidden when idle /
+    /// checking / available (transient states).
+    fn render_update_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use crate::updater::UpdateState;
+        let weak = cx.weak_entity();
+        let is_restart = matches!(self.update_state, UpdateState::Ready { .. });
+        let (text, has_action): (String, bool) = match &self.update_state {
+            UpdateState::Idle | UpdateState::Checking => return None,
+            UpdateState::Downloading { fraction } => {
+                (format!("正在下载更新 {}%", (fraction * 100.0) as u32), false)
+            }
+            UpdateState::Ready { version, notes, .. } => {
+                let mut t = format!("新版本 v{} 已就绪，重启以应用", version);
+                // Append the first line of the release notes, truncated, so the
+                // banner stays compact.
+                if let Some(line) = notes.lines().next() {
+                    let line = line.trim();
+                    if !line.is_empty() {
+                        t.push_str("  ·  ");
+                        let max = 60;
+                        if line.len() > max {
+                            t.push_str(&line[..max]);
+                            t.push('…');
+                        } else {
+                            t.push_str(line);
+                        }
+                    }
+                }
+                (t, true)
+            }
+            UpdateState::UpToDate => (
+                format!("已是最新版本 v{}", crate::updater::current_version()),
+                true,
+            ),
+            UpdateState::Installing => ("正在安装，即将重启…".to_string(), false),
+            UpdateState::Error { message } => (format!("更新失败：{}", message), true),
+        };
+        let action_label = if is_restart { "重启应用" } else { "关闭" };
+
+        let mut card = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .bg(rgb(0xffffff))
+            .border_1()
+            .border_color(rgb(0xe3e2df))
+            .rounded_lg()
+            .shadow_lg()
+            .text_sm()
+            .text_color(rgb(0x1e1e1e))
+            .child(text);
+        if has_action {
+            let bg = if is_restart {
+                rgb(0x1a5fd7)
+            } else {
+                rgb(0xf1f0ee)
+            };
+            let fg = if is_restart {
+                rgb(0xffffff)
+            } else {
+                rgb(0x1e1e1e)
+            };
+            card = card.child(
+                div()
+                    .id("upd-action")
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .text_color(fg)
+                    .cursor_pointer()
+                    .when(is_restart, |d| d.bg(bg))
+                    .when(!is_restart, |d| d.hover(|s| s.bg(rgb(0xebeaea))))
+                    .on_click(move |_, _, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            if is_restart {
+                                this.install_and_restart(cx);
+                            } else {
+                                this.dismiss_update(cx);
+                            }
+                        });
+                    })
+                    .child(action_label),
+            );
+        }
+
+        Some(
+            div()
+                .absolute()
+                .bottom_3()
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(card)
+                .into_any_element(),
+        )
     }
 }

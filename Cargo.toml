@@ -45,6 +45,19 @@ rig-core = { version = "0.38", default-features = false, features = [
 # dependency graph that rig-core already pulls in).
 schemars = "1"
 
+# --- Auto-update --------------------------------------------------------------
+# Self-hosted latest.json + CDN updater (lakemind-style, ported to GPUI).
+# minisign-verify: verify downloaded artifacts against an embedded public key.
+# semver: compare manifest version vs env!(CARGO_PKG_VERSION).
+# zip: extract the Windows bare-exe artifact.
+# flate2 + tar: extract the macOS .app.tar.gz bundle (preserves unix perms).
+# semver/flate2 already exist transitively; listed directly for the updater.
+minisign-verify = "0.2"
+semver = "1"
+zip = "2"
+flate2 = "1"
+tar = "0.4"
+
 # Win32 interop: GPUI updates the *cached* cursor style on a modifier change,
 # but on Windows the system cursor only refreshes on WM_SETCURSOR (mouse move).
 # We set the system cursor directly so holding Ctrl/Shift changes it instantly.

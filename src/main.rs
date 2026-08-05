@@ -11,12 +11,13 @@ mod render;
 mod scene;
 mod text;
 mod tools;
+mod updater;
 
 use board::{
-    ArrowTool, BoardView, BringForward, BringToFront, CancelOp, DeleteSelection, DiamondTool,
-    EllipseTool, EraserTool, HandTool, LineTool, OpenScene, PenTool, Quit, RectTool, Redo,
-    SaveScene, SelectTool, SendBackward, SendToBack, TextTool, ToggleAi, Undo, ZoomIn, ZoomOut,
-    ZoomReset,
+    ArrowTool, BoardView, BringForward, BringToFront, CancelOp, CheckForUpdates, DeleteSelection,
+    DiamondTool, EllipseTool, EraserTool, HandTool, LineTool, OpenScene, PenTool, Quit, RectTool,
+    Redo, SaveScene, SelectTool, SendBackward, SendToBack, TextTool, ToggleAi, Undo, ZoomIn,
+    ZoomOut, ZoomReset,
 };
 use gpui::*;
 use gpui_component::Root;
@@ -107,7 +108,16 @@ fn main() {
                     MenuItem::action("保存场景", SaveScene),
                 ],
             },
+            Menu {
+                name: "帮助".into(),
+                items: vec![MenuItem::action("检查更新…", CheckForUpdates)],
+            },
         ]);
+
+        // Remove leftover `.old` files/dirs from a previous in-place update
+        // (applied on the last run before restart). Best-effort, before any
+        // window opens.
+        updater::cleanup_old();
 
         let bounds = Bounds::centered(None, size(px(1440.0), px(900.0)), cx);
         cx.open_window(
