@@ -15,3 +15,9 @@ shot-*.png
 
 # ZCode session artifacts
 .zcode/
+
+# minisign keypair (generated locally by `cargo run --example
+# gen_minisign_keypair`). NEVER commit - minisign.key is the private signing
+# key; minisign.pub is only needed to bake the pubkey into the app.
+minisign.key
+minisign.pub

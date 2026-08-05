@@ -22,15 +22,15 @@ use std::process::Command;
 // ---------------------------------------------------------------------------
 
 /// URL of the `latest.json` manifest (self-hosted on a CDN/docs site).
-/// The CI release workflow generates and uploads this file.
-pub const MANIFEST_URL: &str =
-    "https://REPLACE_ME.example.com/boundless-latest.json";
+/// The CI release workflow generates and uploads this file. Must match the
+/// `CDN_BASE` GitHub variable + `/boundless-latest.json`.
+pub const MANIFEST_URL: &str = "https://boundlesscdn.xi-n.com/boundless-latest.json";
 
 /// minisign public key - the **base64 line** (second line) of `minisign.pub`,
 /// generated via `minisign -G`. The matching secret key (+ password) goes into
 /// the CI secrets `MINISIGN_PRIVATE_KEY` / `MINISIGN_PRIVATE_KEY_PASSWORD` and
 /// signs each release artifact. `REPLACE_ME` disables verification until set.
-pub const MINISIGN_PUBKEY: &str = "REPLACE_ME";
+pub const MINISIGN_PUBKEY: &str = "RWTgy8P9e5EU/l+TFMe/JOCA/Dkn+5dDYdQgQySZUl959/zDM+NnbK9X";
 
 /// True when a real minisign public key has been configured. Until then,
 /// `verify` is skipped (the updater refuses to apply an unsigned download only
