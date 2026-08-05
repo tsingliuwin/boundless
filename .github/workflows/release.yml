@@ -85,25 +85,25 @@ jobs:
       - name: Build installer (Windows)
         if: runner.os == 'Windows'
         shell: bash
+        env:
+          # Git Bash (MSYS) rewrites args starting with `/` into Windows
+          # paths - which mangles NSIS's `/DVERSION=...` defines into
+          # "C:/Program Files/Git/DVERSION=...". Disable that conversion.
+          MSYS_NO_PATHCONV: "1"
         run: |
           # Double-clickable setup exe (NSIS, per-user install - no UAC, and
           # the install dir stays writable so auto-update can replace the exe
           # in place). Output: boundless-<tag>-win-x64-setup.exe.
-          #
-          # NSIS is NOT preinstalled on windows-latest, so install it via
-          # choco (the runner has admin). choco adds makensis to the *machine*
-          # PATH, but that doesn't refresh the current bash session's PATH,
-          # so we prepend the install dir explicitly before calling makensis.
           set -euo pipefail
           choco install nsis --no-progress -y
           NSIS_DIR="/c/Program Files (x86)/NSIS"
           [ -d "$NSIS_DIR" ] || NSIS_DIR="/c/Program Files/NSIS"
           export PATH="$NSIS_DIR:$PATH"
-          command -v makensis >/dev/null 2>&1 || {
-            echo "makensis not found in $NSIS_DIR"; ls -la "$NSIS_DIR" 2>/dev/null; exit 127;
-          }
+          command -v makensis >/dev/null 2>&1 || { echo "makensis not found"; exit 127; }
           VERSION="${GITHUB_REF_NAME#v}"
-          EXEPATH="$(pwd)/target/${{ matrix.target }}/release/${{ matrix.artifact }}"
+          # makensis is a native Windows exe, so hand it a Windows path
+          # (cygpath -w) rather than the MSYS /d/... form.
+          EXEPATH=$(cygpath -w "$(pwd)/target/${{ matrix.target }}/release/${{ matrix.artifact }}")
           makensis -V2 \
             "/DVERSION=$VERSION" \
             "/DTAG=${GITHUB_REF_NAME}" \
