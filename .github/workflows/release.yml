@@ -104,11 +104,18 @@ jobs:
           # makensis is a native Windows exe, so hand it a Windows path
           # (cygpath -w) rather than the MSYS /d/... form.
           EXEPATH=$(cygpath -w "$(pwd)/target/${{ matrix.target }}/release/${{ matrix.artifact }}")
+          # Explicit absolute OutFile so the setup exe always lands at the repo
+          # root (where the upload glob `boundless-*-setup.exe` looks) instead
+          # of next to the .nsi script.
+          OUTFILE=$(cygpath -w "$(pwd)/boundless-${GITHUB_REF_NAME}-win-x64-setup.exe")
           makensis -V2 \
             "/DVERSION=$VERSION" \
             "/DTAG=${GITHUB_REF_NAME}" \
             "/DEXEPATH=$EXEPATH" \
+            "/DOUTFILE=$OUTFILE" \
             installer/installer.nsi
+          # Sanity-check the setup exe exists at the repo root before upload.
+          ls -la "boundless-${GITHUB_REF_NAME}-win-x64-setup.exe"
 
       - name: Package (macOS)
         if: runner.os == 'macOS'

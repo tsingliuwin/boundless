@@ -27,7 +27,13 @@
 !define UNINSTREG "Software\Microsoft\Windows\CurrentVersion\Uninstall\${UNINSTKEY}"
 
 Name "${APPNAME} ${VERSION}"
-OutFile "boundless-${TAG}-win-x64-setup.exe"
+; OutFile may be passed as an absolute Windows path via /DOUTFILE=... so the
+; build always lands it at the repo root (where the upload glob looks). Defaults
+; to a relative name written next to the script.
+!ifndef OUTFILE
+  !define OUTFILE "boundless-${TAG}-win-x64-setup.exe"
+!endif
+OutFile "${OUTFILE}"
 
 ; Per-user install: no admin elevation, writable by the user (auto-updater
 ; needs write access to the install directory).
