@@ -160,3 +160,59 @@ fn toggle_maximize_windows(window: &Window) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// Start a native window drag from a client-area mouse-down.
+///
+/// GPUI's `start_window_move` is a no-op on Windows, and `window_control_area(
+/// Drag)` only drags when `WM_NCHITTEST` returns `HTCAPTION` - which needs a
+/// current `mouse_hit_test`, but that's often stale by one frame at click time,
+/// so the hit falls back to `HTCLIENT` and the drag never starts. Instead we
+/// release the mouse capture and `SendMessage(WM_NCLBUTTONDOWN, HTCAPTION)`,
+/// which makes Windows enter its caption drag modal loop directly. This is the
+/// standard trick for custom-titlebar windows and doesn't depend on hit-testing.
+pub fn start_window_drag(window: &Window) {
+    #[cfg(target_os = "windows")]
+    {
+        if let Err(e) = start_window_drag_windows(window) {
+            eprintln!("start_window_drag failed: {e}");
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn start_window_drag_windows(window: &Window) -> Result<(), String> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
+    use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetCursorPos, SendMessageW, HTCAPTION, WM_NCLBUTTONDOWN,
+    };
+
+    let raw = HasWindowHandle::window_handle(window)
+        .map_err(|e| format!("window_handle: {e}"))?
+        .as_raw();
+    let hwnd = match raw {
+        RawWindowHandle::Win32(h) => HWND(h.hwnd.get() as *mut core::ffi::c_void),
+        _ => return Err("not a Win32 window".into()),
+    };
+    unsafe {
+        // ReleaseCapture so the in-flight button-down doesn't hold the mouse,
+        // then synthesize a caption (HTCAPTION) non-client button-down. Windows
+        // runs its drag modal loop synchronously inside SendMessageW; the GPUI
+        // input callback is already taken by the outer client mouse-down, so the
+        // reentrant WM_NCLBUTTONDOWN skips element dispatch and hits
+        // DefWindowProcW, which starts the drag.
+        let _ = ReleaseCapture();
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        // lparam = screen-space cursor (low word = x, high word = y).
+        let lparam = LPARAM((((pt.y as u32) << 16) | (pt.x as u32 & 0xFFFF)) as isize);
+        let _ = SendMessageW(
+            hwnd,
+            WM_NCLBUTTONDOWN,
+            Some(WPARAM(HTCAPTION as usize)),
+            Some(lparam),
+        );
+    }
+    Ok(())
+}

@@ -4110,7 +4110,12 @@ impl BoardView {
             .flex_shrink_0()
             .border_b_1()
             .border_color(rgb(0xe3e2df))
-            .bg(rgb(0xffffff));
+            .bg(rgb(0xffffff))
+            // The bar inherits the canvas tool cursor (crosshair/ibeam/...)
+            // from the board's outer div otherwise; force the normal arrow so
+            // the title bar always looks like a title bar. Menu labels below
+            // override this with `cursor_pointer` for their own click hint.
+            .cursor(CursorStyle::Arrow);
         for (i, label) in labels.into_iter().enumerate() {
             let active = self.menubar_open == Some(i);
             bar = bar.child(
@@ -4137,17 +4142,22 @@ impl BoardView {
                     .child(label),
             );
         }
-        // Draggable spacer: the empty middle of the bar is a Win32 caption
-        // (HTCAPTION) region, so dragging from here moves the window. Menu
-        // labels and caption buttons live outside this region, so their clicks
-        // are unaffected. Double-clicking it toggles maximize/restore (native
-        // WM_NCLBUTTONDBLCLK on HTCAPTION -> DefWindowProcW).
+        // Draggable spacer: the empty middle of the bar moves the window. We
+        // don't use window_control_area(Drag) here - that route depends on a
+        // current mouse_hit_test, which is often stale at click time so the hit
+        // falls back to HTCLIENT and nothing drags. Instead, on mouse-down we
+        // synthesize an HTCAPTION non-client click (see platform::start_window_
+        // drag), which reliably starts Windows' caption drag. stop_propagation
+        // keeps the board's on_left_down from also firing.
         bar = bar.child(
             div()
                 .id("title-drag")
                 .flex_1()
                 .h_full()
-                .window_control_area(WindowControlArea::Drag),
+                .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                    crate::platform::start_window_drag(window);
+                    cx.stop_propagation();
+                }),
         );
         // Caption buttons on the right; the OS handles their clicks.
         bar = bar.child(window_controls(window));
