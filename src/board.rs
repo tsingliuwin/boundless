@@ -875,9 +875,25 @@ impl BoardView {
     // AI panel
 
     fn toggle_ai_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.ai_panel.take().is_none() {
+        if let Some(panel) = self.ai_panel.take() {
+            // Closing: undo the pan applied on open (plus any accumulated
+            // during resizing). The net shift to reverse is exactly the
+            // panel's current width / 2: open panned -w0/2, each resize panned
+            // -Δ/2, so the total is -w_current/2.
+            let w = panel.read(cx).width();
+            self.camera.pan_by_screen(px(w / 2.0), px(0.0));
+        } else {
+            // Opening: the right-docked panel overlays the canvas, so the
+            // visible canvas center jumps left by w/2. Pan the camera to
+            // follow it, keeping whatever was centered still centered in the
+            // (narrower) visible area - otherwise the focal content can end up
+            // hidden behind the panel. Excalidraw does the same. Zoom is left
+            // untouched (no need to fit + restore 100%).
             let weak = cx.weak_entity();
-            self.ai_panel = Some(cx.new(|cx| AiPanel::new(weak, window, cx)));
+            let panel = cx.new(|cx| AiPanel::new(weak, window, cx));
+            let w = panel.read(cx).width();
+            self.ai_panel = Some(panel);
+            self.camera.pan_by_screen(px(-w / 2.0), px(0.0));
         }
         cx.notify();
     }

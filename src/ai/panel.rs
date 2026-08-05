@@ -1089,14 +1089,26 @@ impl Render for AiPanel {
                 // *window/content* coordinates: mouse event positions are
                 // relative to the window origin, and viewport_size() is the
                 // window's drawable size in the same space. (Don't use
-                // window.bounds() — that's in screen coordinates.)
+                // window.bounds() - that's in screen coordinates.)
                 let win_right = f32::from(window.viewport_size().width);
                 let pointer_x = f32::from(event.event.position.x);
                 let w = (win_right - pointer_x).clamp(MIN_WIDTH, MAX_WIDTH);
                 panel_mv
                     .update(cx, |this, cx| {
-                        if (this.width - w).abs() > 0.01 {
+                        let delta = w - this.width;
+                        if delta.abs() > 0.01 {
                             this.width = w;
+                            // Keep the canvas's centered content centered as
+                            // the panel grows/shrinks: the right-docked panel
+                            // moves the visible canvas center by delta/2, so pan
+                            // the board camera by -delta/2 to follow it. This
+                            // matches the shift applied on open/close.
+                            this.board
+                                .update(cx, |board, cx| {
+                                    board.camera.pan_by_screen(px(-delta / 2.0), px(0.0));
+                                    cx.notify();
+                                })
+                                .ok();
                             cx.notify();
                         }
                     })
