@@ -52,7 +52,13 @@ schemars = "1"
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
 ] }
+# raw-window-handle is already in the dep graph (transitively via gpui); we add
+# it directly to obtain the HWND for `platform::toggle_maximize` (GPUI's
+# `zoom_window` only maximizes on Windows - it doesn't toggle, so restore needs
+# a direct `ShowWindow(SW_RESTORE)` via the window handle).
+raw-window-handle = "0.6"
 
 # macOS interop: set the Dock/application icon at runtime via
 # `[NSApp setApplicationIconImage:]`. Pinned to the version already in

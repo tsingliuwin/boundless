@@ -52,6 +52,10 @@ fn main() {
             // convention. The menu item "退出 Boundless" picks this binding up
             // automatically for its key-equivalent display.
             KeyBinding::new("cmd-q", Quit, None),
+            // Ctrl-Q is the Windows equivalent; the in-app menu bar's "退出"
+            // item shows this as its shortcut. Harmless on macOS (which also
+            // has cmd-q).
+            KeyBinding::new("ctrl-q", Quit, None),
             KeyBinding::new("ctrl-z", Undo, Some("Board")),
             KeyBinding::new("ctrl-shift-z", Redo, Some("Board")),
             KeyBinding::new("ctrl-y", Redo, Some("Board")),

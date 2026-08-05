@@ -113,3 +113,50 @@ fn set_cursor_windows(style: CursorStyle) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// Toggle the window between maximized and restored.
+///
+/// GPUI's `Window::zoom_window()` on Windows only ever calls
+/// `ShowWindow(SW_MAXIMIZE)` - it doesn't toggle, so a second click on a
+/// "restore" button would just re-maximize. This does a real toggle via the
+/// HWND: `IsZoomed` -> `SW_RESTORE`, else `SW_MAXIMIZE`. No-op on non-Windows
+/// (the in-app menu bar that calls this is Windows-only anyway).
+pub fn toggle_maximize(window: &Window) {
+    #[cfg(target_os = "windows")]
+    {
+        if let Err(e) = toggle_maximize_windows(window) {
+            eprintln!("toggle_maximize failed: {e}");
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn toggle_maximize_windows(window: &Window) -> Result<(), String> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{ShowWindowAsync, SW_MAXIMIZE, SW_RESTORE};
+
+    // gpui::Window has its own inherent `window_handle()` (returning an
+    // AnyWindowHandle) that shadows the `HasWindowHandle` trait method, so call
+    // the trait method via UFCS to get the raw window handle.
+    let raw = HasWindowHandle::window_handle(window)
+        .map_err(|e| format!("window_handle: {e}"))?
+        .as_raw();
+    let hwnd = match raw {
+        RawWindowHandle::Win32(h) => HWND(h.hwnd.get() as *mut core::ffi::c_void),
+        _ => return Err("not a Win32 window".into()),
+    };
+    // `window.is_maximized()` is a live `IsZoomed` query (and also rules out
+    // fullscreen), so it matches the maximize/restore icon we render. Toggle:
+    // maximized -> restore, otherwise -> maximize. ShowWindowAsync returns the
+    // previous visibility (BOOL); we don't need it.
+    let cmd = if window.is_maximized() {
+        SW_RESTORE
+    } else {
+        SW_MAXIMIZE
+    };
+    unsafe {
+        let _ = ShowWindowAsync(hwnd, cmd);
+    }
+    Ok(())
+}

@@ -120,6 +120,11 @@ pub struct BoardView {
     /// Whether the dot grid is painted behind the canvas. Toggled from the
     /// zoom-bar; persisted in the scene file.
     show_grid: bool,
+    /// Index of the currently open top-level menu in the Windows in-app menu
+    /// bar (None = all collapsed). Unused on macOS, which uses the native
+    /// `set_menus` bar; the field compiles everywhere because the menu-bar
+    /// rendering is pure GPUI.
+    menubar_open: Option<usize>,
 }
 
 impl BoardView {
@@ -154,6 +159,7 @@ impl BoardView {
             modifiers: Modifiers::default(),
             context_menu: None,
             show_grid: false,
+            menubar_open: None,
         }
     }
 
@@ -1075,6 +1081,15 @@ impl BoardView {
     // mouse handlers
 
     fn on_left_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Windows: the in-app menu bar spans the top MENU_BAR_HEIGHT px. Clicks
+        // there belong to the menu bar (labels / drag spacer / caption buttons),
+        // not the canvas, so don't start a canvas action. The caption buttons
+        // stop propagation themselves, but the drag spacer can't - HTCAPTION
+        // needs the NC mouse-down to reach DefWindowProcW to move the window -
+        // so guard here instead.
+        if cfg!(target_os = "windows") && event.position.y < px(MENU_BAR_HEIGHT) {
+            return;
+        }
         // A left click closes any open context menu (the backdrop normally
         // intercepts this, but guard anyway for clicks reaching the canvas).
         if self.context_menu.is_some() {
@@ -2883,10 +2898,26 @@ impl Render for BoardView {
         .inset_0()
         .cursor(cursor);
 
+        // Windows-only in-app menu bar (None on macOS, which uses the native
+        // `set_menus` bar). Computed before the chain so the builder doesn't
+        // hold a borrow of `self`/`cx` alongside the chain's own use.
+        let menubar = if cfg!(target_os = "windows") {
+            Some(self.render_menu_bar(window, cx))
+        } else {
+            None
+        };
+        let menubar_dropdown = if cfg!(target_os = "windows") {
+            self.render_menu_dropdown(cx)
+        } else {
+            None
+        };
+
         div()
             .key_context(if editing { "Editor" } else { "Board" })
             .track_focus(&self.focus_handle)
             .size_full()
+            .flex()
+            .flex_col()
             .relative()
             .overflow_hidden()
             .bg(rgb(BG_COLOR))
@@ -2926,14 +2957,29 @@ impl Render for BoardView {
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
-            .child(canvas_el)
-            .child(self.render_toolbar(cx))
-            .child(self.render_style_bar(cx))
-            .child(self.render_element_info(cx))
-            .child(self.render_zoom_bar(cx))
-            .child(self.render_notice_bar())
-            .children(self.render_context_menu(cx))
-            .children(self.ai_panel.clone())
+            .when_some(menubar, |d, bar| d.child(bar))
+            .child(
+                // Inner container: canvas + all floating chrome. It is the
+                // flex item below the menu bar; `relative()` keeps the
+                // absolute-positioned chrome (toolbar `top_3`, zoom bar
+                // `bottom_3`, AI panel `right_0/top_0`) anchored here, and
+                // `flex_1().min_h_0()` makes it fill the remaining height.
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(canvas_el)
+                    .child(self.render_toolbar(cx))
+                    .child(self.render_style_bar(cx))
+                    .child(self.render_element_info(cx))
+                    .child(self.render_zoom_bar(cx))
+                    .child(self.render_notice_bar())
+                    .children(self.render_context_menu(cx))
+                    .children(self.ai_panel.clone()),
+            )
+            // Dropdown overlay rendered last so it paints above the canvas.
+            .when_some(menubar_dropdown, |d, dd| d.child(dd))
     }
 }
 
@@ -3068,6 +3114,104 @@ fn icon_color(active: bool) -> Hsla {
 /// A horizontal separator for the context menu.
 fn menu_separator() -> Div {
     div().h(px(1.0)).w_full().bg(rgb(0xe3e2df))
+}
+
+// --- Windows in-app menu bar ---------------------------------------------
+// GPUI's Windows backend renders nothing for `set_menus` (it only stores the
+// definitions), so without a native bar the app has no File/Edit/View entries
+// on Windows. These constants + helpers draw a compact in-app bar instead.
+// macOS keeps using the native screen-top menu, so this code is gated at the
+// call site by `cfg!(target_os = "windows")`; the helpers themselves are pure
+// GPUI and compile on every platform.
+
+/// Bar height (px). Compact but an easy click target.
+const MENU_BAR_HEIGHT: f32 = 30.0;
+/// Fixed width of each top-level menu label (px). Constant so the dropdown
+/// can align under its label without measuring layout at runtime.
+const MENU_LABEL_W: f32 = 56.0;
+/// Left padding of the bar (px). Equals `px_2()`, so label `i` starts at
+/// `MENU_PAD + i * MENU_LABEL_W` - the dropdown's `left` offset.
+const MENU_PAD: f32 = 8.0;
+/// Width of each window caption button (minimize / maximize / close). Windows
+/// caption buttons are typically ~46px; matches the visual weight of the
+/// 30px-tall bar.
+const WIN_BTN_W: f32 = 46.0;
+
+/// One window caption button (minimize / maximize-or-restore / close).
+///
+/// The click is handled directly via `on_click` calling the GPUI `Window`
+/// methods (`minimize_window` / `zoom_window` / quit), the same approach
+/// gpui-component's `ControlIcon` uses on Linux. We deliberately do NOT use
+/// `window_control_area(Min/Max/Close)` here: that route relies on GPUI's
+/// non-client `HTMINBUTTON`/`HTMAXBUTTON`/`HTCLOSE` handling, which only fires
+/// when the NC mouse-down/up isn't consumed by an element - but the board's
+/// `on_left_down` (on the outer div) intercepts it, so the native path never
+/// triggers. `on_click` is reliable because it dispatches through the normal
+/// client mouse event regardless. `on_mouse_down` stops propagation so clicking
+/// a caption button doesn't also start a canvas action.
+fn window_control_button(
+    id: &'static str,
+    icon: IconName,
+    hover_bg: impl Into<Hsla>,
+    hover_fg: impl Into<Hsla>,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    let hover_bg = hover_bg.into();
+    let hover_fg = hover_fg.into();
+    div()
+        .id(id)
+        .w(px(WIN_BTN_W))
+        .h_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_color(rgb(0x1e1e1e))
+        .hover(|s| s.bg(hover_bg).text_color(hover_fg))
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(on_click)
+        .child(Icon::new(icon))
+}
+
+/// The minimize / maximize-or-restore / close button group on the right of the
+/// menu bar. The maximize icon swaps to a restore glyph when the window is
+/// already maximized. Close quits (single-window app: closing the window quits
+/// the process, matching the "退出" menu item).
+fn window_controls(window: &Window) -> Div {
+    let max_icon = if window.is_maximized() {
+        IconName::WindowRestore
+    } else {
+        IconName::WindowMaximize
+    };
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .h_full()
+        .child(window_control_button(
+            "win-min",
+            IconName::WindowMinimize,
+            rgb(0xf1f0ee),
+            rgb(0x1e1e1e),
+            |_, window, _| window.minimize_window(),
+        ))
+        .child(window_control_button(
+            "win-max",
+            max_icon,
+            rgb(0xf1f0ee),
+            rgb(0x1e1e1e),
+            |_, window, _| crate::platform::toggle_maximize(window),
+        ))
+        // Soft red hover (light tint bg + red icon) instead of a harsh solid
+        // red square - still reads as the "close" button but is gentler, and
+        // matches the gray hovers of the other two in intensity. Palette
+        // follows GitHub's danger colors (#ffebe9 / #cf222e).
+        .child(window_control_button(
+            "win-close",
+            IconName::WindowClose,
+            rgb(0xffebe9),
+            rgb(0xcf222e),
+            |_, _, cx| cx.quit(),
+        ))
 }
 
 /// One row of the right-click context menu: an optional leading icon, a
@@ -3931,6 +4075,246 @@ impl BoardView {
                 });
             },
         ));
+
+        Some(card.into_any_element())
+    }
+
+    /// The Windows top menu bar (文件 / 编辑 / 视图) plus a draggable spacer and
+    /// window caption buttons (minimize / maximize / close). Placed as the first
+    /// child of the board's outer column so it occupies layout space at the top;
+    /// macOS uses the native `set_menus` bar instead and never calls this.
+    fn render_menu_bar(&self, window: &Window, cx: &mut Context<Self>) -> Div {
+        let labels: [&str; 3] = ["文件", "编辑", "视图"];
+        let mut bar = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .pl_2()
+            .h(px(MENU_BAR_HEIGHT))
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(rgb(0xe3e2df))
+            .bg(rgb(0xffffff));
+        for (i, label) in labels.into_iter().enumerate() {
+            let active = self.menubar_open == Some(i);
+            bar = bar.child(
+                div()
+                    .id(gpui::ElementId::named_usize("menu-label", i))
+                    .w(px(MENU_LABEL_W))
+                    .h(px(MENU_BAR_HEIGHT))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_sm()
+                    .text_color(rgb(0x1e1e1e))
+                    .cursor_pointer()
+                    .when(active, |d| d.bg(rgb(0xf1f0ee)))
+                    .hover(|s| s.bg(rgb(0xf1f0ee)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.menubar_open = if this.menubar_open == Some(i) {
+                            None
+                        } else {
+                            Some(i)
+                        };
+                        cx.notify();
+                    }))
+                    .child(label),
+            );
+        }
+        // Draggable spacer: the empty middle of the bar is a Win32 caption
+        // (HTCAPTION) region, so dragging from here moves the window. Menu
+        // labels and caption buttons live outside this region, so their clicks
+        // are unaffected. Double-clicking it toggles maximize/restore (native
+        // WM_NCLBUTTONDBLCLK on HTCAPTION -> DefWindowProcW).
+        bar = bar.child(
+            div()
+                .id("title-drag")
+                .flex_1()
+                .h_full()
+                .window_control_area(WindowControlArea::Drag),
+        );
+        // Caption buttons on the right; the OS handles their clicks.
+        bar = bar.child(window_controls(window));
+        bar
+    }
+
+    /// The dropdown for the currently open menu (None when collapsed). Rendered
+    /// as the *last* child of the board's outer column so it paints above the
+    /// canvas. Reuses the context-menu card pattern (white card, click-away
+    /// dismiss via `on_mouse_down_out`, `context_menu_row` rows).
+    fn render_menu_dropdown(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let i = self.menubar_open?;
+        let weak = cx.weak_entity();
+        let left = px(MENU_PAD + i as f32 * MENU_LABEL_W);
+
+        let mut card = div()
+            .id("menu-dropdown")
+            .absolute()
+            .top(px(MENU_BAR_HEIGHT))
+            .left(left)
+            .w(px(180.0))
+            .bg(rgb(0xffffff))
+            .border_1()
+            .border_color(rgb(0xe3e2df))
+            .rounded_md()
+            .shadow_lg()
+            .p_1()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            // Clicks on the card don't bubble to the canvas.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            // Any mouse-down outside the card closes the menu.
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.menubar_open = None;
+                cx.notify();
+            }));
+
+        // Each row runs its action on the board via the captured weak handle,
+        // then collapses the menu. `cx` in the row closure is `&mut App`, so
+        // `cx.quit()` (no entity needed) is called directly for 退出.
+        match i {
+            0 => {
+                // 文件
+                let w = weak.clone();
+                card = card.child(context_menu_row(
+                    "m-open",
+                    Some(IconName::FolderOpen),
+                    "打开场景…".into(),
+                    Some("Ctrl+O".into()),
+                    true,
+                    move |_, window, cx| {
+                        w.update(cx, |this, cx| {
+                            this.open(window, cx);
+                            this.menubar_open = None;
+                            cx.notify();
+                        })
+                        .ok();
+                    },
+                ));
+                let w = weak.clone();
+                card = card.child(context_menu_row(
+                    "m-save",
+                    Some(IconName::File),
+                    "保存场景".into(),
+                    Some("Ctrl+S".into()),
+                    true,
+                    move |_, _, cx| {
+                        w.update(cx, |this, cx| {
+                            this.save(false, cx);
+                            this.menubar_open = None;
+                            cx.notify();
+                        })
+                        .ok();
+                    },
+                ));
+                card = card.child(menu_separator());
+                let w = weak.clone();
+                card = card.child(context_menu_row(
+                    "m-quit",
+                    None,
+                    "退出 Boundless".into(),
+                    Some("Ctrl+Q".into()),
+                    true,
+                    move |_, _, cx| {
+                        w.update(cx, |this, cx| {
+                            this.menubar_open = None;
+                            cx.notify();
+                        })
+                        .ok();
+                        cx.quit();
+                    },
+                ));
+            }
+            1 => {
+                // 编辑
+                let w = weak.clone();
+                card = card.child(context_menu_row(
+                    "m-undo",
+                    Some(IconName::Undo),
+                    "撤销".into(),
+                    Some("Ctrl+Z".into()),
+                    true,
+                    move |_, window, cx| {
+                        w.update(cx, |this, cx| {
+                            this.undo(window, cx);
+                            this.menubar_open = None;
+                            cx.notify();
+                        })
+                        .ok();
+                    },
+                ));
+                let w = weak.clone();
+                card = card.child(context_menu_row(
+                    "m-redo",
+                    Some(IconName::Redo),
+                    "重做".into(),
+                    Some("Ctrl+Shift+Z".into()),
+                    true,
+                    move |_, window, cx| {
+                        w.update(cx, |this, cx| {
+                            this.redo(window, cx);
+                            this.menubar_open = None;
+                            cx.notify();
+                        })
+                        .ok();
+                    },
+                ));
+            }
+            2 => {
+                // 视图
+                let w = weak.clone();
+                card = card.child(context_menu_row(
+                    "m-zin",
+                    Some(IconName::Plus),
+                    "放大".into(),
+                    Some("Ctrl+=".into()),
+                    true,
+                    move |_, _, cx| {
+                        w.update(cx, |this, cx| {
+                            this.zoom_by(1.25, cx);
+                            this.menubar_open = None;
+                            cx.notify();
+                        })
+                        .ok();
+                    },
+                ));
+                let w = weak.clone();
+                card = card.child(context_menu_row(
+                    "m-zout",
+                    Some(IconName::Minus),
+                    "缩小".into(),
+                    Some("Ctrl+-".into()),
+                    true,
+                    move |_, _, cx| {
+                        w.update(cx, |this, cx| {
+                            this.zoom_by(0.8, cx);
+                            this.menubar_open = None;
+                            cx.notify();
+                        })
+                        .ok();
+                    },
+                ));
+                card = card.child(menu_separator());
+                let w = weak.clone();
+                card = card.child(context_menu_row(
+                    "m-zreset",
+                    None,
+                    "重置缩放".into(),
+                    Some("Ctrl+0".into()),
+                    true,
+                    move |_, _, cx| {
+                        w.update(cx, |this, cx| {
+                            this.zoom_reset(cx);
+                            this.menubar_open = None;
+                            cx.notify();
+                        })
+                        .ok();
+                    },
+                ));
+            }
+            _ => return None,
+        }
 
         Some(card.into_any_element())
     }
