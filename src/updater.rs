@@ -117,10 +117,25 @@ fn http_client() -> Result<reqwest::Client> {
         .context("build reqwest client")
 }
 
+/// Build the manifest URL with a cache-busting query param. CDNs (and some
+/// browsers) cache `latest.json` at the edge, so a plain GET can return a stale
+/// version even after R2 is updated. Appending `?t=<unix-secs>` makes every
+/// request a distinct URL -> cache miss -> always fresh. The artifacts (zips /
+/// .app.tar.gz) have versioned filenames and are safe to cache, so only the
+/// manifest needs this.
+fn manifest_url_nocache() -> String {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let sep = if MANIFEST_URL.contains('?') { '&' } else { '?' };
+    format!("{MANIFEST_URL}{sep}t={ts}")
+}
+
 /// Fetch and parse the manifest from [`MANIFEST_URL`].
 pub async fn fetch_manifest() -> Result<Manifest> {
     let manifest = http_client()?
-        .get(MANIFEST_URL)
+        .get(manifest_url_nocache())
         .send()
         .await
         .context("fetch manifest")?
