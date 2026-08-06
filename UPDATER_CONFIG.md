@@ -77,12 +77,14 @@ In the GitHub repo **Settings → Secrets and variables → Actions**:
 Push a `v*` tag (`git tag v0.2.0 && git push github v0.2.0`). The
 `release.yml` workflow:
 
-1. **build** (Windows + macOS): `cargo build --release`, package the zip
-   (manual download) + (macOS) the `.app.tar.gz` updater artifact, then sign
-   the updater artifact with `cargo run --release --example sign_release`
-   (same `minisign` crate as the keygen).
+1. **build** (Windows + macOS): `cargo build --release`, then per platform:
+   - Windows: portable zip + **NSIS setup exe** (per-user install, no UAC).
+   - macOS: portable zip + `.app.tar.gz` updater artifact + **DMG**.
+   - each platform signs its updater artifact with
+     `cargo run --release --example sign_release` (same `minisign` crate as
+     the keygen).
 2. **release** (Linux): uploads artifacts + `.sig` + `boundless-latest.json`
-   to R2, and creates the GitHub Release.
+   to R2, and creates the GitHub Release with all of the above attached.
 
 Running clients then see the new version on their next poll (30s after launch,
 then every 4h), download + verify + swap + restart.
@@ -104,3 +106,34 @@ then every 4h), download + verify + swap + restart.
   to `Boundless <version>`. For richer notes, edit the generate step in
   `release.yml` to read a hand-maintained `CHANGELOG.md` instead of the commit
   log.
+
+## Troubleshooting (CI / NSIS installer)
+
+The Windows NSIS installer step in `release.yml` hit several environment
+quirks; if it ever regresses, these are the fixes already in place:
+
+- **`makensis: command not found`** - NSIS is NOT preinstalled on
+  `windows-latest`. The step runs `choco install nsis --no-progress -y`, but
+  choco only updates the *machine* PATH, which doesn't refresh the current
+  bash session. Fix: prepend the install dir explicitly in the same step:
+  `export PATH="/c/Program Files (x86)/NSIS:$PATH"` (with a fallback to
+  `/c/Program Files/NSIS`) before calling `makensis`.
+- **`Can't open script "C:/Program Files/Git/DVERSION=0.2.3"`** - Git Bash
+  (MSYS) rewrites command-line args that start with `/` into Windows paths,
+  which mangles NSIS's `/DVERSION=...` defines. Fix: set `MSYS_NO_PATHCONV: "1"`
+  in the step's `env:` so the `/D...` args pass through untouched.
+- **`makensis` is a native Windows exe** - it doesn't understand MSYS paths
+  like `/d/a/boundless/...`. Fix: convert paths with `cygpath -w` before
+  passing them as `/DEXEPATH=...`.
+- **setup.exe missing from the GitHub Release** - makensis resolves `OutFile`
+  relative to the **script's directory** (`installer/`), not the working
+  directory, so the file landed in `installer/` and the upload glob
+  `boundless-*-setup.exe` (which searches the repo root) missed it. Fix: pass
+  an absolute Windows path via `/DOUTFILE=$(cygpath -w "$(pwd)/<name>.exe")`
+  and the .nsi uses `OutFile "${OUTFILE}"`. A trailing `ls -la` confirms it
+  landed at the repo root before upload.
+- **GitHub Actions API / push flaky from China networks** - the GitHub API
+  (`api.github.com`) and SSH (`git push github`) can intermittently fail with
+  TLS/SSH connection resets. Retry the push a few times (`for i in ...; do
+  git push github ... && break; sleep 8; done`); check the run status in the
+  Actions web UI rather than via the API.
