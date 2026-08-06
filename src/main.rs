@@ -1,6 +1,13 @@
 //! boundless — an Excalidraw-style infinite whiteboard on GPUI,
 //! with OpenAI-compatible AI text generation.
 
+// Hide the console window in release builds. The binary is a console-subsystem
+// app by default, so double-clicking the exe (or the Start Menu shortcut the
+// NSIS installer creates) opens a black terminal alongside the window. Switching
+// to the windows subsystem suppresses it. Kept on in debug builds so `cargo run`
+// still shows `eprintln!` diagnostics.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod ai;
 mod board;
 mod camera;
