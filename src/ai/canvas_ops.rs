@@ -150,9 +150,11 @@ pub enum CanvasOp {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,
     },
-    /// Modify an existing element: move it to new coordinates and/or change its
-    /// text. `id` is the element's UUID (returned by the draw tool that created
-    /// it, or discovered via `list_elements`). All fields except `id` are optional.
+    /// Modify an existing element: move it to new coordinates, change its text,
+    /// restyle it, or resize text. `id` is the element's UUID (returned by the
+    /// draw tool that created it, or discovered via `list_elements`). All fields
+    /// except `id` are optional; omitted style fields keep the element's current
+    /// style.
     UpdateElement {
         id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -161,9 +163,17 @@ pub enum CanvasOp {
         y: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,
+        /// Optional visual style override. Omitted fields keep current style.
+        #[serde(default)]
+        style: CanvasStyle,
+        /// New font size (text elements only). Omit to keep current.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        font_size: Option<f64>,
     },
     /// Delete an element by id (also removes its bound label, if any).
     DeleteElement { id: String },
+    /// Delete every element on the canvas (clear it for a fresh start).
+    Clear,
     /// Standalone text. `text` may contain newlines for multi-line.
     Text {
         x: f64,
@@ -198,6 +208,7 @@ impl CanvasOp {
             CanvasOp::Text { .. } => "文本",
             CanvasOp::UpdateElement { .. } => "修改",
             CanvasOp::DeleteElement { .. } => "删除",
+            CanvasOp::Clear => "清空",
         }
     }
 }
@@ -232,6 +243,49 @@ impl CanvasStyle {
         out
     }
 }
+
+/// Machine-readable failure category for a canvas operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CanvasOpErrorCode {
+    /// Arguments failed validation (bad coordinates, non-positive size, etc.).
+    InvalidArgs,
+    /// A referenced element id does not exist.
+    NotFound,
+    /// Any other failure (board gone, internal error).
+    Internal,
+}
+
+/// A failed canvas operation, relayed from the main thread back to the tool.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CanvasOpError {
+    pub code: CanvasOpErrorCode,
+    pub message: String,
+}
+
+impl CanvasOpError {
+    pub fn invalid_args(msg: impl Into<String>) -> Self {
+        Self { code: CanvasOpErrorCode::InvalidArgs, message: msg.into() }
+    }
+    pub fn not_found(msg: impl Into<String>) -> Self {
+        Self { code: CanvasOpErrorCode::NotFound, message: msg.into() }
+    }
+    pub fn internal(msg: impl Into<String>) -> Self {
+        Self { code: CanvasOpErrorCode::Internal, message: msg.into() }
+    }
+}
+
+impl std::fmt::Display for CanvasOpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for CanvasOpError {}
+
+/// The outcome of applying one canvas op on the main thread: `Ok(message)` is
+/// a success description (e.g. "已添加矩形 id=a1b2c3d4"), `Err` is a failure
+/// carrying a category code and a human-readable reason.
+pub type CanvasOpOutcome = Result<String, CanvasOpError>;
 
 #[cfg(test)]
 mod tests {

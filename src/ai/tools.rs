@@ -1,19 +1,17 @@
 //! rig `Tool` implementations that let the AI agent draw on the canvas.
 //!
-//! **Design (mirrors lakemind):** each tool owns its full lifecycle. Inside
-//! `call()` it emits a three-phase event sequence through the shared event
-//! channel — `ToolCall` (open a pending step) → `CanvasOp` (apply the drawing)
-//! → `ToolResult` (mark the step done). rig's own tool-call / tool-result
-//! stream items are ignored on the agent side; the tool is the single source
-//! of truth for its lifecycle. The `call()` return value is a compact string
-//! fed back to the model ("已添加到画布"); the rich UI data (coordinates,
-//! colors…) flows via the `ToolCall` event's `args`.
+//! **Design (mirrors the harness):** each tool owns its full lifecycle AND
+//! returns the authoritative outcome. `call()` validates its arguments first
+//! (fail loud at the boundary), opens a pending step, sends one `CanvasOp` to
+//! the main thread and awaits the apply result — so the tool never reports
+//! success for a no-op or a failure. The string fed back to the model is the
+//! actual outcome, not a guess.
 //!
 //! Tools run on the tokio runtime (rig executes them there); the canvas lives
-//! on the GPUI main thread. `AgentEvent::CanvasOp` is drained on the main
-//! thread to mutate the scene.
+//! on the GPUI main thread. `AgentEvent::CanvasOp` carries a oneshot reply
+//! channel the main thread uses to return the apply outcome.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures::channel::mpsc::UnboundedSender;
 use rig_core::completion::ToolDefinition;
@@ -23,7 +21,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::agent::{next_tool_id, AgentEvent};
-use super::canvas_ops::{CanvasOp, CanvasStyle, OpPoint, OpTextAlign};
+use super::canvas_ops::{
+    CanvasOp, CanvasOpError, CanvasOpErrorCode, CanvasOpOutcome, CanvasStyle, OpPoint, OpTextAlign,
+};
 use super::client::ChatMessage;
 
 /// Generate a new element UUID (used by draw tools so the id can be reported
@@ -32,85 +32,180 @@ fn new_element_id() -> uuid::Uuid {
     uuid::Uuid::new_v4()
 }
 
-/// Shared error type for all drawing tools. Tools are infallible in practice
-/// (sending to an unbounded channel only fails if the receiver was dropped,
-/// i.e. the request was cancelled), so this is a thin wrapper. Implemented by
-/// hand rather than via `thiserror` (not a dependency of this crate).
-#[derive(Debug)]
-pub struct ToolError(pub String);
+/// Machine-facing error type for a tool call. Carries a category code so the
+/// model (and any future UI) can distinguish "bad arguments" from "not found"
+/// from "internal failure"; `Display` is the human-readable message the model
+/// sees. Implemented by hand rather than via `thiserror` (not a dependency).
+#[derive(Debug, Clone)]
+pub struct ToolError {
+    /// Failure category for structured handling; the model-facing message is
+    /// [`Self::message`]. Not yet consumed at runtime.
+    #[allow(dead_code)]
+    pub code: CanvasOpErrorCode,
+    pub message: String,
+}
+
+impl ToolError {
+    pub fn invalid_args(msg: impl Into<String>) -> Self {
+        Self { code: CanvasOpErrorCode::InvalidArgs, message: msg.into() }
+    }
+    pub fn not_found(msg: impl Into<String>) -> Self {
+        Self { code: CanvasOpErrorCode::NotFound, message: msg.into() }
+    }
+    fn from_op(e: CanvasOpError) -> Self {
+        Self { code: e.code, message: e.message }
+    }
+}
 
 impl std::fmt::Display for ToolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "{}", self.message)
     }
 }
 
 impl std::error::Error for ToolError {}
 
 // ---------------------------------------------------------------------------
-// A generic helper: each tool holds an event sender and emits a three-phase
-// lifecycle (call → canvas-op → result) before returning the model-facing
-// string. This makes every tool call a clean, self-contained execution unit.
+// Argument validation (fail loud at the boundary). The apply path re-checks
+// these defensively, but validating here gives the model fast, precise feedback
+// instead of a silent no-op.
 // ---------------------------------------------------------------------------
 
-/// The compact string returned to the model for a successful draw, carrying
-/// the element's short id so the model can reference it in update/delete calls.
-fn tool_ok_result(element_id: uuid::Uuid) -> String {
-    format!("已添加到画布，id={}", &element_id.to_string()[..8])
+fn validate_box(args: &BoxArgs) -> Result<(), ToolError> {
+    if !args.x.is_finite() || !args.y.is_finite() || !args.w.is_finite() || !args.h.is_finite() {
+        return Err(ToolError::invalid_args("坐标和宽高必须是有限数值"));
+    }
+    if args.w <= 0.0 || args.h <= 0.0 {
+        return Err(ToolError::invalid_args("宽高必须为正数"));
+    }
+    Ok(())
 }
 
-/// Emit the full tool-call lifecycle: open a pending step, apply the canvas
-/// op, then mark the step done. All three events share the same `id` so the
-/// UI can pair them. `args_json` is the re-serialized arguments the model
-/// supplied (kept for the UI's expandable detail view). `element_id` is the
-/// pre-generated UUID for the new element — reported back to the model in the
-/// result string so it can update/delete the element later.
-fn emit_tool_step(
+fn validate_points(points: &[OpPoint]) -> Result<(), ToolError> {
+    if points.len() < 2 {
+        return Err(ToolError::invalid_args("至少需要两个坐标点"));
+    }
+    if points.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
+        return Err(ToolError::invalid_args("坐标点必须是有限数值"));
+    }
+    Ok(())
+}
+
+fn validate_text(args: &TextArgs) -> Result<(), ToolError> {
+    if args.text.trim().is_empty() {
+        return Err(ToolError::invalid_args("文本内容不能为空"));
+    }
+    if !args.x.is_finite() || !args.y.is_finite() {
+        return Err(ToolError::invalid_args("坐标必须是有限数值"));
+    }
+    if let Some(fs) = args.font_size {
+        if !fs.is_finite() || fs <= 0.0 {
+            return Err(ToolError::invalid_args("字号必须为正数"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_update(args: &UpdateElementArgs) -> Result<(), ToolError> {
+    if args.id.trim().is_empty() {
+        return Err(ToolError::invalid_args("id 不能为空"));
+    }
+    let has_style = args.style.stroke.is_some()
+        || args.style.fill.is_some()
+        || args.style.stroke_width.is_some()
+        || args.style.roughness.is_some()
+        || args.style.stroke_style.is_some()
+        || args.style.opacity.is_some();
+    if args.x.is_none()
+        && args.y.is_none()
+        && args.text.is_none()
+        && !has_style
+        && args.font_size.is_none()
+    {
+        return Err(ToolError::invalid_args("至少提供 x/y/text/style/font_size 之一"));
+    }
+    if args.x.is_some_and(|v| !v.is_finite()) || args.y.is_some_and(|v| !v.is_finite()) {
+        return Err(ToolError::invalid_args("坐标必须是有限数值"));
+    }
+    if let Some(fs) = args.font_size {
+        if !fs.is_finite() || fs <= 0.0 {
+            return Err(ToolError::invalid_args("字号必须为正数"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_delete(args: &DeleteElementArgs) -> Result<(), ToolError> {
+    if args.id.trim().is_empty() {
+        return Err(ToolError::invalid_args("id 不能为空"));
+    }
+    Ok(())
+}
+
+/// True if `id` (an 8-char prefix or a full UUID) matches any live snapshot
+/// entry. Matches the scene's `find_by_id_prefix` semantics.
+fn snapshot_has_id(snapshot: &[ElementSnapshot], id: &str) -> bool {
+    snapshot.iter().any(|e| e.id.starts_with(id) || id.starts_with(&e.id))
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle helpers: open a pending step, apply the op on the main thread
+// (awaiting the reply), then close the step with the authoritative outcome.
+// ---------------------------------------------------------------------------
+
+/// Open a pending step, send the op, await the main thread's apply result, and
+/// close the step with that result. The returned string is what rig feeds back
+/// to the model — always the real outcome, never a guess.
+async fn run_canvas_op(
     events: &UnboundedSender<AgentEvent>,
     id: String,
     name: &str,
     args_json: Value,
     op: CanvasOp,
-    element_id: uuid::Uuid,
-) {
+    pre_assigned_id: Option<uuid::Uuid>,
+) -> Result<String, ToolError> {
     let _ = events.unbounded_send(AgentEvent::ToolCall {
         id: id.clone(),
         name: name.to_string(),
         args: args_json,
     });
+    let (tx, rx) = futures::channel::oneshot::channel();
     let _ = events.unbounded_send(AgentEvent::CanvasOp {
         op,
-        pre_assigned_id: Some(element_id),
+        pre_assigned_id,
+        reply: tx,
     });
-    let _ = events.unbounded_send(AgentEvent::ToolResult {
-        id,
-        result: tool_ok_result(element_id),
-    });
+    let outcome: CanvasOpOutcome = rx
+        .await
+        .unwrap_or_else(|_| Err(CanvasOpError::internal("画布操作被取消（应用已关闭）")));
+    let (is_error, message) = match &outcome {
+        Ok(msg) => (false, msg.clone()),
+        Err(e) => (true, e.message.clone()),
+    };
+    let _ = events.unbounded_send(AgentEvent::ToolResult { id, result: message, is_error });
+    outcome.map_err(ToolError::from_op)
 }
 
-/// Emit a tool-call lifecycle for non-create ops (update/delete) that don't
-/// create a new element. The result string confirms the operation.
-fn emit_tool_action(
+/// Fail a tool call at the boundary: open + close the step with an error, and
+/// return the error so rig feeds it back to the model for correction.
+async fn fail_tool(
     events: &UnboundedSender<AgentEvent>,
     id: String,
     name: &str,
     args_json: Value,
-    op: CanvasOp,
-    result: &str,
-) {
+    err: ToolError,
+) -> Result<String, ToolError> {
     let _ = events.unbounded_send(AgentEvent::ToolCall {
         id: id.clone(),
         name: name.to_string(),
         args: args_json,
     });
-    let _ = events.unbounded_send(AgentEvent::CanvasOp {
-        op,
-        pre_assigned_id: None,
-    });
     let _ = events.unbounded_send(AgentEvent::ToolResult {
         id,
-        result: result.to_string(),
+        result: err.message.clone(),
+        is_error: true,
     });
+    Err(err)
 }
 
 /// Arguments shared by the four box shapes (rectangle / ellipse / diamond).
@@ -214,20 +309,24 @@ impl Tool for RectangleTool {
         &self,
         args: Self::Args,
     ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
-        let id = next_tool_id(Self::NAME);
-        let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
-        let op = CanvasOp::Rectangle {
-            x: args.x,
-            y: args.y,
-            w: args.w,
-            h: args.h,
-            style: args.style,
-            text: args.text,
-        };
-        let element_id = new_element_id();
-        let result = tool_ok_result(element_id);
-        emit_tool_step(&self.events, id, Self::NAME, args_json, op, element_id);
-        async move { Ok(result) }
+        let events = self.events.clone();
+        let name = Self::NAME;
+        async move {
+            let id = next_tool_id(name);
+            let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
+            if let Err(e) = validate_box(&args) {
+                return fail_tool(&events, id, name, args_json, e).await;
+            }
+            let op = CanvasOp::Rectangle {
+                x: args.x,
+                y: args.y,
+                w: args.w,
+                h: args.h,
+                style: args.style,
+                text: args.text,
+            };
+            run_canvas_op(&events, id, name, args_json, op, Some(new_element_id())).await
+        }
     }
 }
 
@@ -255,20 +354,24 @@ impl Tool for EllipseTool {
         &self,
         args: Self::Args,
     ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
-        let id = next_tool_id(Self::NAME);
-        let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
-        let op = CanvasOp::Ellipse {
-            x: args.x,
-            y: args.y,
-            w: args.w,
-            h: args.h,
-            style: args.style,
-            text: args.text,
-        };
-        let element_id = new_element_id();
-        let result = tool_ok_result(element_id);
-        emit_tool_step(&self.events, id, Self::NAME, args_json, op, element_id);
-        async move { Ok(result) }
+        let events = self.events.clone();
+        let name = Self::NAME;
+        async move {
+            let id = next_tool_id(name);
+            let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
+            if let Err(e) = validate_box(&args) {
+                return fail_tool(&events, id, name, args_json, e).await;
+            }
+            let op = CanvasOp::Ellipse {
+                x: args.x,
+                y: args.y,
+                w: args.w,
+                h: args.h,
+                style: args.style,
+                text: args.text,
+            };
+            run_canvas_op(&events, id, name, args_json, op, Some(new_element_id())).await
+        }
     }
 }
 
@@ -296,20 +399,24 @@ impl Tool for DiamondTool {
         &self,
         args: Self::Args,
     ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
-        let id = next_tool_id(Self::NAME);
-        let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
-        let op = CanvasOp::Diamond {
-            x: args.x,
-            y: args.y,
-            w: args.w,
-            h: args.h,
-            style: args.style,
-            text: args.text,
-        };
-        let element_id = new_element_id();
-        let result = tool_ok_result(element_id);
-        emit_tool_step(&self.events, id, Self::NAME, args_json, op, element_id);
-        async move { Ok(result) }
+        let events = self.events.clone();
+        let name = Self::NAME;
+        async move {
+            let id = next_tool_id(name);
+            let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
+            if let Err(e) = validate_box(&args) {
+                return fail_tool(&events, id, name, args_json, e).await;
+            }
+            let op = CanvasOp::Diamond {
+                x: args.x,
+                y: args.y,
+                w: args.w,
+                h: args.h,
+                style: args.style,
+                text: args.text,
+            };
+            run_canvas_op(&events, id, name, args_json, op, Some(new_element_id())).await
+        }
     }
 }
 
@@ -337,17 +444,21 @@ impl Tool for LineTool {
         &self,
         args: Self::Args,
     ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
-        let id = next_tool_id(Self::NAME);
-        let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
-        let op = CanvasOp::Line {
-            points: args.points,
-            style: args.style,
-            text: args.text,
-        };
-        let element_id = new_element_id();
-        let result = tool_ok_result(element_id);
-        emit_tool_step(&self.events, id, Self::NAME, args_json, op, element_id);
-        async move { Ok(result) }
+        let events = self.events.clone();
+        let name = Self::NAME;
+        async move {
+            let id = next_tool_id(name);
+            let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
+            if let Err(e) = validate_points(&args.points) {
+                return fail_tool(&events, id, name, args_json, e).await;
+            }
+            let op = CanvasOp::Line {
+                points: args.points,
+                style: args.style,
+                text: args.text,
+            };
+            run_canvas_op(&events, id, name, args_json, op, Some(new_element_id())).await
+        }
     }
 }
 
@@ -375,19 +486,23 @@ impl Tool for ArrowTool {
         &self,
         args: Self::Args,
     ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
-        let id = next_tool_id(Self::NAME);
-        let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
-        let op = CanvasOp::Arrow {
-            points: args.points,
-            start_arrowhead: args.start_arrowhead,
-            end_arrowhead: args.end_arrowhead,
-            style: args.style,
-            text: args.text,
-        };
-        let element_id = new_element_id();
-        let result = tool_ok_result(element_id);
-        emit_tool_step(&self.events, id, Self::NAME, args_json, op, element_id);
-        async move { Ok(result) }
+        let events = self.events.clone();
+        let name = Self::NAME;
+        async move {
+            let id = next_tool_id(name);
+            let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
+            if let Err(e) = validate_points(&args.points) {
+                return fail_tool(&events, id, name, args_json, e).await;
+            }
+            let op = CanvasOp::Arrow {
+                points: args.points,
+                start_arrowhead: args.start_arrowhead,
+                end_arrowhead: args.end_arrowhead,
+                style: args.style,
+                text: args.text,
+            };
+            run_canvas_op(&events, id, name, args_json, op, Some(new_element_id())).await
+        }
     }
 }
 
@@ -415,20 +530,24 @@ impl Tool for TextTool {
         &self,
         args: Self::Args,
     ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
-        let id = next_tool_id(Self::NAME);
-        let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
-        let op = CanvasOp::Text {
-            x: args.x,
-            y: args.y,
-            text: args.text,
-            font_size: args.font_size,
-            align: args.align,
-            style: args.style,
-        };
-        let element_id = new_element_id();
-        let result = tool_ok_result(element_id);
-        emit_tool_step(&self.events, id, Self::NAME, args_json, op, element_id);
-        async move { Ok(result) }
+        let events = self.events.clone();
+        let name = Self::NAME;
+        async move {
+            let id = next_tool_id(name);
+            let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
+            if let Err(e) = validate_text(&args) {
+                return fail_tool(&events, id, name, args_json, e).await;
+            }
+            let op = CanvasOp::Text {
+                x: args.x,
+                y: args.y,
+                text: args.text,
+                font_size: args.font_size,
+                align: args.align,
+                style: args.style,
+            };
+            run_canvas_op(&events, id, name, args_json, op, Some(new_element_id())).await
+        }
     }
 }
 
@@ -449,10 +568,18 @@ pub struct UpdateElementArgs {
     /// text). Omit to keep current text.
     #[serde(default)]
     pub text: Option<String>,
+    /// Optional visual style override (stroke/fill/width/roughness/opacity).
+    /// Omitted fields keep the element's current style.
+    #[serde(default)]
+    pub style: CanvasStyle,
+    /// New font size (text elements only). Omit to keep current.
+    #[serde(default)]
+    pub font_size: Option<f64>,
 }
 
 pub struct UpdateElementTool {
     pub events: UnboundedSender<AgentEvent>,
+    pub snapshot: Arc<Mutex<Vec<ElementSnapshot>>>,
 }
 
 impl Tool for UpdateElementTool {
@@ -464,7 +591,7 @@ impl Tool for UpdateElementTool {
     fn definition(&self, _prompt: String) -> impl std::future::Future<Output = ToolDefinition> + Send {
         let def = tool_def::<UpdateElementArgs>(
             Self::NAME,
-            "修改已有元素的位置或文字。id 是创建时返回的元素 ID。可单独修改 x/y（移动）或 text（改文字）。",
+            "修改已有元素：移动（x/y）、改文字（text）、改样式（style：描边/填充/线宽/粗糙度/透明度）或改字号（font_size，仅文本）。id 是创建时返回的元素 ID。",
         );
         async move { def }
     }
@@ -473,16 +600,38 @@ impl Tool for UpdateElementTool {
         &self,
         args: Self::Args,
     ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
-        let id = next_tool_id(Self::NAME);
-        let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
-        let op = CanvasOp::UpdateElement {
-            id: args.id,
-            x: args.x,
-            y: args.y,
-            text: args.text,
-        };
-        emit_tool_action(&self.events, id, Self::NAME, args_json, op, "已更新");
-        async move { Ok("已更新".to_string()) }
+        let events = self.events.clone();
+        let snapshot = self.snapshot.clone();
+        let name = Self::NAME;
+        async move {
+            let id = next_tool_id(name);
+            let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
+            if let Err(e) = validate_update(&args) {
+                return fail_tool(&events, id, name, args_json, e).await;
+            }
+            // Early id-existence check against the live snapshot so a bad id
+            // fails fast (the apply path re-checks authoritatively).
+            let snap = snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if !snapshot_has_id(&snap, &args.id) {
+                return fail_tool(
+                    &events,
+                    id,
+                    name,
+                    args_json,
+                    ToolError::not_found(format!("找不到元素 id={}", args.id)),
+                )
+                .await;
+            }
+            let op = CanvasOp::UpdateElement {
+                id: args.id,
+                x: args.x,
+                y: args.y,
+                text: args.text,
+                style: args.style,
+                font_size: args.font_size,
+            };
+            run_canvas_op(&events, id, name, args_json, op, None).await
+        }
     }
 }
 
@@ -496,6 +645,7 @@ pub struct DeleteElementArgs {
 
 pub struct DeleteElementTool {
     pub events: UnboundedSender<AgentEvent>,
+    pub snapshot: Arc<Mutex<Vec<ElementSnapshot>>>,
 }
 
 impl Tool for DeleteElementTool {
@@ -516,11 +666,62 @@ impl Tool for DeleteElementTool {
         &self,
         args: Self::Args,
     ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
-        let id = next_tool_id(Self::NAME);
-        let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
-        let op = CanvasOp::DeleteElement { id: args.id };
-        emit_tool_action(&self.events, id, Self::NAME, args_json, op, "已删除");
-        async move { Ok("已删除".to_string()) }
+        let events = self.events.clone();
+        let snapshot = self.snapshot.clone();
+        let name = Self::NAME;
+        async move {
+            let id = next_tool_id(name);
+            let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
+            if let Err(e) = validate_delete(&args) {
+                return fail_tool(&events, id, name, args_json, e).await;
+            }
+            let snap = snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if !snapshot_has_id(&snap, &args.id) {
+                return fail_tool(
+                    &events,
+                    id,
+                    name,
+                    args_json,
+                    ToolError::not_found(format!("找不到元素 id={}", args.id)),
+                )
+                .await;
+            }
+            let op = CanvasOp::DeleteElement { id: args.id };
+            run_canvas_op(&events, id, name, args_json, op, None).await
+        }
+    }
+}
+
+// --- Clear Canvas ----------------------------------------------------------
+
+pub struct ClearCanvasTool {
+    pub events: UnboundedSender<AgentEvent>,
+}
+
+impl Tool for ClearCanvasTool {
+    const NAME: &'static str = "clear_canvas";
+    type Error = ToolError;
+    type Args = NoArgs;
+    type Output = String;
+
+    fn definition(&self, _prompt: String) -> impl std::future::Future<Output = ToolDefinition> + Send {
+        let def = tool_def::<NoArgs>(
+            Self::NAME,
+            "清空画布上的所有元素。用于用户要求重新开始或全部重画时。",
+        );
+        async move { def }
+    }
+
+    fn call(
+        &self,
+        _args: Self::Args,
+    ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
+        let events = self.events.clone();
+        let name = Self::NAME;
+        async move {
+            let id = next_tool_id(name);
+            run_canvas_op(&events, id, name, Value::Null, CanvasOp::Clear, None).await
+        }
     }
 }
 
@@ -540,7 +741,9 @@ pub struct ElementSnapshot {
 
 impl ElementSnapshot {
     /// One-line summary for the model, e.g. "ellipse id=a1b2c3d4 text=开始 (350,40) 120×50".
-    fn summary(&self) -> String {
+    /// Public so the board's runtime-context snapshot reuses the exact wording
+    /// the `list_elements` tool reports back (the model sees consistent ids).
+    pub fn summary(&self) -> String {
         let text_part = self
             .text
             .as_ref()
@@ -554,7 +757,7 @@ impl ElementSnapshot {
 }
 
 pub struct ListElementsTool {
-    pub snapshot: Arc<Vec<ElementSnapshot>>,
+    pub snapshot: Arc<Mutex<Vec<ElementSnapshot>>>,
 }
 
 impl Tool for ListElementsTool {
@@ -575,15 +778,22 @@ impl Tool for ListElementsTool {
         &self,
         _args: Self::Args,
     ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
-        let result = if self.snapshot.is_empty() {
-            "画布为空".to_string()
-        } else {
-            let lines: Vec<String> = self.snapshot.iter().enumerate().map(|(i, e)| {
-                format!("{}. {}", i + 1, e.summary())
-            }).collect();
-            lines.join("\n")
-        };
-        async move { Ok(result) }
+        let snapshot = self.snapshot.clone();
+        async move {
+            // Read the LIVE snapshot (refreshed by the main thread after each
+            // apply), so elements drawn earlier in this same request are visible.
+            let snap = snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if snap.is_empty() {
+                Ok("画布为空".to_string())
+            } else {
+                let lines: Vec<String> = snap
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| format!("{}. {}", i + 1, e.summary()))
+                    .collect();
+                Ok(lines.join("\n"))
+            }
+        }
     }
 }
 
@@ -591,12 +801,12 @@ impl Tool for ListElementsTool {
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct NoArgs {}
 
-/// Build all tools sharing one event channel + a canvas snapshot for
-/// `list_elements`. Each draw tool emits its own `ToolCall`/`CanvasOp`/
-/// `ToolResult` lifecycle through `events`.
+/// Build all tools sharing one event channel + a live canvas snapshot (for
+/// `list_elements` and update/delete id validation). The snapshot is shared and
+/// refreshed by the main thread after each applied op.
 pub fn all_tools(
     events: UnboundedSender<AgentEvent>,
-    snapshot: Arc<Vec<ElementSnapshot>>,
+    snapshot: Arc<Mutex<Vec<ElementSnapshot>>>,
 ) -> Vec<Box<dyn rig_core::tool::ToolDyn>> {
     vec![
         Box::new(RectangleTool {
@@ -619,8 +829,13 @@ pub fn all_tools(
         }),
         Box::new(UpdateElementTool {
             events: events.clone(),
+            snapshot: snapshot.clone(),
         }),
         Box::new(DeleteElementTool {
+            events: events.clone(),
+            snapshot: snapshot.clone(),
+        }),
+        Box::new(ClearCanvasTool {
             events: events.clone(),
         }),
         Box::new(ListElementsTool { snapshot }),
@@ -631,3 +846,69 @@ pub fn all_tools(
 // surface (re-exported via the agent) even if not directly used here.
 #[allow(dead_code)]
 fn _chat_message_referenced(_: &ChatMessage) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn box_args(w: f64, h: f64) -> BoxArgs {
+        BoxArgs {
+            x: 0.0,
+            y: 0.0,
+            w,
+            h,
+            style: CanvasStyle::default(),
+            text: None,
+        }
+    }
+
+    fn snap(id: &str) -> ElementSnapshot {
+        ElementSnapshot {
+            id: id.to_string(),
+            kind: "rectangle".to_string(),
+            text: None,
+            x: 0.0,
+            y: 0.0,
+            w: 10.0,
+            h: 10.0,
+        }
+    }
+
+    #[test]
+    fn validate_box_rejects_bad_sizes() {
+        assert!(validate_box(&box_args(100.0, 50.0)).is_ok());
+        assert!(validate_box(&box_args(0.0, 50.0)).is_err());
+        assert!(validate_box(&box_args(100.0, -5.0)).is_err());
+        assert!(validate_box(&box_args(f64::NAN, 50.0)).is_err());
+    }
+
+    #[test]
+    fn validate_points_requires_two_finite_points() {
+        assert!(validate_points(&[OpPoint { x: 0.0, y: 0.0 }]).is_err());
+        assert!(validate_points(&[
+            OpPoint { x: 0.0, y: 0.0 },
+            OpPoint { x: 1.0, y: 1.0 },
+        ])
+        .is_ok());
+        assert!(validate_points(&[
+            OpPoint { x: 0.0, y: 0.0 },
+            OpPoint { x: f64::INFINITY, y: 1.0 },
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn snapshot_has_id_matches_prefix_and_full() {
+        let s = vec![snap("a1b2c3d4")];
+        assert!(snapshot_has_id(&s, "a1b2c3d4"));
+        assert!(snapshot_has_id(&s, "a1b2"));
+        assert!(!snapshot_has_id(&s, "deadbeef"));
+    }
+
+    #[test]
+    fn tool_error_display_is_the_message() {
+        let e = ToolError::not_found("找不到元素 id=abc");
+        assert_eq!(e.to_string(), "找不到元素 id=abc");
+        assert_eq!(e.code, CanvasOpErrorCode::NotFound);
+    }
+}

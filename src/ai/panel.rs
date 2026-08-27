@@ -4,7 +4,7 @@
 //! auto-grow, IME, selection, clipboard) instead of a hand-rolled TextField.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::collections::HashSet;
 
 use futures::StreamExt;
@@ -24,6 +24,7 @@ use super::settings::{AiSettings, ReasoningLevel};
 use super::store::{
     self, create_session, delete_session, list_sessions, load_messages, SessionMeta,
 };
+use super::tools::ElementSnapshot;
 
 
 // ---------------------------------------------------------------------
@@ -346,19 +347,28 @@ impl AiPanel {
             .rev()
             .collect();
 
-        // Build a snapshot of the current canvas elements so the agent can
-        // query them via the `list_elements` tool and reference their ids.
-        let snapshot = self
+        // Build the per-turn canvas state in one board access: the element list
+        // feeds the `list_elements` tool, and the runtime-context string is
+        // prepended to the prompt so the agent sees current state upfront.
+        let (snapshot, runtime_context) = self
             .board
-            .update(cx, |board, _cx| board.element_snapshot())
+            .update(cx, |board, _cx| {
+                let snapshot = board.element_snapshot();
+                let context = board.runtime_context();
+                (snapshot, context)
+            })
             .unwrap_or_default();
+        // Share the snapshot so tools see live state: the main thread refreshes
+        // it after every applied op (list_elements + update/delete id checks).
+        let snapshot: Arc<Mutex<Vec<ElementSnapshot>>> = Arc::new(Mutex::new(snapshot));
         match BoundlessAgent::stream(
             &self.settings,
             prompt,
             history,
-            std::sync::Arc::new(snapshot),
+            snapshot.clone(),
+            runtime_context,
         ) {
-            Ok(request) => self.start_stream_task(request, cx),
+            Ok(request) => self.start_stream_task(request, snapshot, cx),
             Err(e) => {
                 self.error = Some(format!("{e:#}"));
                 cx.notify();
@@ -367,7 +377,12 @@ impl AiPanel {
         cx.notify();
     }
 
-    fn start_stream_task(&mut self, request: AgentRequest, cx: &mut Context<Self>) {
+    fn start_stream_task(
+        &mut self,
+        request: AgentRequest,
+        snapshot: Arc<Mutex<Vec<ElementSnapshot>>>,
+        cx: &mut Context<Self>,
+    ) {
         // Reset the user's step toggles so each new stream starts from the
         // defaults (reasoning open while streaming, tools collapsed).
         self.open_stream_steps.clear();
@@ -439,7 +454,7 @@ impl AiPanel {
                                 if !pd.is_empty() {
                                     Self::apply_delta(panel, &pd);
                                 }
-                                let go = Self::handle_event(panel, ev, &board, cx);
+                                let go = Self::handle_event(panel, ev, &board, &snapshot, cx);
                                 panel.messages_scroll.scroll_to_bottom();
                                 go
                             })
@@ -537,14 +552,28 @@ impl AiPanel {
         panel: &mut AiPanel,
         event: AgentEvent,
         board: &WeakEntity<BoardView>,
+        snapshot: &Arc<Mutex<Vec<ElementSnapshot>>>,
         cx: &mut Context<AiPanel>,
     ) -> bool {
         match event {
             AgentEvent::Delta(_) | AgentEvent::Reasoning(_) => true,
-            AgentEvent::CanvasOp { op, pre_assigned_id } => {
-                board
-                    .update(cx, |board, cx| board.apply_canvas_op(op, pre_assigned_id, cx))
-                    .ok();
+            AgentEvent::CanvasOp { op, pre_assigned_id, reply } => {
+                // Apply on the main thread, refresh the shared snapshot, and
+                // relay the authoritative outcome back to the waiting tool.
+                let outcome = board
+                    .update(cx, |board, cx| {
+                        let outcome = board.apply_canvas_op(op, pre_assigned_id, cx);
+                        let fresh = board.element_snapshot();
+                        let mut snap = snapshot.lock().unwrap_or_else(|e| e.into_inner());
+                        *snap = fresh;
+                        outcome
+                    })
+                    .unwrap_or_else(|_| {
+                        Err(crate::ai::canvas_ops::CanvasOpError::internal(
+                            "画布操作失败：视图已销毁",
+                        ))
+                    });
+                let _ = reply.send(outcome);
                 cx.notify();
                 true
             }
@@ -555,6 +584,7 @@ impl AiPanel {
                         name,
                         args,
                         done: false,
+                        error: false,
                         id,
                         result: String::new(),
                     });
@@ -562,18 +592,20 @@ impl AiPanel {
                 cx.notify();
                 true
             }
-            AgentEvent::ToolResult { id, result } => {
+            AgentEvent::ToolResult { id, result, is_error } => {
                 if let Some(s) = panel.streaming.as_mut() {
                     for step in s.steps.iter_mut() {
                         if let super::client::AssistantStep::Tool {
                             id: step_id,
                             done,
+                            error,
                             result: step_result,
                             ..
                         } = step
                         {
                             if *step_id == id && !*done {
                                 *done = true;
+                                *error = is_error;
                                 *step_result = result.clone();
                                 break;
                             }
@@ -1218,14 +1250,20 @@ impl AiPanel {
                 )
                 .into_any_element()
             }
-            super::client::AssistantStep::Tool { name, args, done, result, .. } => {
+            super::client::AssistantStep::Tool { name, args, done, error, result, .. } => {
                 // Each tool call is its own full-width expandable step - like a
                 // reasoning panel, but with a tool label + status glyph. The
-                // header's icon/verb/color identify add/modify/delete/query.
+                // header's icon/verb/color identify add/modify/delete/query;
+                // the status glyph distinguishes pending / done / failed.
                 let open = self.open_stream_steps.contains(&idx);
-                let body_text = tool_body_text(name, args, result);
-                let status = if *done { "✓" } else { "⏳" };
-                let status_color = if *done { rgb(0x2f9e44) } else { rgb(0x999999) };
+                let body_text = tool_body_text(name, args, result, *error);
+                let (status, status_color) = if !*done {
+                    ("⏳", rgb(0x999999))
+                } else if *error {
+                    ("✕", rgb(0xc92a2a))
+                } else {
+                    ("✓", rgb(0x2f9e44))
+                };
                 let (title, title_color) = tool_header(name, args);
                 step_toggle(
                     ElementId::named_usize("tool-toggle", idx),
@@ -1332,11 +1370,16 @@ impl AiPanel {
                 )
                 .into_any_element()
             }
-            super::client::AssistantStep::Tool { name, args, done, result, .. } => {
+            super::client::AssistantStep::Tool { name, args, done, error, result, .. } => {
                 let open = self.open_done_steps.contains(&key);
-                let body_text = tool_body_text(name, args, result);
-                let status = if *done { "✓" } else { "⏳" };
-                let status_color = if *done { rgb(0x2f9e44) } else { rgb(0x999999) };
+                let body_text = tool_body_text(name, args, result, *error);
+                let (status, status_color) = if !*done {
+                    ("⏳", rgb(0x999999))
+                } else if *error {
+                    ("✕", rgb(0xc92a2a))
+                } else {
+                    ("✓", rgb(0x2f9e44))
+                };
                 let (title, title_color) = tool_header(name, args);
                 step_toggle(
                     ElementId::named_usize("tool-toggle-done", msg_idx * 100000 + step_idx),
@@ -1564,6 +1607,7 @@ enum ToolOp {
     Add,
     Update,
     Delete,
+    Clear,
     Query,
     Other,
 }
@@ -1574,6 +1618,7 @@ fn tool_op(name: &str) -> ToolOp {
         | "draw_arrow" | "draw_text" => ToolOp::Add,
         "update_element" => ToolOp::Update,
         "delete_element" => ToolOp::Delete,
+        "clear_canvas" => ToolOp::Clear,
         "list_elements" => ToolOp::Query,
         _ => ToolOp::Other,
     }
@@ -1585,6 +1630,7 @@ impl ToolOp {
             ToolOp::Add => "➕",
             ToolOp::Update => "✎",
             ToolOp::Delete => "🗑",
+            ToolOp::Clear => "🧹",
             ToolOp::Query => "📋",
             ToolOp::Other => "🔧",
         }
@@ -1594,6 +1640,7 @@ impl ToolOp {
             ToolOp::Add => "新增",
             ToolOp::Update => "修改",
             ToolOp::Delete => "删除",
+            ToolOp::Clear => "清空",
             ToolOp::Query => "查询",
             ToolOp::Other => "操作",
         }
@@ -1603,6 +1650,7 @@ impl ToolOp {
             ToolOp::Add => rgb(0x2f9e44),   // green
             ToolOp::Update => rgb(0x1a5fd7), // blue
             ToolOp::Delete => rgb(0xc92a2a), // red
+            ToolOp::Clear => rgb(0xc92a2a),  // red
             ToolOp::Query => rgb(0x888888),  // gray
             ToolOp::Other => rgb(0x1a5fd7),
         }
@@ -1634,6 +1682,7 @@ fn tool_header(name: &str, args: &serde_json::Value) -> (String, Rgba) {
             }
         }
         ToolOp::Delete => format!("{} {} #{}", op.icon(), op.verb(), short_id(args)),
+        ToolOp::Clear => format!("{} {}画布", op.icon(), op.verb()),
         ToolOp::Query => format!("{} {}元素", op.icon(), op.verb()),
         ToolOp::Other => format!("{} {}{}", op.icon(), op.verb(), tool_label(name)),
     };
@@ -1659,6 +1708,7 @@ fn update_change_preview(args: &serde_json::Value) -> String {
     let x = obj.get("x").and_then(|v| v.as_f64());
     let y = obj.get("y").and_then(|v| v.as_f64());
     let text = obj.get("text").and_then(|v| v.as_str());
+    let font_size = obj.get("font_size").and_then(|v| v.as_f64());
     let mut parts = Vec::new();
     if let (Some(x), Some(y)) = (x, y) {
         parts.push(format!("位置 ({x:.0},{y:.0})"));
@@ -1670,6 +1720,14 @@ fn update_change_preview(args: &serde_json::Value) -> String {
         } else {
             parts.push(format!("文字「{one_line}」"));
         }
+    }
+    if let Some(fs) = font_size {
+        parts.push(format!("字号 {fs:.0}"));
+    }
+    if let Some(style) = obj.get("style").and_then(|v| v.as_object()) {
+        let stroke = color_hex(style.get("stroke")).map(|c| format!("描边 {c}"));
+        let fill = color_hex(style.get("fill")).map(|c| format!("填充 {c}"));
+        parts.extend([stroke, fill].into_iter().flatten());
     }
     parts.join(" ")
 }
@@ -1916,11 +1974,22 @@ fn tool_chip_preview(name: &str, args: &serde_json::Value) -> String {
                 String::new()
             }
         }
-        "draw_rectangle" | "draw_ellipse" | "draw_diamond"
-        | "draw_line" | "draw_arrow" => {
+        "draw_rectangle" | "draw_ellipse" | "draw_diamond" => {
             let (x, y) = (f("x"), f("y"));
             if let (Some(x), Some(y)) = (x, y) {
                 format!("({x:.0},{y:.0})")
+            } else {
+                String::new()
+            }
+        }
+        "draw_line" | "draw_arrow" => {
+            let n = obj
+                .get("points")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            if n > 0 {
+                format!("{n} 点")
             } else {
                 String::new()
             }
@@ -1931,13 +2000,13 @@ fn tool_chip_preview(name: &str, args: &serde_json::Value) -> String {
 
 /// Build the full expanded-body text for a tool step: the friendly parameter
 /// description, plus the tool's result text (if any, e.g. "已添加到画布").
-fn tool_body_text(name: &str, args: &serde_json::Value, result: &str) -> String {
+fn tool_body_text(name: &str, args: &serde_json::Value, result: &str, error: bool) -> String {
     let mut out = tool_call_detail(name, args);
     if !result.is_empty() {
         if !out.is_empty() {
             out.push('\n');
         }
-        out.push_str("→ ");
+        out.push_str(if error { "→ ✕ " } else { "→ ✓ " });
         out.push_str(result);
     }
     out
@@ -2005,6 +2074,7 @@ fn tool_call_detail(name: &str, args: &serde_json::Value) -> String {
             out
         }
         "delete_element" => format!("元素 #{}", short_id(args)),
+        "clear_canvas" => "清空画布上的所有元素".to_string(),
         "list_elements" => "查询画布上的所有元素".to_string(),
         _ => String::new(),
     };
@@ -2105,15 +2175,27 @@ mod tests {
     }
 
     #[test]
+    fn chip_preview_shows_point_count_for_line() {
+        let args = serde_json::from_str(
+            r#"{"points":[{"x":0.0,"y":0.0},{"x":1.0,"y":1.0},{"x":2.0,"y":0.0}]}"#,
+        )
+        .unwrap();
+        assert_eq!(tool_chip_preview("draw_arrow", &args), "3 点");
+    }
+
+    #[test]
     fn body_text_appends_result_when_present() {
         let args = serde_json::from_str(r#"{"x":100.0,"y":200.0,"w":120.0,"h":60.0}"#).unwrap();
         // No result -> just the detail, no arrow.
-        let without = tool_body_text("draw_rectangle", &args, "");
-        assert!(!without.contains("\u{2192} 已添加到画布"));
-        // With result -> detail + "-> 已添加到画布" on a new line.
-        let with = tool_body_text("draw_rectangle", &args, "已添加到画布");
+        let without = tool_body_text("draw_rectangle", &args, "", false);
+        assert!(!without.contains("已添加到画布"));
+        // Success result -> detail + "→ ✓ 已添加到画布".
+        let with = tool_body_text("draw_rectangle", &args, "已添加到画布", false);
         assert!(with.contains("矩形"));
-        assert!(with.contains("\u{2192} 已添加到画布"));
+        assert!(with.contains("→ ✓ 已添加到画布"));
+        // Error result is marked with ✕.
+        let err = tool_body_text("update_element", &args, "找不到元素 id=abc", true);
+        assert!(err.contains("→ ✕ 找不到元素 id=abc"));
     }
 
     #[test]
@@ -2149,6 +2231,11 @@ mod tests {
         // Query needs no args.
         let (title, _) = tool_header("list_elements", &serde_json::Value::Null);
         assert_eq!(title, "📋 查询元素");
+
+        // Clear canvas.
+        let (title, _) = tool_header("clear_canvas", &serde_json::Value::Null);
+        assert_eq!(title, "🧹 清空画布");
+        assert_eq!(tool_op("clear_canvas"), ToolOp::Clear);
     }
 
     #[test]

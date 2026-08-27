@@ -39,6 +39,11 @@ pub enum AssistantStep {
         args: serde_json::Value,
         #[serde(default = "default_tool_done")]
         done: bool,
+        /// True when the tool call failed (its result is an error, not a
+        /// success). Persisted so a reloaded conversation keeps the red error
+        /// state. Defaults false for legacy steps.
+        #[serde(default)]
+        error: bool,
         #[serde(skip)]
         id: String,
         /// The tool's result text (e.g. "已添加到画布"), set when the matching
@@ -137,6 +142,7 @@ impl ChatMessage {
                 name: name.clone(),
                 args: serde_json::Value::Null,
                 done: true,
+                error: false,
                 id: String::new(),
                 result: String::new(),
             });
@@ -198,6 +204,7 @@ mod tests {
                 name: "draw_rectangle".into(),
                 args: serde_json::json!({ "x": 10.0, "y": 20.0, "w": 100.0, "h": 50.0 }),
                 done: true,
+                error: false,
                 id: String::new(),
                 result: String::new(),
             },
@@ -206,6 +213,7 @@ mod tests {
                 name: "draw_arrow".into(),
                 args: serde_json::json!({ "points": [{"x":0.0,"y":0.0},{"x":1.0,"y":1.0}] }),
                 done: false,
+                error: false,
                 id: String::new(),
                 result: String::new(),
             },

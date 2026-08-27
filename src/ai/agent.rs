@@ -13,7 +13,7 @@
 //! others update the UI).
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context as _};
 use futures::channel::mpsc::UnboundedSender;
@@ -25,7 +25,7 @@ use rig_core::message::Message as RigMessage;
 use rig_core::providers::openai::{self, Client as OpenAIClient};
 use rig_core::streaming::{StreamedAssistantContent, StreamingChat};
 
-use super::canvas_ops::CanvasOp;
+use super::canvas_ops::{CanvasOp, CanvasOpOutcome};
 use super::client::ChatMessage;
 use super::settings::AiSettings;
 use super::tools::all_tools;
@@ -51,41 +51,61 @@ pub type StreamItem = MultiTurnStreamItem<<Model as rig_core::completion::Comple
 /// System prompt for the drawing agent. Describes the coordinate system,
 /// available tools, and the expectation that the agent draws rather than only
 /// narrating.
-pub const SYSTEM_PROMPT: &str = r##"你是 boundless 白板应用的绘图助手。你的核心职责是通过调用绘图工具把内容画到画布上。
+pub const SYSTEM_PROMPT: &str = r##"你是 boundless 白板应用的绘图助手。你的核心职责是通过调用绘图工具把内容直接画到画布上，而不是只做文字说明。
+
+## 角色与完成标准
+- 你把用户的描述变成画布上可读、完整、无交叉的图形（流程图、架构图、示意图、概念图等）。
+- 完成标准：图形结构完整、节点都有文字、连线方向明确、布局不重叠不交叉、文字不溢出框外、说明简洁。
+- 只有当图形达到以上标准时，才算真正完成；不要画到一半就当作结束。
 
 ## 行动准则
 1. 用户提到任何图表、流程图、示意图时，**立即调用绘图工具**，不要只回复文字。
 2. 先画图，后说明。哪怕只画出一部分也比只说不画好。
 3. **禁止只说「马上开始」「我来画」之类的话却不调用工具**——你的回复里必须包含至少一次工具调用，否则视为失败。
 4. 用户的请求如果比较模糊（如「画一幅画」「随便画点东西」），不要追问或只口头规划，**直接选一个合理主题（如简单流程图、示意图）开始画**。
-5. 每次调用一个工具，简短思考下一步，再调下一个。用户能看到你的每一步操作。
-6. 用中文简要说明你画了什么，不要逐条复述坐标。
+5. 先规划后落笔：在开始画之前，先在思考里定下每个节点的位置和每条线的起止点，再逐笔调用工具；不要没想好布局就连续乱画。
+6. 每次只调用一个绘图工具，简短思考下一步再调下一个（用户能看到你的每一步操作）。
+7. 画错优先用 update_element 修正（改位置或文字），不要删除重画；只有需要整体重来时才用 delete_element。
+8. 工具调用失败或结果异常时，先判断原因（坐标越界、id 写错、样式不合法），修正后再试；不要机械重复完全相同的调用。
+9. 用中文简要说明你画了什么，不要逐条复述坐标。
+
+## 禁止行为
+- 禁止只复述需求而不画图。
+- 禁止把多个元素画在同一位置导致重叠。
+- 禁止让连线穿过其他形状的内部。
+- 禁止画错后反复删除重画（应先 update 修正）。
+- 禁止两个判断分支都朝同一方向导致交叉。
 
 ## 工具说明
-- draw_ellipse(x, y, w, h, text?)：画椭圆。用 text 参数写内部文字，如「开始」「结束」。
-- draw_rectangle(x, y, w, h, text?)：画矩形。用 text 参数写步骤名，如「输入用户名和密码」。
-- draw_diamond(x, y, w, h, text?)：画菱形（判断节点）。用 text 参数写条件，如「密码正确？」。
-- draw_arrow(points, text?)：画带箭头的连线，points 是两个或更多坐标点。用于连接流程节点。\
-用 text 参数在线上标注条件，如「是」「否」。
+每个 draw_* 工具会返回元素的短 id（如 a1b2c3d4），后续用 update_element / delete_element 引用；list_elements 可随时查询画布现状。
+
+- draw_rectangle(x, y, w, h, text?)：画矩形。x/y 是左上角，w/h 是宽高。text 写步骤名，如「输入用户名和密码」。
+- draw_ellipse(x, y, w, h, text?)：画椭圆（起止/圆角节点）。text 写内部文字，如「开始」「结束」。
+- draw_diamond(x, y, w, h, text?)：画菱形（判断节点）。text 写条件，如「密码正确？」。
+- draw_arrow(points, text?)：画带箭头的连线，points 是两个或更多坐标点，默认末端箭头。用于连接流程节点；text 在线上标注条件，如「是」「否」。
 - draw_line(points, text?)：画无箭头的连线。同样支持 text 参数标注。
 - draw_text(x, y, text)：画独立文本，用于标题或说明（不属于任何形状的文字）。
-- update_element(id, x?, y?, text?)：修改已有元素的位置或文字。画错了可以用它修正，不必删除重画。
+- update_element(id, x?, y?, text?, style?, font_size?)：修改已有元素——移动（x/y）、改文字（text）、改样式（style，只改提供的字段）或改字号（font_size，仅文本）。画错了优先用它修正，不必删除重画。
 - delete_element(id)：删除一个元素（及其标签）。
-- list_elements()：查询画布上所有元素的 ID、类型、文字和位置。
-- 以上绘图工具均可省略 style，沿用画板当前样式。
-- 每个 draw_* 工具会返回元素的 id（如 id=a1b2c3d4），后续可用 update_element 或 delete_element 引用。
+- clear_canvas()：清空画布上的所有元素。用户要求「重新开始」「全部重画」时使用。
+- list_elements()：列出画布所有元素的 id、类型、文字和位置，用于查询现状和完成前自检。
+- 所有 draw_* 与 update_element 均可省略 style，沿用画板当前样式；style 可选字段：stroke（描边 0xRRGGBB）、fill（填充）、stroke_width（线宽）、roughness（粗糙度 0~2）、opacity（透明度 0~1）。
 
-## 画布坐标系
+## 画布坐标系与尺寸
 - 原点在左上角，x 向右增大，y 向下增大。可见范围约 x∈[0,1600]、y∈[0,1000]。
 - 典型矩形宽 140~180、高 60~80。元素间距 30~40，不要重叠。
+- 同一层级/同一类节点尺寸保持一致，节点中心对齐或左对齐，避免忽大忽小、参差不齐。
 - 颜色用 0xRRGGBB 整数，如 0x1e1e1e（黑色）、0xa5d8ff（浅蓝）。省略则用默认黑色描边。
 
 ## 布局规则（避免连线交叉）
 - 主流程从上到下排列，分支向左右两侧展开，不要让连线跨越其他形状。
 - 判断节点（菱形）的两个分支：一个向下（主路径），一个向左或向右（支路径），不要两个分支都向下交叉。
 - 回环线（如"失败后回到输入"）走外侧绕行，不要穿过中间的形状。用多个折线点让线绕开障碍。
-- 箭头端点对齐到形状的边缘（上边中点、下边中点、左边中点、右边中点），不要连到形状内部。
+- 箭头端点对齐到形状的边缘中点（上/下/左/右中点），不要连到形状内部。
 - 先规划好所有形状的位置，再画连线——这样你知道每条线的起点和终点在哪里，能避免交叉。
+
+## 完成前自检
+画完后调用一次 list_elements 核对：节点是否齐全、是否有重叠、连线是否交叉、文字是否溢出。发现问题用 update_element 修正后再结束。
 
 ## 流程图范例
 画一个登录流程图，你会这样调用：
@@ -110,20 +130,22 @@ pub struct AgentRequest {
 }
 
 /// Events surfaced to the UI from an agent stream.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum AgentEvent {
     /// A chunk of assistant text (streamed).
     Delta(String),
     /// A chunk of reasoning/thinking text (streamed). Shown in a collapsible
     /// panel that is expanded while streaming and auto-collapses on Done.
     Reasoning(String),
-    /// A canvas op produced by a tool call — apply it to the board.
-    /// `pre_assigned_id` is the UUID the tool generated for this element (so
-    /// the tool can report it back to the model); `apply_canvas_op` uses it as
-    /// the element's id on create ops. None for non-create ops (update/delete).
+    /// A canvas op produced by a tool call — apply it to the board and reply
+    /// through `reply` with the authoritative outcome. `pre_assigned_id` is the
+    /// UUID the tool generated for this element (so the tool can report it back
+    /// to the model); `apply_canvas_op` uses it as the element's id on create
+    /// ops. None for non-create ops (update/delete).
     CanvasOp {
         op: CanvasOp,
         pre_assigned_id: Option<uuid::Uuid>,
+        reply: futures::channel::oneshot::Sender<CanvasOpOutcome>,
     },
     /// The model made a tool call. `id` is rig's internal call id (used to pair
     /// with the later [`AgentEvent::ToolResult`]); `name` is the tool, `args` is
@@ -136,8 +158,9 @@ pub enum AgentEvent {
     },
     /// A tool call finished executing. `id` matches the `ToolCall` event's `id`
     /// so the UI can mark the corresponding step done; `result` is the tool's
-    /// return text (e.g. "已添加到画布").
-    ToolResult { id: String, result: String },
+    /// return text (e.g. "已添加到画布"), and `is_error` marks a failure (e.g.
+    /// a validation rejection or a missing element id).
+    ToolResult { id: String, result: String, is_error: bool },
     /// Stream completed; `text` is the full final assistant message.
     /// `drew_anything` is true if at least one tool call was made this turn —
     /// the UI uses it to warn when the model replied without drawing.
@@ -155,7 +178,7 @@ impl BoundlessAgent {
     fn build(
         settings: &AiSettings,
         events: UnboundedSender<AgentEvent>,
-        snapshot: Arc<Vec<super::tools::ElementSnapshot>>,
+        snapshot: Arc<Mutex<Vec<super::tools::ElementSnapshot>>>,
     ) -> anyhow::Result<rig_core::agent::Agent<Model>> {
         if settings.api_key.is_empty() {
             return Err(anyhow!(
@@ -204,11 +227,18 @@ impl BoundlessAgent {
         settings: &AiSettings,
         prompt: String,
         history: Vec<ChatMessage>,
-        snapshot: Arc<Vec<super::tools::ElementSnapshot>>,
+        snapshot: Arc<Mutex<Vec<super::tools::ElementSnapshot>>>,
+        runtime_context: String,
     ) -> anyhow::Result<AgentRequest> {
         let (tx, rx) = futures::channel::mpsc::unbounded();
         let agent = Self::build(settings, tx.clone(), snapshot)?;
         let chat_history: Vec<RigMessage> = history.into_iter().filter_map(msg_to_rig).collect();
+
+        // Prepend the fresh canvas snapshot as a user-role runtime context so
+        // the model sees current state without a list_elements round-trip. It
+        // is rebuilt every turn, so an earlier snapshot is superseded rather
+        // than accumulating in the stored history.
+        let prompt = with_runtime_context(prompt, &runtime_context);
 
         // stream_chat(prompt, history) returns a StreamingPromptRequest;
         // `.multi_turn(N)` raises the tool-calling depth, then awaiting it
@@ -346,6 +376,23 @@ fn msg_to_rig(m: ChatMessage) -> Option<RigMessage> {
     }
 }
 
+/// Header for the per-turn runtime-context snapshot, mirroring the harness
+/// convention that each snapshot supersedes earlier ones (so stale state never
+/// accumulates across turns).
+const RUNTIME_CONTEXT_HEADER: &str =
+    "当前画布运行时上下文。此快照取代之前的所有运行时上下文快照。";
+
+/// Prepend the fresh runtime context to the user's message. Empty context is a
+/// no-op so a failure to snapshot the board never blocks the request.
+fn with_runtime_context(prompt: String, runtime_context: &str) -> String {
+    let ctx = runtime_context.trim();
+    if ctx.is_empty() {
+        prompt
+    } else {
+        format!("{RUNTIME_CONTEXT_HEADER}\n\n{ctx}\n\n{prompt}")
+    }
+}
+
 // Keep the GetTokenUsage / StreamingChoice imports referenced even if the
 // generic bounds shift across rig versions.
 #[allow(dead_code)]
@@ -365,5 +412,26 @@ mod tests {
         let mut weird = ChatMessage::user("x");
         weird.role = "tool".into();
         assert!(msg_to_rig(weird).is_none());
+    }
+
+    #[test]
+    fn runtime_context_prepends_once_and_omits_when_empty() {
+        // Empty context is a no-op: the user's message passes through unchanged.
+        assert_eq!(
+            with_runtime_context("画个流程图".into(), ""),
+            "画个流程图"
+        );
+        assert_eq!(
+            with_runtime_context("画个流程图".into(), "   \n"),
+            "画个流程图"
+        );
+
+        // Non-empty context is prepended once, header first, prompt last.
+        let out = with_runtime_context("画个流程图".into(), "画布为空，尚无任何元素。");
+        assert!(out.starts_with(RUNTIME_CONTEXT_HEADER));
+        assert!(out.contains("画布为空，尚无任何元素。"));
+        assert!(out.ends_with("画个流程图"));
+        // Header appears exactly once (the context is never duplicated).
+        assert_eq!(out.matches(RUNTIME_CONTEXT_HEADER).count(), 1);
     }
 }

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use gpui::prelude::*;
 use gpui::*;
 
-use crate::ai::canvas_ops::{CanvasOp, CanvasStyle};
+use crate::ai::canvas_ops::{CanvasOp, CanvasOpError, CanvasOpOutcome, CanvasStyle};
 use crate::ai::panel::AiPanel;
 use crate::camera::Camera;
 use crate::history::History;
@@ -641,58 +641,80 @@ impl BoardView {
         op: CanvasOp,
         pre_assigned_id: Option<uuid::Uuid>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> CanvasOpOutcome {
         // Merge the op's optional style over the board's current style so that
         // omitted fields inherit "last used wins" — the same behavior as a
         // hand-drawn shape.
         let style = self.style.clone();
         let styled = |s: CanvasStyle| CanvasStyle::merge_into(s, style);
 
-        // Where to center the viewport-relative origin (used only to extend a
-        // bounds-less op; box/text ops carry absolute coordinates already).
-        let _center_world = self.viewport_center_world();
-
-        // History is recorded once per op, so each AI-drawn element is an
-        // independent undo step.
-        self.history.record(&self.scene);
-
-        match op {
+        let outcome: CanvasOpOutcome = match op {
             CanvasOp::Rectangle { x, y, w, h, style, text } => {
-                let el = Element::new_with_id(pre_assigned_id.unwrap_or_default(), ElementKind::Rectangle, WBounds::new(x, y, w, h), styled(style));
-                let id = self.scene.add(el);
-                if let Some(t) = text.filter(|t| !t.is_empty()) {
-                    self.add_bound_label(id, WBounds::new(x, y, w, h), t);
+                if !(w > 0.0 && h > 0.0) {
+                    return Err(CanvasOpError::invalid_args("矩形宽高必须为正数"));
                 }
+                let Some(id) = pre_assigned_id else {
+                    return Err(CanvasOpError::internal("内部错误：缺少元素 ID"));
+                };
+                self.history.record(&self.scene);
+                let el = Element::new_with_id(id, ElementKind::Rectangle, WBounds::new(x, y, w, h), styled(style));
+                let added = self.scene.add(el);
+                if let Some(t) = text.filter(|t| !t.is_empty()) {
+                    self.add_bound_label(added, WBounds::new(x, y, w, h), t);
+                }
+                Ok(format!("已添加矩形 id={}", &added.to_string()[..8]))
             }
             CanvasOp::Ellipse { x, y, w, h, style, text } => {
-                let el = Element::new_with_id(pre_assigned_id.unwrap_or_default(), ElementKind::Ellipse, WBounds::new(x, y, w, h), styled(style));
-                let id = self.scene.add(el);
-                if let Some(t) = text.filter(|t| !t.is_empty()) {
-                    self.add_bound_label(id, WBounds::new(x, y, w, h), t);
+                if !(w > 0.0 && h > 0.0) {
+                    return Err(CanvasOpError::invalid_args("椭圆宽高必须为正数"));
                 }
+                let Some(id) = pre_assigned_id else {
+                    return Err(CanvasOpError::internal("内部错误：缺少元素 ID"));
+                };
+                self.history.record(&self.scene);
+                let el = Element::new_with_id(id, ElementKind::Ellipse, WBounds::new(x, y, w, h), styled(style));
+                let added = self.scene.add(el);
+                if let Some(t) = text.filter(|t| !t.is_empty()) {
+                    self.add_bound_label(added, WBounds::new(x, y, w, h), t);
+                }
+                Ok(format!("已添加椭圆 id={}", &added.to_string()[..8]))
             }
             CanvasOp::Diamond { x, y, w, h, style, text } => {
-                let el = Element::new_with_id(pre_assigned_id.unwrap_or_default(), ElementKind::Diamond, WBounds::new(x, y, w, h), styled(style));
-                let id = self.scene.add(el);
-                if let Some(t) = text.filter(|t| !t.is_empty()) {
-                    self.add_bound_label(id, WBounds::new(x, y, w, h), t);
+                if !(w > 0.0 && h > 0.0) {
+                    return Err(CanvasOpError::invalid_args("菱形宽高必须为正数"));
                 }
+                let Some(id) = pre_assigned_id else {
+                    return Err(CanvasOpError::internal("内部错误：缺少元素 ID"));
+                };
+                self.history.record(&self.scene);
+                let el = Element::new_with_id(id, ElementKind::Diamond, WBounds::new(x, y, w, h), styled(style));
+                let added = self.scene.add(el);
+                if let Some(t) = text.filter(|t| !t.is_empty()) {
+                    self.add_bound_label(added, WBounds::new(x, y, w, h), t);
+                }
+                Ok(format!("已添加菱形 id={}", &added.to_string()[..8]))
             }
             CanvasOp::Line { points, style, text } => {
                 let pts: Vec<WPoint> = points.into_iter().map(Into::into).collect();
-                if pts.len() >= 2 {
-                    let el = Element::from_absolute_points_with_id(
-                        pre_assigned_id.unwrap_or_default(),
-                        |p| ElementKind::Line { points: p },
-                        pts,
-                        styled(style),
-                    );
-                    let bounds = el.bounds;
-                    let id = self.scene.add(el);
-                    if let Some(t) = text.filter(|t| !t.is_empty()) {
-                        self.add_bound_label(id, bounds, t);
-                    }
+                if pts.len() < 2 {
+                    return Err(CanvasOpError::invalid_args("至少需要两个坐标点"));
                 }
+                let Some(id) = pre_assigned_id else {
+                    return Err(CanvasOpError::internal("内部错误：缺少元素 ID"));
+                };
+                self.history.record(&self.scene);
+                let el = Element::from_absolute_points_with_id(
+                    id,
+                    |p| ElementKind::Line { points: p },
+                    pts,
+                    styled(style),
+                );
+                let bounds = el.bounds;
+                let added = self.scene.add(el);
+                if let Some(t) = text.filter(|t| !t.is_empty()) {
+                    self.add_bound_label(added, bounds, t);
+                }
+                Ok(format!("已添加直线 id={}", &added.to_string()[..8]))
             }
             CanvasOp::Arrow {
                 points,
@@ -702,23 +724,29 @@ impl BoardView {
                 text,
             } => {
                 let pts: Vec<WPoint> = points.into_iter().map(Into::into).collect();
-                if pts.len() >= 2 {
-                    let el = Element::from_absolute_points_with_id(
-                        pre_assigned_id.unwrap_or_default(),
-                        |p| ElementKind::Arrow {
-                            points: p,
-                            start_arrowhead,
-                            end_arrowhead,
-                        },
-                        pts,
-                        styled(style),
-                    );
-                    let bounds = el.bounds;
-                    let id = self.scene.add(el);
-                    if let Some(t) = text.filter(|t| !t.is_empty()) {
-                        self.add_bound_label(id, bounds, t);
-                    }
+                if pts.len() < 2 {
+                    return Err(CanvasOpError::invalid_args("至少需要两个坐标点"));
                 }
+                let Some(id) = pre_assigned_id else {
+                    return Err(CanvasOpError::internal("内部错误：缺少元素 ID"));
+                };
+                self.history.record(&self.scene);
+                let el = Element::from_absolute_points_with_id(
+                    id,
+                    |p| ElementKind::Arrow {
+                        points: p,
+                        start_arrowhead,
+                        end_arrowhead,
+                    },
+                    pts,
+                    styled(style),
+                );
+                let bounds = el.bounds;
+                let added = self.scene.add(el);
+                if let Some(t) = text.filter(|t| !t.is_empty()) {
+                    self.add_bound_label(added, bounds, t);
+                }
+                Ok(format!("已添加箭头 id={}", &added.to_string()[..8]))
             }
             CanvasOp::Text {
                 x,
@@ -728,13 +756,15 @@ impl BoardView {
                 align,
                 style,
             } => {
+                let Some(id) = pre_assigned_id else {
+                    return Err(CanvasOpError::internal("内部错误：缺少元素 ID"));
+                };
                 let fs = font_size.unwrap_or(self.text_font_size).max(4.0);
                 let ta = align.map(Into::into).unwrap_or(self.text_align);
+                self.history.record(&self.scene);
                 let mut el = Element::new_text(WPoint::new(x, y), text, styled(style));
                 // Override the auto-generated id with the pre-assigned one.
-                if let Some(id) = pre_assigned_id {
-                    el.id = id;
-                }
+                el.id = id;
                 if let ElementKind::Text {
                     font_size: ref mut fs2,
                     text_align: ref mut ta2,
@@ -753,17 +783,21 @@ impl BoardView {
                     .unwrap_or(1);
                 el.bounds.w = (max_chars as f64 * fs).max(1.0);
                 el.bounds.h = lines as f64 * fs * LINE_HEIGHT;
-                let id = self.scene.add(el);
-                self.pending_measure.push(id);
+                let added = self.scene.add(el);
+                self.pending_measure.push(added);
+                Ok(format!("已添加文本 id={}", &added.to_string()[..8]))
             }
-            CanvasOp::UpdateElement { id, x, y, text } => {
+            CanvasOp::UpdateElement { id, x, y, text, style, font_size } => {
                 // The model only knows the 8-char id prefix draw tools report
                 // back, so resolve by prefix (also accepts a full UUID).
                 let Some(uuid) = self.scene.find_by_id_prefix(&id) else {
-                    return;
+                    return Err(CanvasOpError::not_found(format!("找不到元素 id={id}")));
                 };
-                // Phase 1: update position (needs a mutable borrow of the element).
+                self.history.record(&self.scene);
+                // Phase 1: update position / style / font size (needs a mutable
+                // borrow of the element).
                 let mut needs_label_update = false;
+                let mut remeasure = false;
                 if let Some(el) = self.scene.get_mut(uuid) {
                     if let Some(nx) = x {
                         el.bounds.x = nx;
@@ -771,6 +805,10 @@ impl BoardView {
                     if let Some(ny) = y {
                         el.bounds.y = ny;
                     }
+                    // Style override: omitted fields keep the element's current
+                    // style (same "last used wins" overlay as a fresh draw).
+                    let base = el.style.clone();
+                    el.style = style.merge_into(base);
                     // Determine if this is a standalone text element.
                     if let Some(nt) = &text {
                         if let ElementKind::Text { text: ref mut t, .. } = el.kind {
@@ -779,6 +817,16 @@ impl BoardView {
                             needs_label_update = true;
                         }
                     }
+                    // font_size applies only to text elements.
+                    if let Some(fs) = font_size {
+                        if let ElementKind::Text { font_size: ref mut f, .. } = el.kind {
+                            *f = fs.max(4.0);
+                            remeasure = true;
+                        }
+                    }
+                }
+                if remeasure {
+                    self.pending_measure.push(uuid);
                 }
                 // Phase 2: if the element is a shape (not Text), update or
                 // create its bound label. Done in a separate scope so the
@@ -822,15 +870,29 @@ impl BoardView {
                         }
                     }
                 }
+                Ok(format!("已更新元素 id={}", &uuid.to_string()[..8]))
             }
             CanvasOp::DeleteElement { id } => {
-                if let Some(uuid) = self.scene.find_by_id_prefix(&id) {
-                    self.remove_element(uuid);
-                }
+                let Some(uuid) = self.scene.find_by_id_prefix(&id) else {
+                    return Err(CanvasOpError::not_found(format!("找不到元素 id={id}")));
+                };
+                self.history.record(&self.scene);
+                self.remove_element(uuid);
+                Ok(format!("已删除元素 id={}", &uuid.to_string()[..8]))
             }
+            CanvasOp::Clear => {
+                self.history.record(&self.scene);
+                self.scene.restore(Vec::new());
+                self.selection.clear();
+                self.editing = None;
+                Ok("已清空画布".to_string())
+            }
+        };
+        if outcome.is_ok() {
+            self.mark_dirty();
+            cx.notify();
         }
-        self.mark_dirty();
-        cx.notify();
+        outcome
     }
 
     /// Create a bound text label centered inside a container shape. Mirrors
@@ -902,8 +964,72 @@ impl BoardView {
         }).collect()
     }
 
+    /// Build the per-turn runtime-context snapshot the AI agent sees before it
+    /// draws: the visible world region, the current canvas contents, and the
+    /// style that omitted `style` fields inherit. Mirrors the harness pattern
+    /// of injecting dynamic state as a fresh snapshot each turn (so the model
+    /// never acts on stale state) instead of baking it into the static system
+    /// prompt. The "supersedes earlier snapshots" header is added by the agent.
+    pub fn runtime_context(&self) -> String {
+        let mut body = String::new();
+
+        // Visible world region so the agent draws on-screen instead of at the
+        // hardcoded [0,1600]x[0,1000] the system prompt uses as a fallback.
+        let origin = self.canvas_origin();
+        if self.canvas_bounds.size.width.to_f64() > 0.0
+            && self.canvas_bounds.size.height.to_f64() > 0.0
+        {
+            let br_screen = point(
+                origin.x + self.canvas_bounds.size.width,
+                origin.y + self.canvas_bounds.size.height,
+            );
+            let tl = self.camera.screen_to_world(origin, origin);
+            let br = self.camera.screen_to_world(br_screen, origin);
+            body.push_str(&format!(
+                "可见区域（世界坐标）：x∈[{:.0}, {:.0}]，y∈[{:.0}, {:.0}]，缩放 {:.0}%\n",
+                tl.x, br.x, tl.y, br.y, self.camera.zoom * 100.0
+            ));
+        }
+
+        let snapshots = self.element_snapshot();
+        if snapshots.is_empty() {
+            body.push_str("画布为空，尚无任何元素。\n");
+        } else {
+            body.push_str(&format!("画布现有 {} 个元素：\n", snapshots.len()));
+            for (i, e) in snapshots.iter().enumerate() {
+                body.push_str(&format!("{}. {}\n", i + 1, e.summary()));
+            }
+        }
+
+        body.push_str(&self.style_summary());
+        body
+    }
+
+    /// One-line summary of the board's live style, for the runtime context.
+    fn style_summary(&self) -> String {
+        let s = &self.style;
+        let fill = match s.background {
+            Some(c) => format!("#{c:06x}"),
+            None => "无填充".to_string(),
+        };
+        let dash = match s.stroke_style {
+            StrokeStyle::Solid => "实线",
+            StrokeStyle::Dashed => "虚线",
+        };
+        let opacity = if (s.opacity - 1.0).abs() < 0.001 {
+            "不透明".to_string()
+        } else {
+            format!("透明度 {:.0}%", s.opacity * 100.0)
+        };
+        format!(
+            "当前样式：描边 #{:06x}、线宽 {:.0}、粗糙度 {:.1}、{}、{}、{}",
+            s.stroke, s.stroke_width, s.roughness, dash, fill, opacity
+        )
+    }
+
     /// World-space point at the center of the visible canvas. Kept for future
     /// auto-layout use; box/text ops currently carry absolute coordinates.
+    #[allow(dead_code)]
     fn viewport_center_world(&self) -> WPoint {
         let center_screen = point(
             self.canvas_bounds.origin.x + self.canvas_bounds.size.width * 0.5,
