@@ -47,11 +47,10 @@ jobs:
 
   warm:
     needs: test
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.head_commit != null &&
-       !startsWith(github.event.head_commit.message, 'chore: bump version') &&
-       contains(join(github.event.head_commit.added, ' ') + ' ' + join(github.event.head_commit.modified, ' ') + ' ' + join(github.event.head_commit.removed, ' '), 'Cargo.lock'))
+    # Single line on purpose: a folded (>-) multi-line `if` with uneven
+    # continuation indentation keeps literal newlines, which GitHub's
+    # job-level expression parser rejects (the whole file goes invalid).
+    if: github.event_name == 'workflow_dispatch' || (github.event.head_commit != null && !startsWith(github.event.head_commit.message, 'chore: bump version') && contains(join(github.event.head_commit.added, ' ') + join(github.event.head_commit.modified, ' ') + join(github.event.head_commit.removed, ' '), 'Cargo.lock'))
     strategy:
       fail-fast: false
       matrix:
