@@ -12,6 +12,7 @@
 //! toolbar highlight (both are derived from the same value in board.rs).
 
 use gpui::{CursorStyle, Window};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 /// Apply `style` to the system cursor immediately.
 ///
@@ -46,8 +47,8 @@ pub fn set_app_icon() {
 
 #[cfg(target_os = "macos")]
 fn set_app_icon_macos() -> Result<(), String> {
-    use objc::{class, msg_send, sel, sel_impl};
     use objc::runtime::Object;
+    use objc::{class, msg_send, sel, sel_impl};
     use std::ffi::c_void;
 
     // Embedded at compile time so the binary is self-contained (no external
@@ -215,4 +216,243 @@ fn start_window_drag_windows(window: &Window) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Stylus pressure (Windows Ink / WM_POINTER)
+//
+// GPUI 0.2.2 has no pressure in its event model and its Windows backend only
+// handles legacy WM_MOUSE* messages — when a stylus draws, the digitizer's
+// WM_POINTER packets are simply ignored and everything arrives as synthetic
+// mouse input with the pressure thrown away.
+//
+// This hook recovers that data without touching gpui: the gpui window is
+// *subclassed* and the pointer messages are only observed (pressure stashed
+// into lock-free atomics), never consumed. Every packet is forwarded to the
+// original proc, whose DefWindowProc translates pointer input into the legacy
+// mouse messages gpui's event loop is built on — so gpui's input flow is
+// byte-for-byte unchanged and the ink collector (crate::ink) reads the
+// stashed pressure as a side channel while it captures mouse samples.
+//
+// The classifier and freshness logic are plain functions over primitive
+// values so they unit-test on every platform; only the message pump itself
+// is Windows-only.
+// ---------------------------------------------------------------------------
+
+/// One stylus sample recovered from the WM_POINTER stream.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PenSample {
+    /// Digitizer pressure normalized to `0..=1` (raw packets are 0..1024).
+    pub pressure: f32,
+    /// True when the eraser end of the stylus is in use.
+    pub eraser: bool,
+}
+
+/// Raw `POINTER_INPUT_TYPE` for a stylus. Mirrors the windows crate's
+/// `PT_PEN`; a plain constant keeps the classifier testable on all platforms.
+const PT_PEN_RAW: i32 = 3;
+/// Raw `PEN_FLAG_ERASER` bit, mirroring the windows crate's constant.
+const PEN_FLAG_ERASER_RAW: u32 = 4;
+/// Windows defines stylus pressure as 0..1024 (full press = 1024).
+const PEN_PRESSURE_MAX: f32 = 1024.0;
+/// Max age of a pen packet for it to count as current input. While a stylus
+/// draws, WM_POINTERUPDATE packets stream continuously so the slot stays
+/// fresh; a mouse-only session never produces packets, so samples age out
+/// and strokes fall back to velocity-simulated pressure.
+const PEN_FRESH_MS: u64 = 200;
+
+/// Last observed stylus packet, as lock-free side-channel state written by
+/// the WM_POINTER subclass proc (UI thread) and read by the ink collector.
+static PEN_PRESSURE_BITS: AtomicU32 = AtomicU32::new(0.0f32.to_bits());
+static PEN_FLAGS: AtomicU32 = AtomicU32::new(0);
+static PEN_PRESENT: AtomicU8 = AtomicU8::new(0);
+static PEN_LAST_SEEN_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Wall-clock milliseconds for packet freshness stamps.
+fn now_ms() -> u64 {
+    // Wall-clock (not a lazy process-start anchor): tests must be able to
+    // construct a timestamp older than the freshness window even when the
+    // process has just started.
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Map one raw WM_POINTER pen packet to a normalized [`PenSample`]. Returns
+/// `None` for non-pen pointers (mouse/touch packets carry no pen pressure).
+fn pen_sample_from(pointer_type: i32, pressure_raw: u32, pen_flags: u32) -> Option<PenSample> {
+    if pointer_type != PT_PEN_RAW {
+        return None;
+    }
+    Some(PenSample {
+        pressure: (pressure_raw as f32 / PEN_PRESSURE_MAX).clamp(0.0, 1.0),
+        eraser: pen_flags & PEN_FLAG_ERASER_RAW != 0,
+    })
+}
+
+/// Latest stylus sample, when a pen has produced packets recently. The
+/// caller (the ink collector, via board.rs) uses this per pointer event to
+/// switch a stroke from velocity-simulated to hardware pressure.
+pub fn latest_pen_sample() -> Option<PenSample> {
+    if PEN_PRESENT.load(Ordering::Relaxed) != 1 {
+        return None;
+    }
+    let age = now_ms().saturating_sub(PEN_LAST_SEEN_MS.load(Ordering::Relaxed));
+    if age > PEN_FRESH_MS {
+        return None;
+    }
+    Some(PenSample {
+        pressure: f32::from_bits(PEN_PRESSURE_BITS.load(Ordering::Relaxed)),
+        eraser: PEN_FLAGS.load(Ordering::Relaxed) & PEN_FLAG_ERASER_RAW != 0,
+    })
+}
+
+/// Install the WM_POINTER observation hook on the gpui window. Idempotent;
+/// no-op on non-Windows. Must run on the window's thread (BoardView::new
+/// qualifies).
+pub fn init_pen_input(_window: &Window) {
+    #[cfg(target_os = "windows")]
+    {
+        if let Err(e) = init_pen_input_windows(_window) {
+            eprintln!("init_pen_input failed: {e}");
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn init_pen_input_windows(window: &Window) -> Result<(), String> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Shell::SetWindowSubclass;
+
+    static INSTALLED: AtomicU8 = AtomicU8::new(0);
+    if INSTALLED.load(Ordering::SeqCst) == 1 {
+        return Ok(());
+    }
+
+    // Same HWND extraction as toggle_maximize (gpui::Window's inherent
+    // window_handle() shadows the trait method, hence the UFCS).
+    let raw = HasWindowHandle::window_handle(window)
+        .map_err(|e| format!("window_handle: {e}"))?
+        .as_raw();
+    let hwnd = match raw {
+        RawWindowHandle::Win32(h) => HWND(h.hwnd.get() as *mut core::ffi::c_void),
+        _ => return Err("not a Win32 window".into()),
+    };
+    unsafe {
+        // Must be called from the window's thread — we are (main/UI thread).
+        SetWindowSubclass(hwnd, Some(pen_subclass_proc), PEN_SUBCLASS_ID, 0)
+            .ok()
+            .map_err(|e| format!("SetWindowSubclass failed: {e}"))?;
+    }
+    INSTALLED.store(1, Ordering::SeqCst);
+    Ok(())
+}
+
+/// Arbitrary non-zero subclass id (namespace: this window has no other
+/// subclasses).
+#[cfg(target_os = "windows")]
+const PEN_SUBCLASS_ID: usize = 0xB0E55;
+
+/// Observe-and-forward: record pen pressure from pointer packets, then hand
+/// EVERY message to the next proc in the chain. Forwarding is the load-bearing
+/// part — if we returned without it (or consumed WM_POINTER*), DefWindowProc
+/// would never translate pointer input into the legacy mouse messages gpui
+/// dispatches on, and all input would go dead.
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn pen_subclass_proc(
+    hwnd: windows::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+    _uid_subclass: usize,
+    _ref_data: usize,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::UI::Input::Pointer::{GetPointerInfo, GetPointerPenInfo, POINTER_INFO};
+    use windows::Win32::UI::Shell::DefSubclassProc;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        PT_PEN, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE,
+    };
+
+    if matches!(msg, WM_POINTERDOWN | WM_POINTERUPDATE | WM_POINTERUP) {
+        // GET_POINTERID_WPARAM: pointer id lives in the low word of wParam.
+        let pointer_id = (wparam.0 & 0xFFFF) as u32;
+        let mut info = POINTER_INFO::default();
+        if unsafe { GetPointerInfo(pointer_id, &mut info) }.is_ok() && info.pointerType == PT_PEN {
+            let mut pen = windows::Win32::UI::Input::Pointer::POINTER_PEN_INFO::default();
+            if unsafe { GetPointerPenInfo(pointer_id, &mut pen) }.is_ok() {
+                if let Some(s) = pen_sample_from(info.pointerType.0, pen.pressure, pen.penFlags) {
+                    PEN_PRESSURE_BITS.store(s.pressure.to_bits(), Ordering::Relaxed);
+                    PEN_FLAGS.store(pen.penFlags, Ordering::Relaxed);
+                    PEN_PRESENT.store(1, Ordering::Relaxed);
+                    PEN_LAST_SEEN_MS.store(now_ms(), Ordering::Relaxed);
+                }
+            }
+        }
+    }
+    unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pen_classifier_rejects_non_pen_pointers() {
+        // PT_MOUSE = 4, PT_TOUCH = 2 — no pen pressure on those packets.
+        assert!(pen_sample_from(4, 512, 0).is_none());
+        assert!(pen_sample_from(2, 512, 0).is_none());
+    }
+
+    #[test]
+    fn pen_classifier_normalizes_pressure() {
+        let full = pen_sample_from(PT_PEN_RAW, 1024, 0).unwrap();
+        assert!((full.pressure - 1.0).abs() < 1e-6);
+        assert!(!full.eraser);
+
+        let half = pen_sample_from(PT_PEN_RAW, 512, 0).unwrap();
+        assert!((half.pressure - 0.5).abs() < 1e-6);
+
+        let zero = pen_sample_from(PT_PEN_RAW, 0, 0).unwrap();
+        assert!((zero.pressure).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pen_classifier_clamps_out_of_range_pressure() {
+        let s = pen_sample_from(PT_PEN_RAW, 999_999, 0).unwrap();
+        assert!((s.pressure - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pen_classifier_detects_eraser_tip() {
+        // PEN_FLAG_ERASER (raw 4) set → eraser; other flags (barrel = 1) don't.
+        assert!(
+            pen_sample_from(PT_PEN_RAW, 100, PEN_FLAG_ERASER_RAW)
+                .unwrap()
+                .eraser
+        );
+        assert!(!pen_sample_from(PT_PEN_RAW, 100, 1).unwrap().eraser);
+    }
+
+    #[test]
+    fn pen_slot_never_reports_without_packets() {
+        // Fresh timestamp but the "packets flowing" gate off → None.
+        PEN_PRESENT.store(0, Ordering::Relaxed);
+        PEN_LAST_SEEN_MS.store(now_ms(), Ordering::Relaxed);
+        assert!(latest_pen_sample().is_none());
+    }
+
+    #[test]
+    fn pen_slot_expires_stale_packets() {
+        PEN_PRESENT.store(1, Ordering::Relaxed);
+        PEN_LAST_SEEN_MS.store(now_ms().saturating_sub(PEN_FRESH_MS + 1), Ordering::Relaxed);
+        assert!(latest_pen_sample().is_none());
+
+        // Back in date → reported again.
+        PEN_LAST_SEEN_MS.store(now_ms(), Ordering::Relaxed);
+        let s = latest_pen_sample().unwrap();
+        assert!((0.0..=1.0).contains(&s.pressure));
+        PEN_PRESENT.store(0, Ordering::Relaxed);
+    }
 }

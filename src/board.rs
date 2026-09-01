@@ -15,21 +15,43 @@ use crate::render::rough::{color_u32, paths_for_element, ReadyPath};
 use crate::render::{
     dot_grid, handle_rects, measure_text, point_handle_rects, shape_text, ShapedTextLine,
 };
-use gpui_component::{Icon, IconName};
 use crate::scene::{
     Element, ElementId, ElementKind, ElementStyle, LineType, Scene, SceneFile, StrokeStyle,
     TextAlign, WBounds, WPoint, DEFAULT_FONT_SIZE, LINE_HEIGHT,
 };
 use crate::text::{utf16_to_utf8, utf8_to_utf16, TextEditSession};
 use crate::tools::{ActiveTool, DragState, PointTarget};
+use gpui_component::{Icon, IconName};
 
 actions!(
     boundless,
     [
-        Undo, Redo, SaveScene, OpenScene, DeleteSelection, CancelOp, ZoomIn, ZoomOut, ZoomReset,
-        SelectTool, HandTool, RectTool, DiamondTool, EllipseTool, ArrowTool, LineTool, PenTool,
-        TextTool, EraserTool, ToggleAi, BringToFront, SendToBack, BringForward, SendBackward,
-        Quit, CheckForUpdates,
+        Undo,
+        Redo,
+        SaveScene,
+        OpenScene,
+        DeleteSelection,
+        CancelOp,
+        ZoomIn,
+        ZoomOut,
+        ZoomReset,
+        SelectTool,
+        HandTool,
+        RectTool,
+        DiamondTool,
+        EllipseTool,
+        ArrowTool,
+        LineTool,
+        PenTool,
+        TextTool,
+        EraserTool,
+        ToggleAi,
+        BringToFront,
+        SendToBack,
+        BringForward,
+        SendBackward,
+        Quit,
+        CheckForUpdates,
     ]
 );
 
@@ -116,6 +138,11 @@ pub struct BoardView {
     /// any non-Pen tool). The current tool is left untouched, so releasing the
     /// mouse returns to it — Excalidraw's "hold a modifier to sketch" gesture.
     temp_pen: bool,
+    /// Ink "笔锋" effect (crate::ink): per-point width from simulated
+    /// pressure (slow = thick, fast = thin). On by default so new strokes get
+    /// the handwriting feel; off yields the legacy uniform-width stroke.
+    /// Applies to new strokes only — existing strokes keep their baked widths.
+    pen_taper: bool,
     /// True while a temporary canvas pan is in progress (Ctrl + left-drag from
     /// any tool). Like temp_pen, the active tool is left untouched so releasing
     /// the mouse returns to it.
@@ -144,6 +171,10 @@ impl BoardView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle);
+        // Windows Ink: subclass the window to observe WM_POINTER packets so
+        // the ink pipeline gets real stylus pressure and the eraser tip.
+        // Idempotent; no-op on other platforms.
+        crate::platform::init_pen_input(window);
         let view = Self {
             scene: Scene::new(),
             camera: Camera::default(),
@@ -168,6 +199,7 @@ impl BoardView {
             hover_handle: None,
             hover_point: None,
             temp_pen: false,
+            pen_taper: true,
             temp_pan: false,
             modifiers: Modifiers::default(),
             context_menu: None,
@@ -217,6 +249,30 @@ impl BoardView {
 
     fn hit_tolerance(&self) -> f64 {
         4.0 / self.camera.zoom
+    }
+
+    /// Start a freehand drag: the rough-jitter seed is generated once (stable
+    /// across draft frames), and ink capture begins with the current zoom,
+    /// base stroke width, and 笔锋 state. The first pointer sample is pushed
+    /// immediately (with its hardware pressure, when a stylus is live) so
+    /// taps aren't lost.
+    fn begin_freedraw(&self, world: WPoint) -> DragState {
+        let hw = self.hw_pressure();
+        let mut collector = crate::ink::InkCollector::new(self.camera.zoom, self.pen_taper);
+        collector.push_with_pressure(world, hw);
+        DragState::Freedraw {
+            collector,
+            seed: crate::scene::new_seed(),
+        }
+    }
+
+    /// Freshest stylus pressure for the ink collector (`None` = velocity
+    /// simulation). The eraser tip never contributes pressure — it routes to
+    /// the eraser instead.
+    fn hw_pressure(&self) -> Option<f64> {
+        crate::platform::latest_pen_sample()
+            .filter(|s| !s.eraser)
+            .map(|s| s.pressure as f64)
     }
 
     // ------------------------------------------------------------------
@@ -331,8 +387,7 @@ impl BoardView {
     fn undo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.commit_editing(window, cx);
         if self.history.undo(&mut self.scene) {
-            self.selection
-                .retain(|id| self.scene.get(*id).is_some());
+            self.selection.retain(|id| self.scene.get(*id).is_some());
             cx.notify();
         }
     }
@@ -340,8 +395,7 @@ impl BoardView {
     fn redo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.commit_editing(window, cx);
         if self.history.redo(&mut self.scene) {
-            self.selection
-                .retain(|id| self.scene.get(*id).is_some());
+            self.selection.retain(|id| self.scene.get(*id).is_some());
             cx.notify();
         }
     }
@@ -396,20 +450,29 @@ impl BoardView {
     // ------------------------------------------------------------------
     // text editing
 
-    fn start_editing(
-        &mut self,
-        element_id: ElementId,
-        is_new: bool,
-        cx: &mut Context<Self>,
-    ) {
+    fn start_editing(&mut self, element_id: ElementId, is_new: bool, cx: &mut Context<Self>) {
         let Some(el) = self.scene.get(element_id) else {
             return;
         };
         let (text, font_size, font_family, wrap_width, min_height, container_id, text_align) =
             match &el.kind {
-                ElementKind::Text { text, font_size, font_family, wrap_width, min_height, container_id, text_align } => {
-                    (text.clone(), *font_size, font_family.clone(), *wrap_width, *min_height, *container_id, *text_align)
-                }
+                ElementKind::Text {
+                    text,
+                    font_size,
+                    font_family,
+                    wrap_width,
+                    min_height,
+                    container_id,
+                    text_align,
+                } => (
+                    text.clone(),
+                    *font_size,
+                    font_family.clone(),
+                    *wrap_width,
+                    *min_height,
+                    *container_id,
+                    *text_align,
+                ),
                 _ => return,
             };
         self.editing = Some(EditingState {
@@ -489,7 +552,14 @@ impl BoardView {
                 if !ed.is_new {
                     self.history.record(&self.scene);
                 }
-                let (mut w, h) = measure_text(&text, ed.font_size, ed.wrap_width, ed.min_height, &ed.font_family, window);
+                let (mut w, h) = measure_text(
+                    &text,
+                    ed.font_size,
+                    ed.wrap_width,
+                    ed.min_height,
+                    &ed.font_family,
+                    window,
+                );
                 // Standalone wrapped boxes keep their wrap width (selection
                 // frame matches the editing outline); bound labels hug their
                 // content width so centering is true centering.
@@ -612,7 +682,9 @@ impl BoardView {
                 self.canvas_bounds.origin.x + self.canvas_bounds.size.width * 0.5,
                 self.canvas_bounds.origin.y + self.canvas_bounds.size.height * 0.5,
             );
-            let c = self.camera.screen_to_world(center_screen, self.canvas_origin());
+            let c = self
+                .camera
+                .screen_to_world(center_screen, self.canvas_origin());
             WPoint::new(c.x - 150.0, c.y - 40.0)
         });
         self.history.record(&self.scene);
@@ -649,7 +721,14 @@ impl BoardView {
         let styled = |s: CanvasStyle| CanvasStyle::merge_into(s, style);
 
         let outcome: CanvasOpOutcome = match op {
-            CanvasOp::Rectangle { x, y, w, h, style, text } => {
+            CanvasOp::Rectangle {
+                x,
+                y,
+                w,
+                h,
+                style,
+                text,
+            } => {
                 if !(w > 0.0 && h > 0.0) {
                     return Err(CanvasOpError::invalid_args("矩形宽高必须为正数"));
                 }
@@ -657,14 +736,26 @@ impl BoardView {
                     return Err(CanvasOpError::internal("内部错误：缺少元素 ID"));
                 };
                 self.history.record(&self.scene);
-                let el = Element::new_with_id(id, ElementKind::Rectangle, WBounds::new(x, y, w, h), styled(style));
+                let el = Element::new_with_id(
+                    id,
+                    ElementKind::Rectangle,
+                    WBounds::new(x, y, w, h),
+                    styled(style),
+                );
                 let added = self.scene.add(el);
                 if let Some(t) = text.filter(|t| !t.is_empty()) {
                     self.add_bound_label(added, WBounds::new(x, y, w, h), t);
                 }
                 Ok(format!("已添加矩形 id={}", &added.to_string()[..8]))
             }
-            CanvasOp::Ellipse { x, y, w, h, style, text } => {
+            CanvasOp::Ellipse {
+                x,
+                y,
+                w,
+                h,
+                style,
+                text,
+            } => {
                 if !(w > 0.0 && h > 0.0) {
                     return Err(CanvasOpError::invalid_args("椭圆宽高必须为正数"));
                 }
@@ -672,14 +763,26 @@ impl BoardView {
                     return Err(CanvasOpError::internal("内部错误：缺少元素 ID"));
                 };
                 self.history.record(&self.scene);
-                let el = Element::new_with_id(id, ElementKind::Ellipse, WBounds::new(x, y, w, h), styled(style));
+                let el = Element::new_with_id(
+                    id,
+                    ElementKind::Ellipse,
+                    WBounds::new(x, y, w, h),
+                    styled(style),
+                );
                 let added = self.scene.add(el);
                 if let Some(t) = text.filter(|t| !t.is_empty()) {
                     self.add_bound_label(added, WBounds::new(x, y, w, h), t);
                 }
                 Ok(format!("已添加椭圆 id={}", &added.to_string()[..8]))
             }
-            CanvasOp::Diamond { x, y, w, h, style, text } => {
+            CanvasOp::Diamond {
+                x,
+                y,
+                w,
+                h,
+                style,
+                text,
+            } => {
                 if !(w > 0.0 && h > 0.0) {
                     return Err(CanvasOpError::invalid_args("菱形宽高必须为正数"));
                 }
@@ -687,14 +790,23 @@ impl BoardView {
                     return Err(CanvasOpError::internal("内部错误：缺少元素 ID"));
                 };
                 self.history.record(&self.scene);
-                let el = Element::new_with_id(id, ElementKind::Diamond, WBounds::new(x, y, w, h), styled(style));
+                let el = Element::new_with_id(
+                    id,
+                    ElementKind::Diamond,
+                    WBounds::new(x, y, w, h),
+                    styled(style),
+                );
                 let added = self.scene.add(el);
                 if let Some(t) = text.filter(|t| !t.is_empty()) {
                     self.add_bound_label(added, WBounds::new(x, y, w, h), t);
                 }
                 Ok(format!("已添加菱形 id={}", &added.to_string()[..8]))
             }
-            CanvasOp::Line { points, style, text } => {
+            CanvasOp::Line {
+                points,
+                style,
+                text,
+            } => {
                 let pts: Vec<WPoint> = points.into_iter().map(Into::into).collect();
                 if pts.len() < 2 {
                     return Err(CanvasOpError::invalid_args("至少需要两个坐标点"));
@@ -787,7 +899,14 @@ impl BoardView {
                 self.pending_measure.push(added);
                 Ok(format!("已添加文本 id={}", &added.to_string()[..8]))
             }
-            CanvasOp::UpdateElement { id, x, y, text, style, font_size } => {
+            CanvasOp::UpdateElement {
+                id,
+                x,
+                y,
+                text,
+                style,
+                font_size,
+            } => {
                 // The model only knows the 8-char id prefix draw tools report
                 // back, so resolve by prefix (also accepts a full UUID).
                 let Some(uuid) = self.scene.find_by_id_prefix(&id) else {
@@ -811,7 +930,10 @@ impl BoardView {
                     el.style = style.merge_into(base);
                     // Determine if this is a standalone text element.
                     if let Some(nt) = &text {
-                        if let ElementKind::Text { text: ref mut t, .. } = el.kind {
+                        if let ElementKind::Text {
+                            text: ref mut t, ..
+                        } = el.kind
+                        {
                             *t = nt.clone();
                         } else {
                             needs_label_update = true;
@@ -819,7 +941,11 @@ impl BoardView {
                     }
                     // font_size applies only to text elements.
                     if let Some(fs) = font_size {
-                        if let ElementKind::Text { font_size: ref mut f, .. } = el.kind {
+                        if let ElementKind::Text {
+                            font_size: ref mut f,
+                            ..
+                        } = el.kind
+                        {
                             *f = fs.max(4.0);
                             remeasure = true;
                         }
@@ -835,13 +961,26 @@ impl BoardView {
                     if let Some(nt) = &text {
                         // Find existing bound label for this container.
                         let label_id = self.scene.elements.iter().find_map(|e| {
-                            if let ElementKind::Text { container_id: Some(cid), .. } = &e.kind {
-                                if *cid == uuid { Some(e.id) } else { None }
-                            } else { None }
+                            if let ElementKind::Text {
+                                container_id: Some(cid),
+                                ..
+                            } = &e.kind
+                            {
+                                if *cid == uuid {
+                                    Some(e.id)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
                         });
                         if let Some(lid) = label_id {
                             if let Some(label) = self.scene.get_mut(lid) {
-                                if let ElementKind::Text { text: ref mut t, .. } = label.kind {
+                                if let ElementKind::Text {
+                                    text: ref mut t, ..
+                                } = label.kind
+                                {
                                     *t = nt.clone();
                                 }
                             }
@@ -862,7 +1001,11 @@ impl BoardView {
                     let cb = self.scene.get(uuid).map(|e| e.bounds);
                     if let Some(cb) = cb {
                         for e in self.scene.elements.iter_mut() {
-                            if let ElementKind::Text { container_id: Some(cid), .. } = &e.kind {
+                            if let ElementKind::Text {
+                                container_id: Some(cid),
+                                ..
+                            } = &e.kind
+                            {
                                 if *cid == uuid {
                                     place_label(&mut e.bounds, cb, TextAlign::Center);
                                 }
@@ -906,15 +1049,9 @@ impl BoardView {
     fn add_bound_label(&mut self, container_id: ElementId, bounds: WBounds, text: String) {
         // Check if the container is a line/arrow — those need a label background
         // so text is legible over the stroke.
-        let is_line_container = self
-            .scene
-            .get(container_id)
-            .is_some_and(|e| {
-                matches!(
-                    e.kind,
-                    ElementKind::Arrow { .. } | ElementKind::Line { .. }
-                )
-            });
+        let is_line_container = self.scene.get(container_id).is_some_and(|e| {
+            matches!(e.kind, ElementKind::Arrow { .. } | ElementKind::Line { .. })
+        });
         let mut el = self.new_text_element(WPoint::new(bounds.x, bounds.y), text);
         if let ElementKind::Text {
             wrap_width,
@@ -942,26 +1079,30 @@ impl BoardView {
     /// label, optional text, and bounding box.
     pub fn element_snapshot(&self) -> Vec<crate::ai::tools::ElementSnapshot> {
         use crate::ai::tools::ElementSnapshot;
-        self.scene.elements.iter().map(|el| {
-            let (kind, text) = match &el.kind {
-                ElementKind::Rectangle => ("rectangle", el.text().map(|t| t.to_string())),
-                ElementKind::Ellipse => ("ellipse", el.text().map(|t| t.to_string())),
-                ElementKind::Diamond => ("diamond", el.text().map(|t| t.to_string())),
-                ElementKind::Arrow { .. } => ("arrow", el.text().map(|t| t.to_string())),
-                ElementKind::Line { .. } => ("line", el.text().map(|t| t.to_string())),
-                ElementKind::Text { text, .. } => ("text", Some(text.clone())),
-                ElementKind::Freedraw { .. } => ("freedraw", None),
-            };
-            ElementSnapshot {
-                id: el.id.to_string()[..8].to_string(),
-                kind: kind.to_string(),
-                text,
-                x: el.bounds.x,
-                y: el.bounds.y,
-                w: el.bounds.w,
-                h: el.bounds.h,
-            }
-        }).collect()
+        self.scene
+            .elements
+            .iter()
+            .map(|el| {
+                let (kind, text) = match &el.kind {
+                    ElementKind::Rectangle => ("rectangle", el.text().map(|t| t.to_string())),
+                    ElementKind::Ellipse => ("ellipse", el.text().map(|t| t.to_string())),
+                    ElementKind::Diamond => ("diamond", el.text().map(|t| t.to_string())),
+                    ElementKind::Arrow { .. } => ("arrow", el.text().map(|t| t.to_string())),
+                    ElementKind::Line { .. } => ("line", el.text().map(|t| t.to_string())),
+                    ElementKind::Text { text, .. } => ("text", Some(text.clone())),
+                    ElementKind::Freedraw { .. } => ("freedraw", None),
+                };
+                ElementSnapshot {
+                    id: el.id.to_string()[..8].to_string(),
+                    kind: kind.to_string(),
+                    text,
+                    x: el.bounds.x,
+                    y: el.bounds.y,
+                    w: el.bounds.w,
+                    h: el.bounds.h,
+                }
+            })
+            .collect()
     }
 
     /// Build the per-turn runtime-context snapshot the AI agent sees before it
@@ -987,7 +1128,11 @@ impl BoardView {
             let br = self.camera.screen_to_world(br_screen, origin);
             body.push_str(&format!(
                 "可见区域（世界坐标）：x∈[{:.0}, {:.0}]，y∈[{:.0}, {:.0}]，缩放 {:.0}%\n",
-                tl.x, br.x, tl.y, br.y, self.camera.zoom * 100.0
+                tl.x,
+                br.x,
+                tl.y,
+                br.y,
+                self.camera.zoom * 100.0
             ));
         }
 
@@ -1035,7 +1180,8 @@ impl BoardView {
             self.canvas_bounds.origin.x + self.canvas_bounds.size.width * 0.5,
             self.canvas_bounds.origin.y + self.canvas_bounds.size.height * 0.5,
         );
-        self.camera.screen_to_world(center_screen, self.canvas_origin())
+        self.camera
+            .screen_to_world(center_screen, self.canvas_origin())
     }
 
     // ------------------------------------------------------------------
@@ -1115,17 +1261,10 @@ impl BoardView {
                         )
                     })?
                     .clone();
-                let newer = crate::updater::is_newer(
-                    &manifest.version,
-                    crate::updater::current_version(),
-                )?;
+                let newer =
+                    crate::updater::is_newer(&manifest.version, crate::updater::current_version())?;
                 Ok::<_, anyhow::Error>(if newer {
-                    Some((
-                        manifest.version,
-                        manifest.notes,
-                        entry.url,
-                        entry.signature,
-                    ))
+                    Some((manifest.version, manifest.notes, entry.url, entry.signature))
                 } else {
                     None
                 })
@@ -1145,8 +1284,11 @@ impl BoardView {
                         this.download_update(url, sig, version, notes, cx);
                     }
                     Ok(Ok(None)) => {
-                        this.update_state =
-                            if silent { UpdateState::Idle } else { UpdateState::UpToDate };
+                        this.update_state = if silent {
+                            UpdateState::Idle
+                        } else {
+                            UpdateState::UpToDate
+                        };
                         cx.notify();
                     }
                     Ok(Err(e)) => {
@@ -1188,7 +1330,8 @@ impl BoardView {
         } else {
             "zip"
         };
-        let dest = std::env::temp_dir().join(format!("boundless-update-{}.{}", std::process::id(), ext));
+        let dest =
+            std::env::temp_dir().join(format!("boundless-update-{}.{}", std::process::id(), ext));
         self.update_state = UpdateState::Downloading { fraction: 0.0 };
         cx.notify();
 
@@ -1199,7 +1342,11 @@ impl BoardView {
         crate::ai::client::tokio_runtime().spawn(async move {
             let tx2 = tx.clone();
             let res = crate::updater::download(&url_c, &dest_c, move |done, total| {
-                let frac = if total > 0 { done as f64 / total as f64 } else { 0.0 };
+                let frac = if total > 0 {
+                    done as f64 / total as f64
+                } else {
+                    0.0
+                };
                 let _ = tx2.unbounded_send(DownloadMsg::Progress(frac));
             })
             .await;
@@ -1284,7 +1431,12 @@ impl BoardView {
     /// panel root, which breaks gpui-component's text selection drag, since GPUI
     /// runs all mouse listeners — element handlers and TextView's selection
     /// listeners alike — through one loop that aborts on stop_propagation).
-    fn over_ai_panel(&self, position: Point<Pixels>, window: &Window, cx: &mut Context<Self>) -> bool {
+    fn over_ai_panel(
+        &self,
+        position: Point<Pixels>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.ai_panel.is_none() {
             return false;
         }
@@ -1313,8 +1465,9 @@ impl BoardView {
             (DragState::Idle, _) if self.modifiers.shift && self.tool != ActiveTool::Pen => {
                 CursorStyle::Crosshair
             }
-            (DragState::Idle, _) if (self.modifiers.control || self.modifiers.platform)
-                && self.tool != ActiveTool::Hand =>
+            (DragState::Idle, _)
+                if (self.modifiers.control || self.modifiers.platform)
+                    && self.tool != ActiveTool::Hand =>
             {
                 CursorStyle::PointingHand
             }
@@ -1396,7 +1549,10 @@ impl BoardView {
             self.file_path.clone().unwrap()
         };
         let file = SceneFile::new(&self.scene, self.camera);
-        let file = SceneFile { show_grid: self.show_grid, ..file };
+        let file = SceneFile {
+            show_grid: self.show_grid,
+            ..file
+        };
         let result = serde_json::to_string_pretty(&file)
             .map_err(anyhow::Error::from)
             .and_then(|json| std::fs::write(&path, json).map_err(anyhow::Error::from));
@@ -1464,7 +1620,12 @@ impl BoardView {
     // ------------------------------------------------------------------
     // mouse handlers
 
-    fn on_left_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_left_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Windows: the in-app menu bar spans the top MENU_BAR_HEIGHT px. Clicks
         // there belong to the menu bar (labels / drag spacer / caption buttons),
         // not the canvas, so don't start a canvas action. The caption buttons
@@ -1529,10 +1690,7 @@ impl BoardView {
                 // Shift + left-drag: temporary freehand stroke (Excalidraw's
                 // "hold to sketch"). Reuses the Pen tool's drag path.
                 self.temp_pen = true;
-                self.drag = DragState::Freedraw {
-                    points: vec![world],
-                    seed: crate::scene::new_seed(),
-                };
+                self.drag = self.begin_freedraw(world);
                 cx.notify();
                 return;
             } else if ctrl && self.tool != ActiveTool::Hand {
@@ -1567,15 +1725,18 @@ impl BoardView {
                 };
             }
             ActiveTool::Pen => {
-                self.drag = DragState::Freedraw {
-                    points: vec![world],
-                    seed: crate::scene::new_seed(),
-                };
+                // Stylus eraser tip: Windows Ink routes the flipped pen
+                // through the pen tool with the eraser flag set — erase
+                // instead of drawing.
+                if crate::platform::latest_pen_sample().is_some_and(|s| s.eraser) {
+                    self.begin_erase(world, cx);
+                } else {
+                    self.drag = self.begin_freedraw(world);
+                }
             }
             ActiveTool::Text => {
                 let hit = self.scene.hit_test(world, self.hit_tolerance());
-                let is_text =
-                    hit.is_some_and(|id| self.scene.get(id).is_some_and(|e| e.is_text()));
+                let is_text = hit.is_some_and(|id| self.scene.get(id).is_some_and(|e| e.is_text()));
                 let is_container =
                     hit.is_some_and(|id| self.scene.get(id).is_some_and(|e| e.is_container()));
                 if let Some(id) = hit.filter(|_| is_text) {
@@ -1592,20 +1753,28 @@ impl BoardView {
                 }
             }
             ActiveTool::Eraser => {
-                let mut removed = false;
-                if let Some(id) = self.scene.hit_test(world, self.hit_tolerance()) {
-                    self.history.record(&self.scene);
-                    self.remove_element(id);
-                    self.selection.retain(|s| *s != id);
-                    removed = true;
-                    self.mark_dirty();
-                }
-                self.drag = DragState::Erasing {
-                    removed_any: removed,
-                };
-                cx.notify();
+                self.begin_erase(world, cx);
             }
         }
+        cx.notify();
+    }
+
+    /// Start an erase drag at `world`: removes the hit element (if any) and
+    /// enters the continuous-erase drag state. Shared by the Eraser tool and
+    /// the stylus-eraser tip (Windows Ink routes the flipped pen through the
+    /// Pen tool with the eraser flag set).
+    fn begin_erase(&mut self, world: WPoint, cx: &mut Context<Self>) {
+        let mut removed = false;
+        if let Some(id) = self.scene.hit_test(world, self.hit_tolerance()) {
+            self.history.record(&self.scene);
+            self.remove_element(id);
+            self.selection.retain(|s| *s != id);
+            removed = true;
+            self.mark_dirty();
+        }
+        self.drag = DragState::Erasing {
+            removed_any: removed,
+        };
         cx.notify();
     }
 
@@ -1662,9 +1831,10 @@ impl BoardView {
         // anywhere inside the selection box to move it.
         if !self.selection.is_empty()
             && !event.modifiers.shift
-            && self
-                .selection_bounds_world()
-                .is_some_and(|b| b.inflate(self.hit_tolerance(), self.hit_tolerance()).contains(world))
+            && self.selection_bounds_world().is_some_and(|b| {
+                b.inflate(self.hit_tolerance(), self.hit_tolerance())
+                    .contains(world)
+            })
         {
             self.drag = DragState::Moving {
                 last_world: world,
@@ -1752,7 +1922,12 @@ impl BoardView {
     /// right-clicking a vertex handle of a selected line/arrow adds a
     /// "delete vertex" item. Right-clicking empty canvas with no selection
     /// opens nothing.
-    fn on_right_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_right_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.over_ai_panel(event.position, window, cx) {
             return;
         }
@@ -1821,7 +1996,12 @@ impl BoardView {
         cx.notify();
     }
 
-    fn on_mouse_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Ignore moves over the AI panel — the panel owns hover/cursor/selection
         // there, and the canvas must not fight it (e.g. update the hover handle
         // or keep an in-progress drag updating while the pointer is over text).
@@ -1916,16 +2096,19 @@ impl BoardView {
                 self.drag = DragState::Drawing { start, seed };
                 cx.notify();
             }
-            DragState::Freedraw { mut points, seed } => {
-                let min_dist = 2.0 / self.camera.zoom;
-                if points
-                    .last()
-                    .is_none_or(|last| last.distance(world) > min_dist)
-                {
-                    points.push(world);
+            DragState::Freedraw {
+                mut collector,
+                seed,
+            } => {
+                // The collector applies decimation (2-screen-px rule), EMA
+                // smoothing, and pressure (hardware stylus pressure from the
+                // WM_POINTER hook when a pen is live, velocity-simulated
+                // otherwise); notify only when a sample was actually captured.
+                let hw = self.hw_pressure();
+                if collector.push_with_pressure(world, hw) {
                     cx.notify();
                 }
-                self.drag = DragState::Freedraw { points, seed };
+                self.drag = DragState::Freedraw { collector, seed };
             }
             DragState::Moving {
                 mut last_world,
@@ -2036,13 +2219,17 @@ impl BoardView {
                         | crate::render::Handle::Se
                         | crate::render::Handle::Sw
                 );
-                let is_horizontal_edge = matches!(
-                    handle,
-                    crate::render::Handle::E | crate::render::Handle::W
-                );
+                let is_horizontal_edge =
+                    matches!(handle, crate::render::Handle::E | crate::render::Handle::W);
                 for original in &originals {
                     let mut scaled = original.clone();
-                    if let ElementKind::Text { font_size, wrap_width, min_height, .. } = &mut scaled.kind {
+                    if let ElementKind::Text {
+                        font_size,
+                        wrap_width,
+                        min_height,
+                        ..
+                    } = &mut scaled.kind
+                    {
                         // Text resize is handle-aware:
                         //  - corner: scale font (and wrap width) uniformly
                         //  - horizontal edge (E/W): change wrap width, keep font
@@ -2092,7 +2279,9 @@ impl BoardView {
                     if resized_ids.contains(&el.id) {
                         continue;
                     }
-                    let Some(cid) = el.container_id() else { continue };
+                    let Some(cid) = el.container_id() else {
+                        continue;
+                    };
                     let Some((_, cb)) = container_bounds.iter().find(|(id, _)| *id == cid) else {
                         continue;
                     };
@@ -2163,10 +2352,7 @@ impl BoardView {
                 WPoint::new(start.x + len * snapped.cos(), start.y + len * snapped.sin())
             } else {
                 let side = dx.abs().max(dy.abs());
-                WPoint::new(
-                    start.x + side * dx.signum(),
-                    start.y + side * dy.signum(),
-                )
+                WPoint::new(start.x + side * dx.signum(), start.y + side * dy.signum())
             };
         }
         let bounds = WBounds::from_corners(start, end);
@@ -2189,8 +2375,12 @@ impl BoardView {
                 let mut style = self.style.clone();
                 style.stroke_style = StrokeStyle::Dashed;
                 style.roughness = 0.0;
-                let one_line =
-                    WBounds::new(bounds.x, bounds.y, bounds.w, self.text_font_size * LINE_HEIGHT);
+                let one_line = WBounds::new(
+                    bounds.x,
+                    bounds.y,
+                    bounds.w,
+                    self.text_font_size * LINE_HEIGHT,
+                );
                 let mut draft = Element::new(ElementKind::Rectangle, one_line, style);
                 draft.seed = seed;
                 self.draft = Some(draft);
@@ -2235,9 +2425,11 @@ impl BoardView {
                         // The drag fixes only the wrap width. The font size
                         // comes from the style-bar default; the box height
                         // starts at one line and grows with the content.
-                        let b = self.draft.as_ref().map(|d| d.bounds).unwrap_or_else(|| {
-                            WBounds::from_corners(start, world)
-                        });
+                        let b = self
+                            .draft
+                            .as_ref()
+                            .map(|d| d.bounds)
+                            .unwrap_or_else(|| WBounds::from_corners(start, world));
                         let mut el = self.new_text_element(WPoint::new(b.x, b.y), String::new());
                         if let ElementKind::Text { wrap_width, .. } = &mut el.kind {
                             *wrap_width = Some(b.w.max(self.text_font_size * 2.0).max(20.0));
@@ -2254,8 +2446,10 @@ impl BoardView {
                     self.selection = vec![id];
                     self.start_editing(id, true, cx);
                 } else if let Some(mut el) = self.draft.take() {
-                    if matches!(el.kind, ElementKind::Line { .. } | ElementKind::Arrow { .. })
-                        && world.distance(start) < 1e-6
+                    if matches!(
+                        el.kind,
+                        ElementKind::Line { .. } | ElementKind::Arrow { .. }
+                    ) && world.distance(start) < 1e-6
                     {
                         // zero-length line: skip
                     } else {
@@ -2270,12 +2464,16 @@ impl BoardView {
                     }
                 }
             }
-            DragState::Freedraw { points, seed } => {
-                if points.len() >= 2 {
+            DragState::Freedraw { collector, seed } => {
+                if collector.len() >= 2 {
                     self.history.record(&self.scene);
+                    let stroke = collector.finish();
                     let mut el = Element::from_absolute_points(
-                        |points| ElementKind::Freedraw { points },
-                        points,
+                        |points| ElementKind::Freedraw {
+                            points,
+                            widths: stroke.widths,
+                        },
+                        stroke.points,
                         self.style.clone(),
                     );
                     // Reuse the drag seed so the committed stroke looks
@@ -2334,7 +2532,11 @@ impl BoardView {
             // shift+vertical-wheel into the X axis (delta.x set, delta.y=0),
             // so pan by delta.x. (delta.y is kept as a fallback for platforms
             // that don't transpose, e.g. some trackpads.)
-            let dx = if delta.x.to_f64() != 0.0 { delta.x } else { delta.y };
+            let dx = if delta.x.to_f64() != 0.0 {
+                delta.x
+            } else {
+                delta.y
+            };
             self.camera.pan_by_screen(dx, px(0.0));
         } else {
             self.camera.pan_by_screen(delta.x, delta.y);
@@ -2452,10 +2654,7 @@ impl BoardView {
             .world_to_screen(WPoint::new(b.x, b.y), self.canvas_origin());
         Bounds {
             origin,
-            size: size(
-                self.camera.scale(b.w),
-                self.camera.scale(b.h),
-            ),
+            size: size(self.camera.scale(b.w), self.camera.scale(b.h)),
         }
     }
 
@@ -2467,7 +2666,10 @@ impl BoardView {
             return None;
         }
         let el = self.scene.get(self.selection[0])?;
-        if !matches!(el.kind, ElementKind::Line { .. } | ElementKind::Arrow { .. }) {
+        if !matches!(
+            el.kind,
+            ElementKind::Line { .. } | ElementKind::Arrow { .. }
+        ) {
             return None;
         }
         let origin = self.canvas_origin();
@@ -2502,7 +2704,9 @@ impl BoardView {
             if container_ids.contains(&el.id) {
                 continue;
             }
-            let Some(cid) = el.container_id() else { continue };
+            let Some(cid) = el.container_id() else {
+                continue;
+            };
             let Some((_, cb)) = bounds.iter().find(|(id, _)| *id == cid) else {
                 continue;
             };
@@ -2570,10 +2774,7 @@ impl BoardView {
     /// Box width used for line alignment while editing: the wrap width for
     /// standalone wrapped text; the content width otherwise (bound labels).
     fn editing_box_width(&self, ed: &EditingState, lines: &[ShapedTextLine]) -> Pixels {
-        let content_w = lines
-            .iter()
-            .map(|l| l.width)
-            .fold(px(0.0), |a, b| a.max(b));
+        let content_w = lines.iter().map(|l| l.width).fold(px(0.0), |a, b| a.max(b));
         match (ed.wrap_width, ed.container_id) {
             (Some(ww), None) => self.camera.scale(ww).max(content_w),
             _ => content_w,
@@ -2586,7 +2787,15 @@ impl BoardView {
         let el = self.scene.get(ed.element_id)?;
         let text = ed.session.text();
         let color = color_u32(0x000000, 1.0);
-        let (lines, line_height) = shape_text(&text, ed.font_size, &self.camera, color, ed.wrap_width, &ed.font_family, window);
+        let (lines, line_height) = shape_text(
+            &text,
+            ed.font_size,
+            &self.camera,
+            color,
+            ed.wrap_width,
+            &ed.font_family,
+            window,
+        );
         if lines.is_empty() {
             return Some(0);
         }
@@ -2617,7 +2826,15 @@ impl BoardView {
     ) -> Option<(Point<Pixels>, Pixels)> {
         let text = ed.session.text();
         let color = color_u32(0x000000, 1.0);
-        let (lines, line_height) = shape_text(&text, ed.font_size, &self.camera, color, ed.wrap_width, &ed.font_family, window);
+        let (lines, line_height) = shape_text(
+            &text,
+            ed.font_size,
+            &self.camera,
+            color,
+            ed.wrap_width,
+            &ed.font_family,
+            window,
+        );
         if lines.is_empty() {
             return None;
         }
@@ -2689,12 +2906,22 @@ impl EntityInputHandler for BoardView {
         })
     }
 
-    fn marked_text_range(&self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<Range<usize>> {
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
         let ed = self.editing.as_ref()?;
         let marked = ed.session.marked.clone()?;
         let text = ed.session.text();
-        let start = utf8_to_utf16(&text, crate::text::char_to_byte(&ed.session.rope, marked.start));
-        let end = utf8_to_utf16(&text, crate::text::char_to_byte(&ed.session.rope, marked.end));
+        let start = utf8_to_utf16(
+            &text,
+            crate::text::char_to_byte(&ed.session.rope, marked.start),
+        );
+        let end = utf8_to_utf16(
+            &text,
+            crate::text::char_to_byte(&ed.session.rope, marked.end),
+        );
         Some(start..end)
     }
 
@@ -2852,15 +3079,23 @@ impl BoardView {
                 continue; // painted via the editing session
             }
             match &el.kind {
-                ElementKind::Text { text, font_size, .. } => {
+                ElementKind::Text {
+                    text, font_size, ..
+                } => {
                     let color = color_u32(el.style.stroke, el.style.opacity);
                     let bg = el.style.background.map(|c| color_u32(c, el.style.opacity));
-                    let (lines, line_height) =
-                        shape_text(text, *font_size, &self.camera, color, el.wrap_width(), el.font_family(), window);
-                    let screen_origin = self.camera.world_to_screen(
-                        WPoint::new(el.bounds.x, el.bounds.y),
-                        origin,
+                    let (lines, line_height) = shape_text(
+                        text,
+                        *font_size,
+                        &self.camera,
+                        color,
+                        el.wrap_width(),
+                        el.font_family(),
+                        window,
                     );
+                    let screen_origin = self
+                        .camera
+                        .world_to_screen(WPoint::new(el.bounds.x, el.bounds.y), origin);
                     let screen_bounds = Bounds {
                         origin: screen_origin,
                         size: size(
@@ -2889,11 +3124,12 @@ impl BoardView {
         if let Some(draft) = &self.draft {
             paths.extend(paths_for_element(draft, &self.camera, origin));
         }
-        if let DragState::Freedraw { points, seed } = &self.drag {
-            if points.len() >= 2 {
+        if let DragState::Freedraw { collector, seed } = &self.drag {
+            if collector.len() >= 2 {
+                let widths = collector.widths().to_vec();
                 let mut draft = Element::from_absolute_points(
-                    |points| ElementKind::Freedraw { points },
-                    points.clone(),
+                    |points| ElementKind::Freedraw { points, widths },
+                    collector.points().to_vec(),
                     self.style.clone(),
                 );
                 // Stable seed for the whole drag: without it the rough
@@ -2928,7 +3164,10 @@ impl BoardView {
                 let pad = self.camera.scale(pad_world).max(px(2.0));
                 let screen = Bounds {
                     origin: point(screen.origin.x - pad, screen.origin.y - pad),
-                    size: size(screen.size.width + pad * 2.0, screen.size.height + pad * 2.0),
+                    size: size(
+                        screen.size.width + pad * 2.0,
+                        screen.size.height + pad * 2.0,
+                    ),
                 };
                 let sel = color_u32(SELECTION_COLOR, 1.0);
                 // While a control point is being dragged, hide both the bbox
@@ -3033,12 +3272,17 @@ impl BoardView {
         let el = self.scene.get(ed.element_id)?;
         let text = ed.session.text();
         let color = color_u32(el.style.stroke, el.style.opacity);
-        let (lines, line_height) = shape_text(&text, ed.font_size, &self.camera, color, ed.wrap_width, &ed.font_family, window);
+        let (lines, line_height) = shape_text(
+            &text,
+            ed.font_size,
+            &self.camera,
+            color,
+            ed.wrap_width,
+            &ed.font_family,
+            window,
+        );
         // Live content size; bound labels center themselves on the container.
-        let content_w = lines
-            .iter()
-            .map(|l| l.width)
-            .fold(px(0.0), |a, b| a.max(b));
+        let content_w = lines.iter().map(|l| l.width).fold(px(0.0), |a, b| a.max(b));
         let mut content_h = line_height * lines.len() as f32;
         if let Some(mh) = ed.min_height {
             content_h = content_h.max(self.camera.scale(mh));
@@ -3060,7 +3304,9 @@ impl BoardView {
             for (i, line) in lines.iter().enumerate() {
                 let overlap_start = start_byte.max(line.byte_range.start);
                 let overlap_end = end_byte.min(line.byte_range.end);
-                if overlap_start < overlap_end || (overlap_start == overlap_end && sel.start == sel.end) {
+                if overlap_start < overlap_end
+                    || (overlap_start == overlap_end && sel.start == sel.end)
+                {
                     let x0 = line.line.x_for_index(
                         (overlap_start - line.byte_range.start).min(line.byte_range.len()),
                     );
@@ -3184,13 +3430,31 @@ impl Render for BoardView {
             let pending = std::mem::take(&mut self.pending_measure);
             for id in pending {
                 let info = self.scene.get(id).and_then(|el| match &el.kind {
-                    ElementKind::Text { text, font_size, font_family, wrap_width, min_height, .. } => {
-                        Some((text.clone(), *font_size, font_family.clone(), *wrap_width, *min_height))
-                    }
+                    ElementKind::Text {
+                        text,
+                        font_size,
+                        font_family,
+                        wrap_width,
+                        min_height,
+                        ..
+                    } => Some((
+                        text.clone(),
+                        *font_size,
+                        font_family.clone(),
+                        *wrap_width,
+                        *min_height,
+                    )),
                     _ => None,
                 });
                 if let Some((text, font_size, font_family, wrap_width, min_height)) = info {
-                    let (mut w, h) = measure_text(&text, font_size, wrap_width, min_height, &font_family, window);
+                    let (mut w, h) = measure_text(
+                        &text,
+                        font_size,
+                        wrap_width,
+                        min_height,
+                        &font_family,
+                        window,
+                    );
                     let cid = self.scene.get(id).and_then(|el| el.container_id());
                     // Standalone wrapped boxes keep their wrap width; bound
                     // labels hug their content width (see commit_editing).
@@ -3199,9 +3463,7 @@ impl Render for BoardView {
                             w = ww.max(w);
                         }
                     }
-                    let cb = cid
-                        .and_then(|cid| self.scene.get(cid))
-                        .map(|c| c.bounds);
+                    let cb = cid.and_then(|cid| self.scene.get(cid)).map(|c| c.bounds);
                     if let Some(el) = self.scene.get_mut(id) {
                         el.bounds.w = w.max(1.0);
                         el.bounds.h = h.max(1.0);
@@ -3312,27 +3574,61 @@ impl Render for BoardView {
             .on_action(cx.listener(|this, _: &Redo, window, cx| this.redo(window, cx)))
             .on_action(cx.listener(|this, _: &SaveScene, _window, cx| this.save(false, cx)))
             .on_action(cx.listener(|this, _: &OpenScene, window, cx| this.open(window, cx)))
-            .on_action(cx.listener(|this, _: &DeleteSelection, _window, cx| this.delete_selection(cx)))
-            .on_action(cx.listener(|this, _: &BringToFront, _window, cx| this.reorder_layers(LayerOp::ToFront, cx)))
-            .on_action(cx.listener(|this, _: &SendToBack, _window, cx| this.reorder_layers(LayerOp::ToBack, cx)))
-            .on_action(cx.listener(|this, _: &BringForward, _window, cx| this.reorder_layers(LayerOp::Forward, cx)))
-            .on_action(cx.listener(|this, _: &SendBackward, _window, cx| this.reorder_layers(LayerOp::Backward, cx)))
+            .on_action(
+                cx.listener(|this, _: &DeleteSelection, _window, cx| this.delete_selection(cx)),
+            )
+            .on_action(cx.listener(|this, _: &BringToFront, _window, cx| {
+                this.reorder_layers(LayerOp::ToFront, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SendToBack, _window, cx| {
+                this.reorder_layers(LayerOp::ToBack, cx)
+            }))
+            .on_action(cx.listener(|this, _: &BringForward, _window, cx| {
+                this.reorder_layers(LayerOp::Forward, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SendBackward, _window, cx| {
+                this.reorder_layers(LayerOp::Backward, cx)
+            }))
             .on_action(cx.listener(|this, _: &CancelOp, window, cx| this.cancel(window, cx)))
             .on_action(cx.listener(|this, _: &ZoomIn, _window, cx| this.zoom_by(1.25, cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, _window, cx| this.zoom_by(0.8, cx)))
             .on_action(cx.listener(|this, _: &ZoomReset, _window, cx| this.zoom_reset(cx)))
-            .on_action(cx.listener(|this, _: &SelectTool, window, cx| this.set_tool(ActiveTool::Select, window, cx)))
-            .on_action(cx.listener(|this, _: &HandTool, window, cx| this.set_tool(ActiveTool::Hand, window, cx)))
-            .on_action(cx.listener(|this, _: &RectTool, window, cx| this.set_tool(ActiveTool::Rectangle, window, cx)))
-            .on_action(cx.listener(|this, _: &DiamondTool, window, cx| this.set_tool(ActiveTool::Diamond, window, cx)))
-            .on_action(cx.listener(|this, _: &EllipseTool, window, cx| this.set_tool(ActiveTool::Ellipse, window, cx)))
-            .on_action(cx.listener(|this, _: &ArrowTool, window, cx| this.set_tool(ActiveTool::Arrow, window, cx)))
-            .on_action(cx.listener(|this, _: &LineTool, window, cx| this.set_tool(ActiveTool::Line, window, cx)))
-            .on_action(cx.listener(|this, _: &PenTool, window, cx| this.set_tool(ActiveTool::Pen, window, cx)))
-            .on_action(cx.listener(|this, _: &TextTool, window, cx| this.set_tool(ActiveTool::Text, window, cx)))
-            .on_action(cx.listener(|this, _: &EraserTool, window, cx| this.set_tool(ActiveTool::Eraser, window, cx)))
-            .on_action(cx.listener(|this, _: &ToggleAi, window, cx| this.toggle_ai_panel(window, cx)))
-            .on_action(cx.listener(|this, _: &CheckForUpdates, _window, cx| this.check_for_updates(cx, false)))
+            .on_action(cx.listener(|this, _: &SelectTool, window, cx| {
+                this.set_tool(ActiveTool::Select, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &HandTool, window, cx| {
+                this.set_tool(ActiveTool::Hand, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RectTool, window, cx| {
+                this.set_tool(ActiveTool::Rectangle, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &DiamondTool, window, cx| {
+                this.set_tool(ActiveTool::Diamond, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &EllipseTool, window, cx| {
+                this.set_tool(ActiveTool::Ellipse, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ArrowTool, window, cx| {
+                this.set_tool(ActiveTool::Arrow, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &LineTool, window, cx| {
+                this.set_tool(ActiveTool::Line, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &PenTool, window, cx| {
+                this.set_tool(ActiveTool::Pen, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &TextTool, window, cx| {
+                this.set_tool(ActiveTool::Text, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &EraserTool, window, cx| {
+                this.set_tool(ActiveTool::Eraser, window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &ToggleAi, window, cx| this.toggle_ai_panel(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &CheckForUpdates, _window, cx| {
+                this.check_for_updates(cx, false)
+            }))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_left_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_down))
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_down))
@@ -3388,7 +3684,13 @@ fn paint_text_item(item: &TextPaintItem, window: &mut Window, cx: &mut App) {
 // ---------------------------------------------------------------------
 
 const STROKE_COLORS: [u32; 5] = [0x1e1e1e, 0xe03131, 0x2f9e44, 0x1971c2, 0xf08c00];
-const BG_COLORS: [Option<u32>; 5] = [None, Some(0xffc9c9), Some(0xb2f2bb), Some(0xa5d8ff), Some(0xffec99)];
+const BG_COLORS: [Option<u32>; 5] = [
+    None,
+    Some(0xffc9c9),
+    Some(0xb2f2bb),
+    Some(0xa5d8ff),
+    Some(0xffec99),
+];
 const STROKE_WIDTHS: [(f64, f32); 3] = [(1.0, 1.0), (2.0, 2.0), (4.0, 4.0)];
 const ROUGHNESSES: [f32; 3] = [0.0, 1.0, 2.0];
 /// Font size presets: (font size in world units, glyph icon size in px).
@@ -3458,7 +3760,10 @@ fn glyph_button(
         .size_7()
         .rounded_md()
         .cursor_pointer()
-        .text_color(color_u32(if active { ICON_ACTIVE } else { ICON_NORMAL }, 1.0))
+        .text_color(color_u32(
+            if active { ICON_ACTIVE } else { ICON_NORMAL },
+            1.0,
+        ))
         .child(glyph);
     if active {
         b = b.bg(rgb(0xdce8ff));
@@ -3800,24 +4105,42 @@ impl BoardView {
 
         // (tool enum, label, icon factory)
         let tools: [(ActiveTool, &str, fn(Hsla) -> gpui::AnyElement); 10] = [
-            (ActiveTool::Select, "选择", |c| ic::select(c).into_any_element()),
-            (ActiveTool::Hand, "抓手", |c| ic::hand(c).into_any_element()),
-            (ActiveTool::Rectangle, "矩形", |c| ic::rectangle(c).into_any_element()),
-            (ActiveTool::Diamond, "菱形", |c| ic::diamond(c).into_any_element()),
-            (ActiveTool::Ellipse, "椭圆", |c| ic::ellipse(c).into_any_element()),
-            (ActiveTool::Arrow, "箭头", |c| ic::arrow(c).into_any_element()),
-            (ActiveTool::Line, "直线", |c| ic::line(c).into_any_element()),
+            (ActiveTool::Select, "选择", |c| {
+                ic::select(c).into_any_element()
+            }),
+            (ActiveTool::Hand, "抓手", |c| {
+                ic::hand(c).into_any_element()
+            }),
+            (ActiveTool::Rectangle, "矩形", |c| {
+                ic::rectangle(c).into_any_element()
+            }),
+            (ActiveTool::Diamond, "菱形", |c| {
+                ic::diamond(c).into_any_element()
+            }),
+            (ActiveTool::Ellipse, "椭圆", |c| {
+                ic::ellipse(c).into_any_element()
+            }),
+            (ActiveTool::Arrow, "箭头", |c| {
+                ic::arrow(c).into_any_element()
+            }),
+            (ActiveTool::Line, "直线", |c| {
+                ic::line(c).into_any_element()
+            }),
             (ActiveTool::Pen, "画笔", |c| ic::pen(c).into_any_element()),
-            (ActiveTool::Text, "文本", |c| ic::text(c).into_any_element()),
-            (ActiveTool::Eraser, "橡皮", |c| ic::eraser(c).into_any_element()),
+            (ActiveTool::Text, "文本", |c| {
+                ic::text(c).into_any_element()
+            }),
+            (ActiveTool::Eraser, "橡皮", |c| {
+                ic::eraser(c).into_any_element()
+            }),
         ];
 
         let mut bar = bar_container();
         // Whether a modifier is held that would trigger a temporary gesture —
         // used to highlight Hand (Ctrl) / Pen (Shift) even before the button is
         // pressed, for immediate visual feedback. Ignored while editing text.
-        let ctrl_held = (self.modifiers.control || self.modifiers.platform)
-            && self.editing.is_none();
+        let ctrl_held =
+            (self.modifiers.control || self.modifiers.platform) && self.editing.is_none();
         let shift_held = self.modifiers.shift && self.editing.is_none();
         for (tool, label, icon_fn) in tools {
             let weak = weak.clone();
@@ -3831,10 +4154,15 @@ impl BoardView {
                 || ((self.temp_pen || (shift_held && matches!(self.drag, DragState::Idle)))
                     && tool == ActiveTool::Pen);
             bar = bar.child(
-                bar_icon_button(gpui::ElementId::Name(label.into()), active, icon_fn(icon_color(active)))
-                    .on_click(move |_, window, cx| {
-                        weak.update(cx, |this, cx| this.set_tool(tool, window, cx)).ok();
-                    }),
+                bar_icon_button(
+                    gpui::ElementId::Name(label.into()),
+                    active,
+                    icon_fn(icon_color(active)),
+                )
+                .on_click(move |_, window, cx| {
+                    weak.update(cx, |this, cx| this.set_tool(tool, window, cx))
+                        .ok();
+                }),
             );
         }
 
@@ -3847,36 +4175,43 @@ impl BoardView {
         bar = bar
             .child(div().w(px(1.0)).h_5().bg(rgb(0xe3e2df)).mx_1())
             .child(
-                bar_icon_button("撤销", false, ic::undo(icon_color(false)))
-                    .on_click(move |_, window, cx| {
+                bar_icon_button("撤销", false, ic::undo(icon_color(false))).on_click(
+                    move |_, window, cx| {
                         weak_undo.update(cx, |this, cx| this.undo(window, cx)).ok();
-                    }),
+                    },
+                ),
             )
             .child(
-                bar_icon_button("重做", false, ic::redo(icon_color(false)))
-                    .on_click(move |_, window, cx| {
+                bar_icon_button("重做", false, ic::redo(icon_color(false))).on_click(
+                    move |_, window, cx| {
                         weak_redo.update(cx, |this, cx| this.redo(window, cx)).ok();
-                    }),
+                    },
+                ),
             )
             .child(div().w(px(1.0)).h_5().bg(rgb(0xe3e2df)).mx_1())
             .child(
-                bar_icon_button("保存", false, ic::save(icon_color(false)))
-                    .on_click(move |_, _, cx| {
+                bar_icon_button("保存", false, ic::save(icon_color(false))).on_click(
+                    move |_, _, cx| {
                         weak_save.update(cx, |this, cx| this.save(false, cx)).ok();
-                    }),
+                    },
+                ),
             )
             .child(
-                bar_icon_button("打开", false, ic::open(icon_color(false)))
-                    .on_click(move |_, window, cx| {
+                bar_icon_button("打开", false, ic::open(icon_color(false))).on_click(
+                    move |_, window, cx| {
                         weak_open.update(cx, |this, cx| this.open(window, cx)).ok();
-                    }),
+                    },
+                ),
             )
             .child(div().w(px(1.0)).h_5().bg(rgb(0xe3e2df)).mx_1())
             .child(
-                bar_icon_button("AI", ai_active, ic::ai(icon_color(ai_active)))
-                    .on_click(move |_, window, cx| {
-                        weak_ai.update(cx, |this, cx| this.toggle_ai_panel(window, cx)).ok();
-                    }),
+                bar_icon_button("AI", ai_active, ic::ai(icon_color(ai_active))).on_click(
+                    move |_, window, cx| {
+                        weak_ai
+                            .update(cx, |this, cx| this.toggle_ai_panel(window, cx))
+                            .ok();
+                    },
+                ),
             );
 
         // Center the toolbar over the *canvas* area. When the AI panel (which
@@ -3936,7 +4271,10 @@ impl BoardView {
         // diamond). Lines, arrows and freedraw strokes are open polylines
         // with no fillable interior, so hide the background-color row when
         // the selection (or active tool) is purely linear.
-        let linear_tool = matches!(self.tool, ActiveTool::Arrow | ActiveTool::Line | ActiveTool::Pen);
+        let linear_tool = matches!(
+            self.tool,
+            ActiveTool::Arrow | ActiveTool::Line | ActiveTool::Pen
+        );
         let linear_sel = !self.selection.is_empty()
             && self
                 .selection
@@ -3945,7 +4283,9 @@ impl BoardView {
                 .all(|e| {
                     matches!(
                         e.kind,
-                        ElementKind::Line { .. } | ElementKind::Arrow { .. } | ElementKind::Freedraw { .. }
+                        ElementKind::Line { .. }
+                            | ElementKind::Arrow { .. }
+                            | ElementKind::Freedraw { .. }
                     )
                 });
         // When bound labels are selected, the shape targets are their
@@ -3954,16 +4294,12 @@ impl BoardView {
             self.panel_shape_ids()
                 .iter()
                 .filter_map(|id| self.scene.get(*id))
-                .all(|e| {
-                    matches!(
-                        e.kind,
-                        ElementKind::Line { .. } | ElementKind::Arrow { .. }
-                    )
-                })
+                .all(|e| matches!(e.kind, ElementKind::Line { .. } | ElementKind::Arrow { .. }))
         } else {
             linear_sel
         };
-        let show_background = show_shape_options && !(linear_tool && self.selection.is_empty()) && !linear_targets;
+        let show_background =
+            show_shape_options && !(linear_tool && self.selection.is_empty()) && !linear_targets;
         let _ = linear_sel; // used via linear_targets when applicable
 
         let mut bar = bar_container().flex_col().items_start().gap_2().p_2();
@@ -4077,10 +4413,8 @@ impl BoardView {
                         None,
                     )
                     .on_click(move |_, _, cx| {
-                        weak.update(cx, |this, cx| {
-                            this.apply_style_to_text(|fs| *fs = size, cx)
-                        })
-                        .ok();
+                        weak.update(cx, |this, cx| this.apply_style_to_text(|fs| *fs = size, cx))
+                            .ok();
                     }),
                 );
             }
@@ -4099,12 +4433,9 @@ impl BoardView {
                 }
             };
             let mut row = div().flex().flex_row().gap_1();
-            for (ix, family) in [
-                crate::render::HANDWRITTEN_FONT,
-                crate::render::SYSTEM_FONT,
-            ]
-            .iter()
-            .enumerate()
+            for (ix, family) in [crate::render::HANDWRITTEN_FONT, crate::render::SYSTEM_FONT]
+                .iter()
+                .enumerate()
             {
                 let weak = weak.clone();
                 let family = *family;
@@ -4151,8 +4482,7 @@ impl BoardView {
                         ic::align_icon(icon_color(active), a),
                     )
                     .on_click(move |_, _, cx| {
-                        weak.update(cx, |this, cx| this.set_text_align(a, cx))
-                            .ok();
+                        weak.update(cx, |this, cx| this.set_text_align(a, cx)).ok();
                     }),
                 );
             }
@@ -4181,6 +4511,29 @@ impl BoardView {
                 );
             }
             bar = bar.child(row);
+
+            // 笔锋 (ink taper): only for the Pen tool — it controls the
+            // variable-width effect on new freehand strokes. Existing tapered
+            // strokes keep their baked widths.
+            if matches!(self.tool, ActiveTool::Pen) {
+                use crate::icons as ic;
+                let weak = weak.clone();
+                let active = self.pen_taper;
+                bar = bar.child(
+                    bar_icon_button(
+                        gpui::ElementId::named_usize("pt", 0),
+                        active,
+                        ic::taper_icon(icon_color(active)),
+                    )
+                    .on_click(move |_, _, cx| {
+                        weak.update(cx, |this, cx| {
+                            this.pen_taper = !this.pen_taper;
+                            cx.notify();
+                        })
+                        .ok();
+                    }),
+                );
+            }
 
             // Roughness (shapes only): three lines of increasing wobble.
             let mut row = div().flex().flex_row().gap_1();
@@ -4321,7 +4674,9 @@ impl BoardView {
                             .on_click({
                                 let full_id = el_ref.id.to_string();
                                 move |_, _, cx| {
-                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(full_id.clone()));
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        full_id.clone(),
+                                    ));
                                 }
                             }),
                     ),
@@ -4336,11 +4691,7 @@ impl BoardView {
                     .child(div().child(size_text)),
             );
         if let Some(t) = text_content {
-            card = card.child(
-                div()
-                    .text_color(rgb(0x444444))
-                    .child(format!("文字: {t}")),
-            );
+            card = card.child(div().text_color(rgb(0x444444)).child(format!("文字: {t}")));
         }
         // Position: right-aligned, but avoid the AI panel.
         if panel_open {
@@ -4419,10 +4770,25 @@ impl BoardView {
 
         // Layer ops. Disabled (greyed, non-interactive) when the move can't apply.
         let layer_ops: [(LayerOp, &str, IconName, &str); 4] = [
-            (LayerOp::ToFront, "置于顶层", IconName::ArrowUp, "Ctrl+Shift+]"),
+            (
+                LayerOp::ToFront,
+                "置于顶层",
+                IconName::ArrowUp,
+                "Ctrl+Shift+]",
+            ),
             (LayerOp::Forward, "上移一层", IconName::ChevronUp, "Ctrl+]"),
-            (LayerOp::Backward, "下移一层", IconName::ChevronDown, "Ctrl+["),
-            (LayerOp::ToBack, "置于底层", IconName::ArrowDown, "Ctrl+Shift+["),
+            (
+                LayerOp::Backward,
+                "下移一层",
+                IconName::ChevronDown,
+                "Ctrl+[",
+            ),
+            (
+                LayerOp::ToBack,
+                "置于底层",
+                IconName::ArrowDown,
+                "Ctrl+Shift+[",
+            ),
         ];
         for (i, (op, label, icon, sc)) in layer_ops.into_iter().enumerate() {
             let enabled = match op {
@@ -4519,16 +4885,13 @@ impl BoardView {
         // synthesize an HTCAPTION non-client click (see platform::start_window_
         // drag), which reliably starts Windows' caption drag. stop_propagation
         // keeps the board's on_left_down from also firing.
-        bar = bar.child(
-            div()
-                .id("title-drag")
-                .flex_1()
-                .h_full()
-                .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                    crate::platform::start_window_drag(window);
-                    cx.stop_propagation();
-                }),
-        );
+        bar = bar.child(div().id("title-drag").flex_1().h_full().on_mouse_down(
+            MouseButton::Left,
+            |_, window, cx| {
+                crate::platform::start_window_drag(window);
+                cx.stop_propagation();
+            },
+        ));
         // Caption buttons on the right; the OS handles their clicks.
         bar = bar.child(window_controls(window));
         bar
@@ -4761,58 +5124,59 @@ impl BoardView {
             .when(!panel_open, |d| d.right(px(INSET)))
             .flex()
             .child(
-            bar_container()
-                .child(bar_button("−", false).on_click(move |_, _, cx| {
-                    weak_out.update(cx, |this, cx| this.zoom_by(0.8, cx)).ok();
-                }))
-                .child(
-                    div()
-                        .id("zoom-percent")
-                        .w_12()
-                        .text_center()
-                        .text_sm()
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgb(0xf1f0ee)).rounded_md())
-                        // Double-click the percentage to reset zoom to 100%,
-                        // replacing the dedicated reset button (Excalidraw/
-                        // Figma behavior). GPUI has no on_double_click helper,
-                        // so detect it via MouseDownEvent::click_count == 2.
-                        .on_mouse_down(MouseButton::Left, move |event, _, cx| {
-                            if event.click_count >= 2 {
-                                weak_reset.update(cx, |this, cx| this.zoom_reset(cx)).ok();
-                            }
-                        })
-                        .child(percent),
-                )
-                .child(bar_button("+", false).on_click(move |_, _, cx| {
-                    weak_in.update(cx, |this, cx| this.zoom_by(1.25, cx)).ok();
-                }))
-                .child(
-                    bar_icon_button("zoom-fit", false, ic::zoom_fit(icon_color(false)))
-                        .on_click(move |_, _, cx| {
-                    weak_fit
-                        .update(cx, |this, cx| {
-                            if let Some(bounds) = this.scene.content_bounds() {
-                                let viewport = this.viewport_bounds(cx).size;
-                                this.camera.zoom_to_fit(bounds, viewport);
-                                cx.notify();
-                            }
-                        })
-                        .ok();
-                }))
-                .child(
-                    bar_icon_button("toggle-grid", grid_on, ic::grid(icon_color(grid_on)))
-                        .on_click(move |_, _, cx| {
-                            weak_grid
-                                .update(cx, |this, cx| {
-                                    this.show_grid = !this.show_grid;
-                                    this.mark_dirty();
-                                    cx.notify();
-                                })
-                                .ok();
-                        }),
-                ),
-        )
+                bar_container()
+                    .child(bar_button("−", false).on_click(move |_, _, cx| {
+                        weak_out.update(cx, |this, cx| this.zoom_by(0.8, cx)).ok();
+                    }))
+                    .child(
+                        div()
+                            .id("zoom-percent")
+                            .w_12()
+                            .text_center()
+                            .text_sm()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(0xf1f0ee)).rounded_md())
+                            // Double-click the percentage to reset zoom to 100%,
+                            // replacing the dedicated reset button (Excalidraw/
+                            // Figma behavior). GPUI has no on_double_click helper,
+                            // so detect it via MouseDownEvent::click_count == 2.
+                            .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+                                if event.click_count >= 2 {
+                                    weak_reset.update(cx, |this, cx| this.zoom_reset(cx)).ok();
+                                }
+                            })
+                            .child(percent),
+                    )
+                    .child(bar_button("+", false).on_click(move |_, _, cx| {
+                        weak_in.update(cx, |this, cx| this.zoom_by(1.25, cx)).ok();
+                    }))
+                    .child(
+                        bar_icon_button("zoom-fit", false, ic::zoom_fit(icon_color(false)))
+                            .on_click(move |_, _, cx| {
+                                weak_fit
+                                    .update(cx, |this, cx| {
+                                        if let Some(bounds) = this.scene.content_bounds() {
+                                            let viewport = this.viewport_bounds(cx).size;
+                                            this.camera.zoom_to_fit(bounds, viewport);
+                                            cx.notify();
+                                        }
+                                    })
+                                    .ok();
+                            }),
+                    )
+                    .child(
+                        bar_icon_button("toggle-grid", grid_on, ic::grid(icon_color(grid_on)))
+                            .on_click(move |_, _, cx| {
+                                weak_grid
+                                    .update(cx, |this, cx| {
+                                        this.show_grid = !this.show_grid;
+                                        this.mark_dirty();
+                                        cx.notify();
+                                    })
+                                    .ok();
+                            }),
+                    ),
+            )
     }
 
     fn render_notice_bar(&self) -> impl IntoElement {
@@ -4853,9 +5217,10 @@ impl BoardView {
         let is_restart = matches!(self.update_state, UpdateState::Ready { .. });
         let (text, has_action): (String, bool) = match &self.update_state {
             UpdateState::Idle | UpdateState::Checking => return None,
-            UpdateState::Downloading { fraction } => {
-                (format!("正在下载更新 {}%", (fraction * 100.0) as u32), false)
-            }
+            UpdateState::Downloading { fraction } => (
+                format!("正在下载更新 {}%", (fraction * 100.0) as u32),
+                false,
+            ),
             UpdateState::Ready { version, notes, .. } => {
                 let mut t = format!("新版本 v{} 已就绪，重启以应用", version);
                 // Append the first line of the release notes, truncated, so the

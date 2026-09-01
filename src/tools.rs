@@ -99,8 +99,14 @@ pub enum DragState {
     /// Freehand stroke in progress. The `seed` is generated once at drag
     /// start and reused for every draft frame (and the committed stroke):
     /// rough hand-drawn jitter is seeded, so a fresh seed per frame would
-    /// make the whole line visibly "swim" while drawing.
-    Freedraw { points: Vec<WPoint>, seed: u64 },
+    /// make the whole line visibly "swim" while drawing. The collector
+    /// (crate::ink) decimates/smooths/widths the pointer stream as it goes;
+    /// both the draft preview and the committed element are built from it,
+    /// which keeps "committed == previewed".
+    Freedraw {
+        collector: crate::ink::InkCollector,
+        seed: u64,
+    },
     /// Moving the current selection.
     Moving {
         last_world: WPoint,

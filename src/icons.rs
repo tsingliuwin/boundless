@@ -39,10 +39,7 @@ impl IconCanvas for PathBuilder {
 
 /// Build an icon element: a square canvas that strokes `draw` (in 0..S coords)
 /// translated to the canvas origin, in `color`. The button must be S×S.
-pub fn icon(
-    color: Hsla,
-    draw: impl Fn(&mut PathBuilder) + 'static,
-) -> impl IntoElement {
+pub fn icon(color: Hsla, draw: impl Fn(&mut PathBuilder) + 'static) -> impl IntoElement {
     canvas(
         |_bounds, _window, _cx| (),
         move |bounds, _, window, _cx| {
@@ -352,6 +349,33 @@ pub fn stroke_width_icon(c: Hsla, width: f32) -> impl IntoElement {
             let x1 = f32::from(bounds.origin.x) + f32::from(bounds.size.width) - 3.0;
             b.move_to(point(px(x0), px(y)));
             b.line_to(point(px(x1), px(y)));
+            if let Ok(path) = b.build() {
+                window.paint_path(path, c);
+            }
+        },
+    )
+    .size_full()
+}
+
+// ---------------------------------------------------------------------
+// 笔锋 (ink taper) toggle: a wedge swelling from a hairline on the left
+// to a broad stroke on the right — the width variation the toggle enables.
+// ---------------------------------------------------------------------
+
+pub fn taper_icon(c: Hsla) -> impl IntoElement {
+    canvas(
+        |_b, _w, _cx| (),
+        move |bounds, _, window, _cx| {
+            let y = f32::from(bounds.origin.y) + f32::from(bounds.size.height) * 0.5;
+            let x0 = f32::from(bounds.origin.x) + 3.0;
+            let x1 = f32::from(bounds.origin.x) + f32::from(bounds.size.width) - 3.0;
+            let h = f32::from(bounds.size.height) * 0.38;
+            let mut b = PathBuilder::fill();
+            b.move_to(point(px(x0), px(y - 0.8)));
+            b.line_to(point(px(x1), px(y - h)));
+            b.line_to(point(px(x1), px(y + h)));
+            b.line_to(point(px(x0), px(y + 0.8)));
+            b.close();
             if let Ok(path) = b.build() {
                 window.paint_path(path, c);
             }

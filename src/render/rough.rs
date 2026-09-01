@@ -1,7 +1,7 @@
 //! Converts scene elements into GPUI paths with a hand-drawn look,
 //! powered by rough.js' Rust port (roughr / rough_piet).
 
-use gpui::{px, Hsla, Path, PathBuilder, Pixels, Point};
+use gpui::{px, FillOptions, Hsla, Path, PathBuilder, PathStyle, Pixels, Point};
 use rough_piet::KurboGenerator;
 use roughr::Srgba;
 
@@ -18,12 +18,39 @@ pub struct ReadyPath {
     pub color: Hsla,
 }
 
+/// Screen-space ribbon outline of a variable-width freedraw stroke: the ink
+/// pipeline's world-space outline scaled through the camera. Shared by the
+/// render branch and its tests (gpui's tessellated `Path` exposes no public
+/// geometry, so tests assert on this instead).
+fn ink_outline_screen(
+    el: &Element,
+    camera: &Camera,
+    canvas_origin: Point<Pixels>,
+) -> Vec<Point<Pixels>> {
+    let points = el.absolute_points();
+    let widths: Vec<f64> = el
+        .ink_widths()
+        .iter()
+        .map(|ratio| el.style.stroke_width * ratio)
+        .collect();
+    crate::ink::ribbon_outline(&points, &widths)
+        .iter()
+        .map(|wp| camera.world_to_screen(*wp, canvas_origin))
+        .collect()
+}
+
 /// Convert a 0xRRGGBB color + opacity into an Hsla.
 pub fn color_u32(rgb: u32, opacity: f32) -> Hsla {
     let r = ((rgb >> 16) & 0xff) as f32 / 255.0;
     let g = ((rgb >> 8) & 0xff) as f32 / 255.0;
     let b = (rgb & 0xff) as f32 / 255.0;
-    gpui::Rgba { r, g, b, a: opacity }.into()
+    gpui::Rgba {
+        r,
+        g,
+        b,
+        a: opacity,
+    }
+    .into()
 }
 
 fn srgba(rgb: u32, opacity: f32) -> Srgba {
@@ -126,7 +153,8 @@ pub fn paths_for_element(
     let fill_weight_px = camera.scale(style.stroke_width * 0.5).max(px(0.5));
     let dashed = style.stroke_style == StrokeStyle::Dashed;
 
-    let mut push_drawable = |drawable: &rough_piet::KurboDrawable<f64>, out: &mut Vec<ReadyPath>| {
+    let mut push_drawable = |drawable: &rough_piet::KurboDrawable<f64>,
+                             out: &mut Vec<ReadyPath>| {
         for set in &drawable.sets {
             match set.op_set_type {
                 OpSetType::FillPath => {
@@ -193,6 +221,34 @@ pub fn paths_for_element(
             let gen = KurboGenerator::new(options_for(style, el.seed, false));
             let points: Vec<_> = diamond_polygon(b).iter().map(|p| to_euclid(*p)).collect();
             push_drawable(&gen.polygon(&points), &mut out);
+        }
+        // Variable-width ink stroke (from the crate::ink pipeline): fill the
+        // ribbon outline instead of stroking a centerline. This arm must sit
+        // before the generic point-based arm below, which keeps legacy
+        // uniform strokes (empty widths) on the original rough path.
+        ElementKind::Freedraw { .. } if !el.ink_widths().is_empty() => {
+            let outline = ink_outline_screen(el, camera, canvas_origin);
+            if outline.len() < 2 {
+                return out;
+            }
+            // NonZero fill: the ribbon can self-intersect at sharp turns and
+            // an EvenOdd rule would punch holes there.
+            let mut builder =
+                PathBuilder::fill().with_style(PathStyle::Fill(FillOptions::non_zero()));
+            for (i, sp) in outline.iter().enumerate() {
+                if i == 0 {
+                    builder.move_to(*sp);
+                } else {
+                    builder.line_to(*sp);
+                }
+            }
+            builder.close();
+            if let Ok(path) = builder.build() {
+                out.push(ReadyPath {
+                    path,
+                    color: stroke_color,
+                });
+            }
         }
         ElementKind::Line { .. } | ElementKind::Arrow { .. } | ElementKind::Freedraw { .. } => {
             let points = el.absolute_points();
@@ -350,9 +406,21 @@ mod tests {
             ..Default::default()
         };
         let kinds = vec![
-            Element::new(ElementKind::Rectangle, WBounds::new(0.0, 0.0, 100.0, 80.0), style.clone()),
-            Element::new(ElementKind::Ellipse, WBounds::new(0.0, 0.0, 100.0, 80.0), style.clone()),
-            Element::new(ElementKind::Diamond, WBounds::new(0.0, 0.0, 100.0, 80.0), style.clone()),
+            Element::new(
+                ElementKind::Rectangle,
+                WBounds::new(0.0, 0.0, 100.0, 80.0),
+                style.clone(),
+            ),
+            Element::new(
+                ElementKind::Ellipse,
+                WBounds::new(0.0, 0.0, 100.0, 80.0),
+                style.clone(),
+            ),
+            Element::new(
+                ElementKind::Diamond,
+                WBounds::new(0.0, 0.0, 100.0, 80.0),
+                style.clone(),
+            ),
             Element::from_absolute_points(
                 |points| ElementKind::Arrow {
                     points,
@@ -363,7 +431,10 @@ mod tests {
                 style.clone(),
             ),
             Element::from_absolute_points(
-                |points| ElementKind::Freedraw { points },
+                |points| ElementKind::Freedraw {
+                    points,
+                    widths: Vec::new(),
+                },
                 (0..20)
                     .map(|i| WPoint::new(i as f64 * 5.0, (i as f64 * 0.7).sin() * 10.0))
                     .collect(),
@@ -437,5 +508,74 @@ mod tests {
         )
         .unwrap();
         assert_eq!(style.line_type, LineType::Straight);
+    }
+
+    fn horizontal_ink_stroke(widths: Vec<f64>) -> Element {
+        let mut style = ElementStyle::default();
+        style.stroke_width = 4.0;
+        let mut el = Element::from_absolute_points(
+            |points| ElementKind::Freedraw {
+                points,
+                widths: Vec::new(),
+            },
+            vec![WPoint::new(10.0, 0.0), WPoint::new(100.0, 0.0)],
+            style,
+        );
+        if let ElementKind::Freedraw { widths: w, .. } = &mut el.kind {
+            *w = widths;
+        }
+        el
+    }
+
+    #[test]
+    fn ink_stroke_fills_the_ribbon_outline() {
+        // A tapered horizontal stroke (widths 4 → 2 world units) must render
+        // as exactly one fill path whose outline covers the ribbon extents:
+        // half the max width above/below the centerline, half the end widths
+        // past the tips.
+        let camera = Camera::default();
+        let origin = gpui::point(px(0.0), px(0.0));
+        let el = horizontal_ink_stroke(vec![1.0, 0.5]);
+        let paths = paths_for_element(&el, &camera, origin);
+        assert_eq!(paths.len(), 1, "ink stroke renders as one fill path");
+
+        let outline = ink_outline_screen(&el, &camera, origin);
+        let (mut x0, mut y0, mut x1, mut y1) = (
+            f32::INFINITY,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+        );
+        for p in &outline {
+            x0 = x0.min(f32::from(p.x));
+            y0 = y0.min(f32::from(p.y));
+            x1 = x1.max(f32::from(p.x));
+            y1 = y1.max(f32::from(p.y));
+        }
+        assert!((x0 - 8.0).abs() < 1e-3, "cap back {x0}");
+        assert!((x1 - 101.0).abs() < 1e-3, "cap tip {x1}");
+        assert!((y0 + 2.0).abs() < 1e-3, "top {y0}");
+        assert!((y1 - 2.0).abs() < 1e-3, "bottom {y1}");
+    }
+
+    #[test]
+    fn ink_stroke_rendering_is_deterministic() {
+        let camera = Camera::default();
+        let origin = gpui::point(px(0.0), px(0.0));
+        let el = horizontal_ink_stroke(vec![0.6, 1.0, 0.4]);
+        let a = ink_outline_screen(&el, &camera, origin);
+        let b = ink_outline_screen(&el, &camera, origin);
+        assert_eq!(a, b);
+        assert_eq!(paths_for_element(&el, &camera, origin).len(), 1);
+    }
+
+    #[test]
+    fn legacy_uniform_freedraw_keeps_the_rough_path() {
+        // Empty widths = legacy stroke: still renders (rough stroked line),
+        // never through the ink branch.
+        let camera = Camera::default();
+        let origin = gpui::point(px(0.0), px(0.0));
+        let el = horizontal_ink_stroke(Vec::new());
+        assert!(!paths_for_element(&el, &camera, origin).is_empty());
     }
 }

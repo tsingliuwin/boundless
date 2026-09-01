@@ -66,6 +66,11 @@ tar = "0.4"
 windows = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
+    # Pen pressure: SetWindowSubclass/DefSubclassProc (Shell) and
+    # GetPointerInfo/GetPointerPenInfo (Input_Pointer) for the WM_POINTER
+    # hook that feeds stylus pressure into the ink pipeline.
+    "Win32_UI_Shell",
+    "Win32_UI_Input_Pointer",
     "Win32_Foundation",
 ] }
 # raw-window-handle is already in the dep graph (transitively via gpui); we add

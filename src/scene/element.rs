@@ -208,7 +208,9 @@ pub enum ElementKind {
     Ellipse,
     Diamond,
     /// Polyline; points relative to the element origin.
-    Line { points: Vec<WPoint> },
+    Line {
+        points: Vec<WPoint>,
+    },
     /// Polyline with arrowheads; points relative to the element origin.
     Arrow {
         points: Vec<WPoint>,
@@ -218,7 +220,20 @@ pub enum ElementKind {
         start_arrowhead: bool,
     },
     /// Freehand stroke; points relative to the element origin.
-    Freedraw { points: Vec<WPoint> },
+    ///
+    /// `widths` holds one stroke-width *ratio* (relative to
+    /// `style.stroke_width`) per point, parallel to `points`, produced by the
+    /// ink pipeline (`crate::ink`). An empty vec is the legacy uniform stroke:
+    /// it renders exactly like the pre-ink pipeline (single
+    /// `style.stroke_width` line) and is what old scene files deserialize to.
+    /// Ratios rather than absolute widths keep restyling natural — changing
+    /// the base width rescales the whole stroke — and serialization compact.
+    /// Like `stroke_width`, widths are not scaled by [`Element::rescale`].
+    Freedraw {
+        points: Vec<WPoint>,
+        #[serde(default)]
+        widths: Vec<f64>,
+    },
     Text {
         text: String,
         font_size: f64,
@@ -411,7 +426,7 @@ impl Element {
         match &self.kind {
             ElementKind::Line { points }
             | ElementKind::Arrow { points, .. }
-            | ElementKind::Freedraw { points } => points.iter().map(|p| origin + *p).collect(),
+            | ElementKind::Freedraw { points, .. } => points.iter().map(|p| origin + *p).collect(),
             _ => Vec::new(),
         }
     }
@@ -441,13 +456,17 @@ impl Element {
         match &mut self.kind {
             ElementKind::Line { points }
             | ElementKind::Arrow { points, .. }
-            | ElementKind::Freedraw { points } => {
+            | ElementKind::Freedraw { points, .. } => {
                 for p in points.iter_mut() {
                     p.x *= sx.abs();
                     p.y *= sy.abs();
                 }
             }
-            ElementKind::Text { font_size, wrap_width, .. } => {
+            ElementKind::Text {
+                font_size,
+                wrap_width,
+                ..
+            } => {
                 *font_size = (*font_size * esx.max(0.05)).clamp(4.0, 400.0);
                 if let Some(w) = wrap_width {
                     *w = (*w * esx).max(4.0);
@@ -472,7 +491,7 @@ impl Element {
         let new_origin = WPoint::new(new_bounds.x, new_bounds.y);
         if let ElementKind::Line { points }
         | ElementKind::Arrow { points, .. }
-        | ElementKind::Freedraw { points } = &mut self.kind
+        | ElementKind::Freedraw { points, .. } = &mut self.kind
         {
             for p in points.iter_mut() {
                 *p = old_origin + *p - new_origin;
@@ -490,7 +509,7 @@ impl Element {
         match &mut self.kind {
             ElementKind::Line { points }
             | ElementKind::Arrow { points, .. }
-            | ElementKind::Freedraw { points } => match points.get_mut(index) {
+            | ElementKind::Freedraw { points, .. } => match points.get_mut(index) {
                 Some(pt) => *pt = p - origin,
                 None => return,
             },
@@ -505,13 +524,29 @@ impl Element {
     pub fn insert_absolute_point_after(&mut self, seg: usize, p: WPoint) {
         let origin = WPoint::new(self.bounds.x, self.bounds.y);
         match &mut self.kind {
-            ElementKind::Line { points }
-            | ElementKind::Arrow { points, .. }
-            | ElementKind::Freedraw { points } => {
+            ElementKind::Line { points } | ElementKind::Arrow { points, .. } => {
                 if seg + 1 > points.len() {
                     return;
                 }
                 points.insert(seg + 1, p - origin);
+            }
+            ElementKind::Freedraw { points, widths } => {
+                if seg + 1 > points.len() {
+                    return;
+                }
+                // Only touch widths when they're actually parallel (legacy
+                // uniform strokes carry an empty vec).
+                let parallel = widths.len() == points.len();
+                points.insert(seg + 1, p - origin);
+                if parallel {
+                    let w = widths
+                        .get(seg + 1)
+                        .copied()
+                        .or_else(|| widths.last().copied());
+                    if let Some(w) = w {
+                        widths.insert(seg + 1, w);
+                    }
+                }
             }
             _ => return,
         }
@@ -523,13 +558,20 @@ impl Element {
     /// elements, out-of-range indices, or when only two points remain.
     pub fn remove_point(&mut self, index: usize) {
         match &mut self.kind {
-            ElementKind::Line { points }
-            | ElementKind::Arrow { points, .. }
-            | ElementKind::Freedraw { points } => {
+            ElementKind::Line { points } | ElementKind::Arrow { points, .. } => {
                 if points.len() <= 2 || index >= points.len() {
                     return;
                 }
                 points.remove(index);
+            }
+            ElementKind::Freedraw { points, widths } => {
+                if points.len() <= 2 || index >= points.len() {
+                    return;
+                }
+                points.remove(index);
+                if widths.len() == points.len() + 1 {
+                    widths.remove(index);
+                }
             }
             _ => return,
         }
@@ -538,7 +580,7 @@ impl Element {
 
     /// Hit test in world coordinates. `tol` is a world-space tolerance.
     pub fn hit_test(&self, p: WPoint, tol: f64) -> bool {
-        let stroke_tol = (self.style.stroke_width / 2.0).max(2.0) + tol;
+        let stroke_tol = (self.effective_stroke_width() / 2.0).max(2.0) + tol;
         match &self.kind {
             // Closed shapes: the whole bounding area is hit-testable (so a
             // click anywhere on the shape selects/moves it), regardless of
@@ -564,7 +606,10 @@ impl Element {
                 // Freedraw strokes are already dense, so they're left as-is.
                 let abs = self.absolute_points();
                 let pts = if self.style.line_type == LineType::Curved
-                    && matches!(self.kind, ElementKind::Line { .. } | ElementKind::Arrow { .. })
+                    && matches!(
+                        self.kind,
+                        ElementKind::Line { .. } | ElementKind::Arrow { .. }
+                    )
                     && abs.len() >= 2
                 {
                     curve_samples(&abs, 16)
@@ -574,6 +619,29 @@ impl Element {
                 distance_to_polygon(p, &pts, false) <= stroke_tol
             }
             ElementKind::Text { .. } => self.bounds.inflate(tol, tol).contains(p),
+        }
+    }
+
+    /// Widest stroke width in world units across this element: the base
+    /// `style.stroke_width`, or — for ink strokes carrying per-point width
+    /// ratios — `stroke_width × max(ratio)`. Used for hit-test tolerance so
+    /// thick tapered sections stay clickable.
+    pub fn effective_stroke_width(&self) -> f64 {
+        let base = self.style.stroke_width;
+        match &self.kind {
+            ElementKind::Freedraw { widths, .. } if !widths.is_empty() => {
+                base * widths.iter().cloned().fold(0.0f64, f64::max)
+            }
+            _ => base,
+        }
+    }
+
+    /// Per-point width ratios of a freehand stroke (parallel to its points);
+    /// empty for uniform legacy strokes and all other element kinds.
+    pub fn ink_widths(&self) -> &[f64] {
+        match &self.kind {
+            ElementKind::Freedraw { widths, .. } => widths,
+            _ => &[],
         }
     }
 }
@@ -757,7 +825,11 @@ mod tests {
                 vec![WPoint::new(0.0, 0.0), WPoint::new(50.0, 30.0)],
                 rect_style(),
             ),
-            Element::new_text(WPoint::new(5.0, 5.0), "你好 boundless".to_string(), rect_style()),
+            Element::new_text(
+                WPoint::new(5.0, 5.0),
+                "你好 boundless".to_string(),
+                rect_style(),
+            ),
         ];
         elements[0].style.background = Some(0xa5d8ff);
         let json = serde_json::to_string_pretty(&elements).unwrap();
@@ -794,7 +866,10 @@ mod tests {
     #[test]
     fn rescale_scales_points_and_font() {
         let mut el = Element::from_absolute_points(
-            |points| ElementKind::Freedraw { points },
+            |points| ElementKind::Freedraw {
+                points,
+                widths: Vec::new(),
+            },
             vec![WPoint::new(0.0, 0.0), WPoint::new(100.0, 100.0)],
             rect_style(),
         );
@@ -811,6 +886,107 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    fn freedraw_with_widths() -> Element {
+        let mut el = Element::from_absolute_points(
+            |points| ElementKind::Freedraw {
+                points,
+                widths: Vec::new(),
+            },
+            vec![
+                WPoint::new(10.0, 10.0),
+                WPoint::new(60.0, 10.0),
+                WPoint::new(60.0, 60.0),
+            ],
+            rect_style(),
+        );
+        if let ElementKind::Freedraw { widths, .. } = &mut el.kind {
+            *widths = vec![0.5, 1.0, 0.8];
+        }
+        el
+    }
+
+    #[test]
+    fn freedraw_widths_roundtrip() {
+        let el = freedraw_with_widths();
+        let json = serde_json::to_string(&el).unwrap();
+        let back: Element = serde_json::from_str(&json).unwrap();
+        assert_eq!(el, back);
+        assert_eq!(back.ink_widths(), &[0.5, 1.0, 0.8]);
+    }
+
+    #[test]
+    fn legacy_freedraw_without_widths_defaults_to_uniform() {
+        // Pre-ink scene files carry only "points" for freedraw: they must
+        // parse with empty widths (uniform legacy rendering).
+        let legacy = r#"{"id":"00000000-0000-0000-0000-000000000002","x":0.0,"y":0.0,"w":100.0,"h":0.0,"seed":1,"stroke":1973790,"background":null,"stroke_width":2.0,"roughness":1.0,"stroke_style":"solid","opacity":1.0,"kind":"freedraw","points":[{"x":0.0,"y":0.0},{"x":100.0,"y":0.0}]}"#;
+        let parsed: Element = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.ink_widths().is_empty());
+    }
+
+    #[test]
+    fn ink_hit_test_tolerance_follows_widest_point() {
+        // A stroke with a wide middle section: a click just outside the base
+        // width, within the widest section, must still hit.
+        let mut el = freedraw_with_widths();
+        el.style.stroke_width = 2.0;
+        let wide_tol = el.effective_stroke_width();
+        assert!((wide_tol - 2.0).abs() < 1e-9, "max ratio 1.0 × base 2.0");
+
+        // Shrink the base width: the effective width scales with it.
+        el.style.stroke_width = 10.0;
+        assert!((el.effective_stroke_width() - 10.0).abs() < 1e-9);
+
+        // Legacy uniform strokes report exactly the base width.
+        let uniform = Element::from_absolute_points(
+            |points| ElementKind::Freedraw {
+                points,
+                widths: Vec::new(),
+            },
+            vec![WPoint::new(0.0, 0.0), WPoint::new(100.0, 0.0)],
+            rect_style(),
+        );
+        assert!((uniform.effective_stroke_width() - rect_style().stroke_width).abs() < 1e-9);
+    }
+
+    #[test]
+    fn point_edits_keep_widths_parallel() {
+        let mut el = freedraw_with_widths();
+
+        // Insert after segment 0 → widths grow, inheriting the following
+        // vertex's width (the inserted point splits its segment).
+        el.insert_absolute_point_after(0, WPoint::new(35.0, 10.0));
+        assert_eq!(el.ink_widths().len(), 4);
+        assert_eq!(el.ink_widths()[1], 1.0);
+
+        // Remove that vertex again → widths shrink back in step.
+        el.remove_point(1);
+        assert_eq!(el.ink_widths().len(), 3);
+        assert_eq!(el.ink_widths().to_vec(), vec![0.5, 1.0, 0.8]);
+
+        // Legacy uniform strokes stay uniform through edits.
+        let mut uniform = Element::from_absolute_points(
+            |points| ElementKind::Freedraw {
+                points,
+                widths: Vec::new(),
+            },
+            vec![WPoint::new(0.0, 0.0), WPoint::new(100.0, 0.0)],
+            rect_style(),
+        );
+        uniform.insert_absolute_point_after(0, WPoint::new(50.0, 0.0));
+        assert!(uniform.ink_widths().is_empty());
+        uniform.remove_point(1);
+        assert!(uniform.ink_widths().is_empty());
+    }
+
+    #[test]
+    fn rescale_leaves_widths_untouched() {
+        // Consistent with stroke_width: resizing geometry does not rescale
+        // ink width ratios.
+        let mut el = freedraw_with_widths();
+        el.rescale(2.0, 2.0, WPoint::new(0.0, 0.0));
+        assert_eq!(el.ink_widths().to_vec(), vec![0.5, 1.0, 0.8]);
     }
 
     #[test]
@@ -841,7 +1017,11 @@ mod tests {
         }
         t.rescale(2.0, 2.0, WPoint::new(0.0, 0.0));
         match t.kind {
-            ElementKind::Text { font_size, wrap_width, .. } => {
+            ElementKind::Text {
+                font_size,
+                wrap_width,
+                ..
+            } => {
                 assert!((font_size - DEFAULT_FONT_SIZE * 2.0).abs() < 1e-9);
                 assert!((wrap_width.unwrap() - 200.0).abs() < 1e-9);
             }
@@ -850,11 +1030,7 @@ mod tests {
     }
 
     fn line(points: Vec<WPoint>) -> Element {
-        Element::from_absolute_points(
-            |points| ElementKind::Line { points },
-            points,
-            rect_style(),
-        )
+        Element::from_absolute_points(|points| ElementKind::Line { points }, points, rect_style())
     }
 
     #[test]
@@ -884,7 +1060,10 @@ mod tests {
         // Drag the first vertex up-left past the current bounds.
         el.set_absolute_point(0, WPoint::new(-20.0, -10.0));
         let abs = el.absolute_points();
-        assert_eq!(abs, vec![WPoint::new(-20.0, -10.0), WPoint::new(100.0, 60.0)]);
+        assert_eq!(
+            abs,
+            vec![WPoint::new(-20.0, -10.0), WPoint::new(100.0, 60.0)]
+        );
         // Bounds renormalized to enclose the new points exactly.
         assert_eq!((el.bounds.x, el.bounds.y), (-20.0, -10.0));
         assert_eq!((el.bounds.w, el.bounds.h), (120.0, 70.0));

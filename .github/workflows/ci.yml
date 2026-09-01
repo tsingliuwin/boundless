@@ -1,28 +1,57 @@
-# Cache Warmer: pre-compiles release-mode dependencies on main so that
-# tag-triggered Release builds (release.yml) hit the cache and only
-# recompile the app crate + link.
+# CI: unit tests + dependency cache warming.
+#
+# Jobs:
+#   test  - `cargo test` on Windows (the dev platform). Every push to main,
+#           all PRs. Catches regressions in the unit-tested modules (scene,
+#           ink, render, camera, history, ai, updater) before they land.
+#   warm  - pre-compiles release-mode dependencies on main so that
+#           tag-triggered Release builds (release.yml) hit the cache and only
+#           recompile the app crate + link.
 #
 # Triggers:
-#   - push to main when Cargo.lock changes (new/updated deps)
+#   - push to main (test always; warm only when Cargo.lock changes)
+#   - pull requests (test only)
 #   - manual (workflow_dispatch)
-# Skips "chore: bump version" commits (those trigger the full Release build
-# simultaneously - no point warming in parallel).
+# Warm skips "chore: bump version" commits (those trigger the full Release
+# build simultaneously - no point warming in parallel).
 
-name: CI Cache Warmer
+name: CI
 
 on:
   workflow_dispatch:
+  pull_request:
   push:
     branches:
       - main
-    paths:
-      - "Cargo.lock"
 
 jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          # Distinct key: debug test artifacts must not poison the release
+          # cache shared with release.yml.
+          shared-key: "boundless-test-x86_64-pc-windows-msvc"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: "true"
+
+      - name: Run unit tests
+        run: cargo test
+
   warm:
+    needs: test
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      (github.event.head_commit != null && !startsWith(github.event.head_commit.message, 'chore: bump version'))
+      (github.event.head_commit != null &&
+       !startsWith(github.event.head_commit.message, 'chore: bump version') &&
+       contains(join(github.event.head_commit.added, ' ') + ' ' + join(github.event.head_commit.modified, ' ') + ' ' + join(github.event.head_commit.removed, ' '), 'Cargo.lock'))
     strategy:
       fail-fast: false
       matrix:
