@@ -16,9 +16,38 @@ use boundless::ai::settings::AiSettings;
 use futures::StreamExt;
 use std::sync::{Arc, Mutex};
 
-/// The fixed exam prompt — keep it identical across runs so rounds are
-/// comparable.
-const PROMPT: &str = "请在画布上设计一份精美的教师节黑板报。";
+/// The fixed exam prompts — keep them identical across runs so rounds are
+/// comparable. Select via CLI arg: `blackboard` (default) or `ink`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Exam {
+    Blackboard,
+    InkLandscape,
+}
+
+impl Exam {
+    fn from_args() -> Self {
+        match std::env::args().nth(1).as_deref() {
+            Some("ink") | Some("ink-wash") => Exam::InkLandscape,
+            _ => Exam::Blackboard,
+        }
+    }
+
+    fn prompt(self) -> &'static str {
+        match self {
+            Exam::Blackboard => "请在画布上设计一份精美的教师节黑板报。",
+            Exam::InkLandscape => {
+                "请画一幅意境悠远的水墨山水画：远山淡墨层层递进、水面留白、一叶扁舟，左上竖排题跋并配一方朱红印章。"
+            }
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Exam::Blackboard => "教师节黑板报",
+            Exam::InkLandscape => "水墨山水画",
+        }
+    }
+}
 
 fn main() {
     if let Err(e) = run() {
@@ -28,6 +57,8 @@ fn main() {
 }
 
 fn run() -> anyhow::Result<()> {
+    let exam = Exam::from_args();
+    let prompt = exam.prompt();
     let settings = AiSettings::load();
     if settings.api_key.trim().is_empty() {
         anyhow::bail!("未配置 API Key（~/.boundless/config.json 或环境变量 OPENAI_API_KEY）");
@@ -36,14 +67,14 @@ fn run() -> anyhow::Result<()> {
     let snapshot = Arc::new(Mutex::new(Vec::new()));
     let request = BoundlessAgent::stream(
         &settings,
-        PROMPT.to_string(),
+        prompt.to_string(),
         Vec::new(),
         snapshot.clone(),
         String::new(),
     )?;
-    println!("模型: {} — 考题: {PROMPT}", settings.model);
+    println!("模型: {} — 考题[{}]: {prompt}", settings.model, exam.name());
 
-    let log_path = boundless::ai::log::begin_run(PROMPT, &settings.model);
+    let log_path = boundless::ai::log::begin_run(prompt, &settings.model);
 
     // The virtual board: CanvasOps are applied here live (mirroring the
     // board's semantics via eval::apply) and the tool's oneshot reply is
@@ -115,7 +146,10 @@ fn run() -> anyhow::Result<()> {
     }
 
     // The model narrated but drew nothing — report and fail.
-    let report = eval::evaluate(&canvas, drew, total_calls);
+    let report = match exam {
+        Exam::Blackboard => eval::evaluate(&canvas, drew, total_calls),
+        Exam::InkLandscape => eval::evaluate_ink(&canvas, drew, total_calls),
+    };
     let report_text = report.to_text();
     println!("{report_text}");
 

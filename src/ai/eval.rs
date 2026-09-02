@@ -40,6 +40,8 @@ pub struct VirtualElement {
     pub font_size: f64,
     pub stroke: u32,
     pub fill: Option<u32>,
+    /// Element opacity (0..1) — the ink-wash rubric grades ink density.
+    pub opacity: f64,
 }
 
 /// The virtual canvas state after replaying a run's ops.
@@ -359,6 +361,7 @@ pub fn apply(
                 font_size: 0.0,
                 stroke: style.stroke.unwrap_or(0x1e1e1e),
                 fill: style.fill,
+                opacity: f64::from(style.opacity.unwrap_or(1.0)),
             });
             if let Some(t) = text {
                 if !t.is_empty() {
@@ -374,6 +377,7 @@ pub fn apply(
                         font_size: 16.0,
                         stroke: style.stroke.unwrap_or(0x1e1e1e),
                         fill: None,
+                        opacity: f64::from(style.opacity.unwrap_or(1.0)),
                     });
                 }
             }
@@ -413,6 +417,7 @@ pub fn apply(
                 font_size: font_size.unwrap_or(20.0),
                 stroke: style.stroke.unwrap_or(0x1e1e1e),
                 fill: style.fill,
+                opacity: f64::from(style.opacity.unwrap_or(1.0)),
             });
             c.ops_applied += 1;
             msg = format!("已添加文本 id={id8}");
@@ -452,6 +457,7 @@ fn push_shape(
         font_size: 0.0,
         stroke: style.stroke.unwrap_or(0x1e1e1e),
         fill: style.fill,
+        opacity: f64::from(style.opacity.unwrap_or(1.0)),
     });
     if let Some(t) = label {
         if !t.is_empty() {
@@ -469,6 +475,7 @@ fn push_shape(
                 font_size: fs,
                 stroke: style.stroke.unwrap_or(0x1e1e1e),
                 fill: None,
+                opacity: f64::from(style.opacity.unwrap_or(1.0)),
             });
         }
     }
@@ -988,6 +995,397 @@ pub fn evaluate(
     EvalReport { passed, checks }
 }
 
+// ---------------------------------------------------------------------------
+// 水墨山水 rubric
+// ---------------------------------------------------------------------------
+
+/// Grade an ink-wash landscape replay. The rubric is deliberately different
+/// from the blackboard one: the soul of 水墨 is ink-density layering (淡墨远山
+/// → 浓墨近岸), generous empty space, and the literati finishing touches
+/// (竖排题跋 + 朱印).
+pub fn evaluate_ink(
+    canvas: &VirtualCanvas,
+    drew_anything: bool,
+    total_tool_calls: usize,
+) -> EvalReport {
+    let mut checks = Vec::new();
+
+    // -- 宣纸底 --
+    let paper_ok = canvas
+        .background
+        .map(|c| luminance(c) >= 0.75)
+        .unwrap_or(false);
+    checks.push(check(
+        "宣纸底（浅色）",
+        paper_ok,
+        match canvas.background {
+            Some(c) => format!("背景 #{c:06x}，亮度 {:.2}", luminance(c)),
+            None => "未设置画布背景".to_string(),
+        },
+    ));
+
+    // -- 远山层：宽扁椭圆、带填充、淡墨 --
+    let is_mountain = |e: &VirtualElement| {
+        matches!(e.kind, "ellipse")
+            && e.w >= 250.0
+            && e.h >= 80.0
+            && e.w / e.h.max(1.0) >= 1.8
+            && e.fill.is_some()
+    };
+    let mountains: Vec<&VirtualElement> =
+        canvas.elements.iter().filter(|e| is_mountain(e)).collect();
+    let light_mountains = mountains.iter().filter(|m| m.opacity <= 0.5).count();
+    checks.push(check(
+        "远山层 ≥ 3（宽扁椭圆淡墨填充）",
+        light_mountains >= 3,
+        format!(
+            "宽扁椭圆 {} 只，其中淡墨填充 {} 只",
+            mountains.len(),
+            light_mountains
+        ),
+    ));
+
+    // -- 墨色递进：远山透明度或墨色有梯度（不能全画布一个浓淡）--
+    let opacities: Vec<f64> = mountains.iter().map(|m| m.opacity).collect();
+    let opacity_spread = opacities.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+        - opacities.iter().cloned().fold(f64::INFINITY, f64::min);
+    let fill_variety = mountains
+        .iter()
+        .map(|m| m.fill)
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    let gradation = mountains.len() >= 2 && (opacity_spread >= 0.12 || fill_variety >= 2);
+    checks.push(check(
+        "墨色浓淡有递进",
+        gradation,
+        format!(
+            "透明度跨度 {:.2}，墨色 {} 种",
+            opacity_spread.max(0.0),
+            fill_variety
+        ),
+    ));
+
+    // -- 浓墨近景 ≥ 1 --
+    let dark_near = canvas
+        .elements
+        .iter()
+        .filter(|e| {
+            matches!(e.kind, "rectangle" | "ellipse")
+                && e.fill.is_some()
+                && (e.opacity >= 0.55 || luminance(e.fill.unwrap_or(0xFFFFFF)) <= 0.35)
+        })
+        .count();
+    checks.push(check(
+        "浓墨近景 ≥ 1（近实远虚）",
+        dark_near >= 1,
+        format!("共 {dark_near} 处"),
+    ));
+
+    // -- 竖排题跋：一列单字（≥3 字、横向聚拢）或窄高文本块 --
+    let single_chars: Vec<&VirtualElement> = texts_of(canvas)
+        .into_iter()
+        .filter(|t| {
+            t.text
+                .as_deref()
+                .map(|s| {
+                    s.chars().count() == 1
+                        && s.chars().next().map(|c| !c.is_ascii()).unwrap_or(false)
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+    let has_column = if single_chars.len() >= 3 {
+        let xs: Vec<f64> = single_chars.iter().map(|t| t.x).collect();
+        let (min_x, max_x) = (
+            xs.iter().cloned().fold(f64::INFINITY, f64::min),
+            xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        );
+        max_x - min_x <= 80.0
+    } else {
+        false
+    };
+    let narrow_tall = texts_of(canvas).iter().any(|t| {
+        let chars = t.text.as_deref().map(|s| s.chars().count()).unwrap_or(0);
+        (4..=16).contains(&chars) && t.w <= 90.0 && t.h >= t.w * 1.8
+    });
+    checks.push(check(
+        "竖排题跋",
+        has_column || narrow_tall,
+        format!(
+            "单字 {} 个{}，窄高文本 {}",
+            single_chars.len(),
+            if has_column {
+                "（成列）"
+            } else {
+                "（未成列）"
+            },
+            if narrow_tall { "有" } else { "无" }
+        ),
+    ));
+
+    // -- 朱印：小型红 dominant 方块 --
+    let seal = canvas.elements.iter().any(|e| {
+        matches!(e.kind, "rectangle" | "ellipse")
+            && e.w <= 50.0
+            && e.h <= 50.0
+            && e.fill
+                .map(|f| {
+                    let r = ((f >> 16) & 0xff) as f64;
+                    let g = ((f >> 8) & 0xff) as f64;
+                    let b = (f & 0xff) as f64;
+                    r - g.max(b) >= 30.0 && luminance(f) <= 0.55
+                })
+                .unwrap_or(false)
+    });
+    checks.push(check(
+        "朱红印章",
+        seal,
+        if seal {
+            "有".to_string()
+        } else {
+            "缺".to_string()
+        },
+    ));
+
+    // -- 点景（舟/雁/树）：小型线形或小形状 --
+    let small_lines = canvas
+        .elements
+        .iter()
+        .filter(|e| matches!(e.kind, "line" | "arrow") && e.w <= 220.0 && e.h <= 120.0)
+        .count();
+    let small_shapes = canvas
+        .elements
+        .iter()
+        .filter(|e| matches!(e.kind, "ellipse" | "diamond") && !is_mountain(e) && e.w <= 120.0)
+        .count();
+    checks.push(check(
+        "点景（舟/雁/树）≥ 1",
+        small_lines + small_shapes >= 1,
+        format!("小型线形 {small_lines}，小形状 {small_shapes}"),
+    ));
+
+    // -- 留白密度（粗代理：元素 bbox 总面积，重叠会高估，阈值放宽）--
+    let total_area: f64 = canvas.elements.iter().map(|e| e.w * e.h).sum();
+    let sparse = total_area <= 0.75 * CANVAS_W * CANVAS_H;
+    checks.push(check(
+        "画面密度 ≤ 75%（留白）",
+        sparse,
+        format!(
+            "元素面积合计约 {:.0}%",
+            total_area / (CANVAS_W * CANVAS_H) * 100.0
+        ),
+    ));
+
+    // -- 无越界 --
+    let out_of_bounds: Vec<String> = canvas
+        .elements
+        .iter()
+        .filter(|e| {
+            e.x < -BOUNDS_TOL
+                || e.y < -BOUNDS_TOL
+                || e.x + e.w > CANVAS_W + BOUNDS_TOL
+                || e.y + e.h > CANVAS_H + BOUNDS_TOL
+        })
+        .map(|e| format!("{}({:.0},{:.0})", e.kind, e.x, e.y))
+        .collect();
+    checks.push(check(
+        "全部元素在可见范围内",
+        out_of_bounds.is_empty(),
+        if out_of_bounds.is_empty() {
+            "无越界".to_string()
+        } else {
+            format!("越界: {}", out_of_bounds.join("、"))
+        },
+    ));
+
+    // -- 纪律 --
+    checks.push(check(
+        "无失败工具调用",
+        canvas.ops_failed == 0,
+        format!("失败 {} 次", canvas.ops_failed),
+    ));
+    let total = total_tool_calls.max(canvas.ops_applied + canvas.ops_failed);
+    checks.push(check(
+        format!("工具调用 ≤ {MAX_TOOL_CALLS}"),
+        total <= MAX_TOOL_CALLS,
+        format!("共 {total} 次"),
+    ));
+    checks.push(check(
+        "确实画了东西",
+        drew_anything,
+        if drew_anything {
+            "有绘制".to_string()
+        } else {
+            "未调用绘图工具".to_string()
+        },
+    ));
+
+    let passed = checks.iter().all(|c| c.passed);
+    EvalReport { passed, checks }
+}
+
+fn texts_of(canvas: &VirtualCanvas) -> Vec<&VirtualElement> {
+    canvas
+        .elements
+        .iter()
+        .filter(|e| e.kind == "text" || e.kind == "label")
+        .collect()
+}
+
+#[cfg(test)]
+mod ink_tests {
+    use super::*;
+    use crate::ai::canvas_ops::OpFillStyle;
+    use crate::ai::canvas_ops::OpPoint;
+
+    fn pt(x: f64, y: f64) -> OpPoint {
+        OpPoint::new(x, y)
+    }
+
+    fn ink_ops() -> Vec<(CanvasOp, Option<String>)> {
+        let mut ops = vec![(
+            CanvasOp::SetBackground {
+                color: Some(0xf5efdc),
+            },
+            None,
+        )];
+        let layers = [
+            (80.0, 120.0, 700.0, 240.0, 0.2),
+            (300.0, 180.0, 750.0, 260.0, 0.3),
+            (520.0, 260.0, 700.0, 250.0, 0.42),
+            (200.0, 420.0, 800.0, 280.0, 0.8),
+        ];
+        for (x, y, w, h, op) in layers {
+            ops.push((
+                CanvasOp::Ellipse {
+                    x,
+                    y,
+                    w,
+                    h,
+                    style: CanvasStyle {
+                        fill: Some(0x6b7680),
+                        opacity: Some(op),
+                        fill_style: Some(OpFillStyle::Solid),
+                        ..Default::default()
+                    },
+                    text: None,
+                },
+                None,
+            ));
+        }
+        // 孤舟：一根短横线
+        ops.push((
+            CanvasOp::Line {
+                points: vec![pt(760.0, 700.0), pt(860.0, 700.0)],
+                style: CanvasStyle {
+                    stroke: Some(0x3a4148),
+                    ..Default::default()
+                },
+                text: None,
+            },
+            None,
+        ));
+        // 竖排题跋：一列单字
+        for (i, ch) in ["远", "屿", "含", "烟"].into_iter().enumerate() {
+            ops.push((
+                CanvasOp::Text {
+                    x: 60.0,
+                    y: 100.0 + i as f64 * 40.0,
+                    text: ch.into(),
+                    font_size: Some(18.0),
+                    align: None,
+                    font_family: Some("kai".into()),
+                    wrap_width: None,
+                    style: CanvasStyle {
+                        stroke: Some(0x3a3a3a),
+                        ..Default::default()
+                    },
+                },
+                None,
+            ));
+        }
+        // 朱印
+        ops.push((
+            CanvasOp::Rectangle {
+                x: 60.0,
+                y: 280.0,
+                w: 22.0,
+                h: 22.0,
+                style: CanvasStyle {
+                    fill: Some(0xB33A2B),
+                    ..Default::default()
+                },
+                text: None,
+            },
+            None,
+        ));
+        ops
+    }
+
+    #[test]
+    fn well_formed_ink_painting_passes() {
+        let ops = ink_ops();
+        let canvas = replay(&ops);
+        let report = evaluate_ink(&canvas, true, ops.len());
+        assert!(
+            report.passed,
+            "report:
+{}",
+            report.to_text()
+        );
+    }
+
+    #[test]
+    fn ink_without_seal_fails() {
+        let ops: Vec<_> = ink_ops()
+            .into_iter()
+            .filter(|(op, _)| !matches!(op, CanvasOp::Rectangle { .. }))
+            .collect();
+        let canvas = replay(&ops);
+        let report = evaluate_ink(&canvas, true, ops.len());
+        let seal = report.checks.iter().find(|c| c.name == "朱红印章").unwrap();
+        assert!(!seal.passed);
+        assert!(!report.passed);
+    }
+
+    #[test]
+    fn ink_without_gradation_fails() {
+        let mut ops = ink_ops();
+        for (op, _) in ops.iter_mut() {
+            if let CanvasOp::Ellipse { style, w, h, .. } = op {
+                if *w >= 250.0 && *h >= 80.0 {
+                    style.opacity = Some(0.3);
+                }
+            }
+        }
+        let canvas = replay(&ops);
+        let report = evaluate_ink(&canvas, true, ops.len());
+        let g = report
+            .checks
+            .iter()
+            .find(|c| c.name.contains("递进"))
+            .unwrap();
+        assert!(!g.passed, "detail: {}", g.detail);
+    }
+
+    #[test]
+    fn ink_without_column_fails() {
+        let mut ops = ink_ops();
+        // 把题跋单字横向摊开，破坏竖排列
+        for (i, (op, _)) in ops.iter_mut().enumerate() {
+            if let CanvasOp::Text { x, .. } = op {
+                if *x == 60.0 {
+                    *x = 60.0 + (i % 4) as f64 * 150.0;
+                }
+            }
+        }
+        let canvas = replay(&ops);
+        let report = evaluate_ink(&canvas, true, ops.len());
+        let col = report.checks.iter().find(|c| c.name == "竖排题跋").unwrap();
+        assert!(!col.passed, "detail: {}", col.detail);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1164,6 +1562,7 @@ mod tests {
             font_size: 20.0,
             stroke: 0xFFFFFF,
             fill: None,
+            opacity: 1.0,
         });
         let report = evaluate(&canvas, true, 0);
         let check = report
