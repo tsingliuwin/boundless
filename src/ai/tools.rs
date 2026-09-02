@@ -1098,4 +1098,66 @@ mod tests {
         assert_eq!(e.to_string(), "找不到元素 id=abc");
         assert_eq!(e.code, CanvasOpErrorCode::NotFound);
     }
+
+    /// End-to-end tool-chain test without GPUI: the tool emits
+    /// ToolCall → CanvasOp → (caller applies + replies) → ToolResult. A
+    /// successful apply MUST yield `is_error == false` on the ToolResult —
+    /// this is the exact chain the headless eval harness depends on.
+    #[test]
+    fn tool_result_not_error_after_successful_reply() {
+        use futures::future::FutureExt;
+        use futures::task::noop_waker_ref;
+        use std::task::Context;
+
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<AgentEvent>();
+        let tool = TextTool { events: tx };
+        let args: TextArgs = serde_json::from_str(
+            r#"{"x":10.0,"y":10.0,"text":"你好","font_size":20.0}"#,
+        )
+        .unwrap();
+        let mut fut = Box::pin(tool.call(args));
+        let waker = noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+
+        // First poll: emits ToolCall + CanvasOp, then pends on the reply.
+        match std::future::Future::poll(fut.as_mut(), &mut cx) {
+            std::task::Poll::Pending => {}
+            std::task::Poll::Ready(_) => panic!("tool completed before reply"),
+        }
+
+        // Drain events until the CanvasOp, then reply exactly like the
+        // eval harness / panel does.
+        let mut replied = false;
+        while let Ok(Some(event)) = rx.try_next() {
+            match event {
+                AgentEvent::CanvasOp { reply, .. } => {
+                    reply
+                        .send(Ok("已添加文本 id=test1234".to_string()))
+                        .expect("reply send");
+                    replied = true;
+                }
+                AgentEvent::ToolResult { is_error, result, .. } => {
+                    panic!("ToolResult before reply: is_error={is_error} {result}");
+                }
+                _ => {}
+            }
+        }
+        assert!(replied, "no CanvasOp event to reply to");
+
+        // Completion poll: emits the ToolResult.
+        match std::future::Future::poll(fut.as_mut(), &mut cx) {
+            std::task::Poll::Ready(Ok(msg)) => assert!(msg.contains("test1234")),
+            _ => panic!("tool did not complete after reply"),
+        }
+
+        // The ToolResult must carry is_error=false.
+        let mut saw_result = false;
+        while let Ok(Some(event)) = rx.try_next() {
+            if let AgentEvent::ToolResult { is_error, result, .. } = event {
+                saw_result = true;
+                assert!(!is_error, "successful reply logged as error: {result}");
+            }
+        }
+        assert!(saw_result, "no ToolResult event");
+    }
 }

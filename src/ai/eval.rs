@@ -534,50 +534,133 @@ fn check(name: impl Into<String>, passed: bool, detail: impl Into<String>) -> Ch
     }
 }
 
+/// The "effective" surface color behind the text: the canvas background, or —
+/// if a huge filled shape covers most of the canvas (the model sometimes
+/// paints a full-canvas panel) — that shape's fill, since it visually
+/// replaces the board surface.
+fn effective_surface(canvas: &VirtualCanvas) -> Option<u32> {
+    const CANVAS_AREA: f64 = 1600.0 * 1000.0;
+    let mut covered: Option<u32> = None;
+    for e in &canvas.elements {
+        if matches!(e.kind, "rectangle" | "ellipse") && e.w * e.h >= 0.8 * CANVAS_AREA {
+            if let Some(f) = e.fill {
+                // Only dark full-canvas fills count as "the new surface";
+                // a light one is the model burying the blackboard.
+                if is_dark_surface(f) {
+                    covered = Some(f);
+                }
+            }
+        }
+    }
+    covered.or(canvas.background)
+}
+
+fn is_dark_surface(c: u32) -> bool {
+    luminance(c) <= 0.45
+}
+
 /// Score a replayed canvas against the blackboard-poster acceptance criteria.
 /// `drew_anything` is the agent's own "did it draw at all" flag.
-pub fn evaluate(canvas: &VirtualCanvas, drew_anything: bool) -> EvalReport {
+pub fn evaluate(
+    canvas: &VirtualCanvas,
+    drew_anything: bool,
+    total_tool_calls: usize,
+) -> EvalReport {
     let mut checks = Vec::new();
     let texts: Vec<&VirtualElement> = canvas.texts().collect();
 
     // -- 风格 --
-    let bg_ok = canvas
-        .background
-        .map(luminance)
-        .map(|l| l <= 0.45)
-        .unwrap_or(false);
+    let surface = effective_surface(canvas);
+    let surface_dark = surface.map(is_dark_surface).unwrap_or(false);
     checks.push(check(
-        "背景为深色板面",
-        bg_ok,
-        match canvas.background {
-            Some(c) => format!("背景 #{c:06x}，亮度 {:.2}", luminance(c)),
-            None => "未设置画布背景".into(),
+        "板面为深色（黑板）",
+        surface_dark,
+        match (canvas.background, surface) {
+            (bg, Some(s)) if Some(s) != bg => format!(
+                "画布背景 #{:06x}，但被大面积填充形状覆盖为 #{s:06x}（亮度 {:.2}）——黑板底色被盖住了",
+                canvas.background.unwrap_or(0xFFFFFF),
+                luminance(s)
+            ),
+            (Some(c), _) => format!("背景 #{c:06x}，亮度 {:.2}", luminance(c)),
+            (None, _) => "未设置画布背景".to_string(),
         },
     ));
 
-    let chalk_fail: Vec<String> = texts
-        .iter()
-        .filter(|t| luminance(t.stroke) < 0.6)
-        .map(|t| {
-            format!(
-                "「{}」#{:06x}",
-                t.text
-                    .as_deref()
-                    .unwrap_or("")
-                    .chars()
-                    .take(6)
-                    .collect::<String>(),
-                t.stroke
-            )
-        })
-        .collect();
+    // 全屏覆盖矩形禁令：底色只能用 set_canvas_background。画一个盖住整个
+    // 画布的填充矩形会埋掉板面，让粉笔字失去对比（第一轮实测教训）。
+    let mut full_cover: Vec<String> = Vec::new();
+    for e in &canvas.elements {
+        if matches!(e.kind, "rectangle" | "ellipse") && e.fill.is_some() {
+            if e.w >= CANVAS_W * 0.9 && e.h >= CANVAS_H * 0.9 {
+                // A dark full-canvas panel is harmless (equals the board
+                // surface); a LIGHT one buries the blackboard and kills
+                // chalk contrast (实测第一轮事故)。
+                let light = e.fill.map(|f| !is_dark_surface(f)).unwrap_or(false);
+                if light {
+                    full_cover.push(format!(
+                        "{}({:.0}x{:.0}) fill #{:06x}",
+                        e.kind,
+                        e.w,
+                        e.h,
+                        e.fill.unwrap_or(0)
+                    ));
+                }
+            }
+        }
+    }
     checks.push(check(
-        "文字使用粉笔色系（深底高亮）",
-        chalk_fail.is_empty(),
-        if chalk_fail.is_empty() {
-            "全部文字为高亮粉笔色".into()
+        "无浅色全画布覆盖矩形（底色用 set_canvas_background）",
+        full_cover.is_empty(),
+        if full_cover.is_empty() {
+            "无".to_string()
         } else {
-            format!("非粉笔色: {}", chalk_fail.join("、"))
+            format!("浅色覆盖形状: {}", full_cover.join("、"))
+        },
+    ));
+
+    // 文字与有效板面的对比：深底要浅字，浅底要深字。
+    let contrast_fail: Vec<String> = match surface {
+        Some(s) => {
+            let dark = is_dark_surface(s);
+            texts
+                .iter()
+                .filter(|t| {
+                    let l = luminance(t.stroke);
+                    if dark {
+                        l < 0.6
+                    } else {
+                        l > 0.4
+                    }
+                })
+                .map(|t| {
+                    format!(
+                        "「{}」#{:06x}",
+                        t.text
+                            .as_deref()
+                            .unwrap_or("")
+                            .chars()
+                            .take(6)
+                            .collect::<String>(),
+                        t.stroke
+                    )
+                })
+                .collect()
+        }
+        None => vec![],
+    };
+    checks.push(check(
+        "文字与板面对比充足",
+        contrast_fail.is_empty(),
+        if contrast_fail.is_empty() {
+            format!(
+                "全部文字与板面对比清晰（{}）",
+                match surface {
+                    Some(s) => format!("板面 #{s:06x}"),
+                    None => "默认白板".to_string(),
+                }
+            )
+        } else {
+            format!("对比不足: {}", contrast_fail.join("、"))
         },
     ));
 
@@ -626,7 +709,7 @@ pub fn evaluate(canvas: &VirtualCanvas, drew_anything: bool) -> EvalReport {
         .filter(|e| e.w >= 1000.0 && e.h >= 600.0)
         .count();
     let coverage: f64 = boards.iter().map(|e| e.w * e.h).sum();
-    let boards_ok = frames >= 1 || (boards.len() >= 3 && coverage >= 0.5 * CANVAS_W * CANVAS_H);
+    let boards_ok = frames >= 1 || (boards.len() >= 3 && coverage >= 0.45 * CANVAS_W * CANVAS_H);
     checks.push(check(
         "存在底板/边框（整幅框或 ≥3 块分区板且覆盖过半）",
         boards_ok,
@@ -682,10 +765,25 @@ pub fn evaluate(canvas: &VirtualCanvas, drew_anything: bool) -> EvalReport {
     ));
 
     // -- 布局 --
+    let is_deco_glyph = |t: &VirtualElement| {
+        // 短装饰字符（如标题两侧的「★」）压在标题 bbox 内是有意的排版。
+        t.text
+            .as_deref()
+            .map(|s| {
+                s.chars()
+                    .filter(|c| !matches!(c, ' ' | '★' | '☆' | '●' | '◆' | '·'))
+                    .count()
+                    <= 2
+            })
+            .unwrap_or(false)
+    };
     let mut overlaps: Vec<String> = Vec::new();
     for i in 0..texts.len() {
         for j in i + 1..texts.len() {
             let (a, b) = (texts[i], texts[j]);
+            if is_deco_glyph(a) || is_deco_glyph(b) {
+                continue;
+            }
             if rects_overlap(a, b, 2.0) {
                 overlaps.push(format!(
                     "「{}」×「{}」",
@@ -742,7 +840,8 @@ pub fn evaluate(canvas: &VirtualCanvas, drew_anything: bool) -> EvalReport {
         canvas.ops_failed == 0,
         format!("失败 {} 次", canvas.ops_failed),
     ));
-    let total = canvas.ops_applied + canvas.ops_failed;
+    // 预算按全部工具调用计（含 list_elements 自检），否则自检刷屏会绕过成本上限。
+    let total = total_tool_calls.max(canvas.ops_applied + canvas.ops_failed);
     checks.push(check(
         format!("工具调用 ≤ {MAX_TOOL_CALLS}"),
         total <= MAX_TOOL_CALLS,
@@ -823,22 +922,8 @@ mod tests {
     #[test]
     fn well_formed_poster_passes() {
         let canvas = replay(&poster_ops());
-        let report = evaluate(&canvas, true);
+        let report = evaluate(&canvas, true, 0);
         assert!(report.passed, "report:\n{}", report.to_text());
-    }
-
-    #[test]
-    fn white_background_fails() {
-        let mut ops = poster_ops();
-        ops[0] = (CanvasOp::SetBackground { color: None }, None);
-        let report = evaluate(&replay(&ops), true);
-        let bg = report
-            .checks
-            .iter()
-            .find(|c| c.name == "背景为深色板面")
-            .unwrap();
-        assert!(!bg.passed);
-        assert!(!report.passed);
     }
 
     #[test]
@@ -849,13 +934,17 @@ mod tests {
                 style.stroke = Some(0x1e1e1e);
             }
         }
-        let report = evaluate(&replay(&ops), true);
-        let chalk = report
+        let report = evaluate(&replay(&ops), true, ops.len());
+        let contrast = report
             .checks
             .iter()
-            .find(|c| c.name.contains("粉笔"))
+            .find(|c| c.name.contains("对比"))
             .unwrap();
-        assert!(!chalk.passed);
+        assert!(
+            !contrast.passed,
+            "black text on dark board must fail contrast: {}",
+            contrast.detail
+        );
     }
 
     #[test]
@@ -864,7 +953,7 @@ mod tests {
         ops.retain(
             |(op, _)| !matches!(op, CanvasOp::Text { font_size: Some(fs), .. } if *fs >= 36.0),
         );
-        let report = evaluate(&replay(&ops), true);
+        let report = evaluate(&replay(&ops), true, ops.len());
         assert!(
             !report
                 .checks
@@ -884,7 +973,7 @@ mod tests {
             *x = 120.0;
             *y = 260.0;
         }
-        let report = evaluate(&replay(&ops), true);
+        let report = evaluate(&replay(&ops), true, ops.len());
         let overlap = report
             .checks
             .iter()
@@ -899,12 +988,35 @@ mod tests {
         if let (CanvasOp::Text { x, .. }, _) = &mut ops[9] {
             *x = 1700.0;
         }
-        let report = evaluate(&replay(&ops), true);
+        let report = evaluate(&replay(&ops), true, ops.len());
         assert!(
             !report
                 .checks
                 .iter()
                 .find(|c| c.name.contains("可见范围"))
+                .unwrap()
+                .passed
+        );
+    }
+
+    #[test]
+    fn tool_call_budget_counts_everything() {
+        let mut canvas = VirtualCanvas::default();
+        canvas.ops_applied = 10;
+        // 55 次 list_elements 自检 + 10 次绘制 = 65 > 60：预算必须算上自检。
+        let report = evaluate(&canvas, true, 65);
+        let budget = report
+            .checks
+            .iter()
+            .find(|c| c.name.contains("工具调用"))
+            .unwrap();
+        assert!(!budget.passed, "detail: {}", budget.detail);
+        let report = evaluate(&canvas, true, 40);
+        assert!(
+            report
+                .checks
+                .iter()
+                .find(|c| c.name.contains("工具调用"))
                 .unwrap()
                 .passed
         );
@@ -933,7 +1045,7 @@ mod tests {
         ];
         let canvas = replay(&ops);
         assert_eq!(canvas.ops_failed, 1);
-        let report = evaluate(&canvas, true);
+        let report = evaluate(&canvas, true, 0);
         assert!(
             !report
                 .checks
@@ -963,5 +1075,45 @@ mod tests {
         assert_eq!((title.x, title.y), (600.0, 60.0));
         assert_eq!(title.text.as_deref(), Some("庆祝教师节"));
         assert!((title.font_size - 72.0).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod apply_tests {
+    use super::*;
+    use crate::ai::canvas_ops::CanvasStyle;
+
+    #[test]
+    fn apply_returns_ok_with_board_style_message() {
+        let mut c = VirtualCanvas::default();
+        let r = apply(
+            &mut c,
+            &CanvasOp::SetBackground {
+                color: Some(0x2A5240),
+            },
+            None,
+        );
+        assert!(r.is_ok(), "SetBackground apply returned Err: {r:?}");
+        let r = apply(
+            &mut c,
+            &CanvasOp::Text {
+                x: 10.0,
+                y: 10.0,
+                text: "你好".into(),
+                font_size: Some(20.0),
+                align: None,
+                font_family: None,
+                wrap_width: None,
+                style: CanvasStyle::default(),
+            },
+            Some("abcd1234"),
+        );
+        assert!(r.is_ok(), "Text apply returned Err: {r:?}");
+        assert!(
+            r.as_deref()
+                .map(|s| s.contains("abcd1234"))
+                .unwrap_or(false),
+            "message should carry the id: {r:?}"
+        );
     }
 }

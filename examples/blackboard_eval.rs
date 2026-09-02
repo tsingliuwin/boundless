@@ -50,6 +50,7 @@ fn run() -> anyhow::Result<()> {
     // answered with the outcome — an unanswered reply reads as
     // "画布操作被取消" on the tool side and kills the whole run.
     let mut canvas = eval::VirtualCanvas::default();
+    let mut total_calls = 0usize;
     let mut drew = false;
     let mut final_text = String::new();
     let mut run_error: Option<String> = None;
@@ -76,6 +77,7 @@ fn run() -> anyhow::Result<()> {
                     }
                 }
                 AgentEvent::ToolCall { name, args, .. } => {
+                    total_calls += 1;
                     boundless::ai::log::log_tool_call(&name, &args);
                 }
                 AgentEvent::ToolResult {
@@ -113,7 +115,7 @@ fn run() -> anyhow::Result<()> {
     }
 
     // The model narrated but drew nothing — report and fail.
-    let report = eval::evaluate(&canvas, drew);
+    let report = eval::evaluate(&canvas, drew, total_calls);
     let report_text = report.to_text();
     println!("{report_text}");
 
