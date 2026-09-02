@@ -341,11 +341,16 @@ pub fn paint_world_geom(
                     OpSetType::FillPath => {
                         let mut builder = PathBuilder::fill();
                         append_bez_path(&mut builder, &set.ops, camera, canvas_origin);
-                        if let Ok(path) = builder.build() {
-                            out.push(ReadyPath {
+                        match builder.build() {
+                            Ok(path) => out.push(ReadyPath {
                                 path,
                                 color: fill_color,
-                            });
+                            }),
+                            Err(e) => eprintln!(
+                                "[render] FillPath tessellation failed ({}x{}): {e}",
+                                el.id.to_string().get(..8).unwrap_or("?"),
+                                el.bounds.w
+                            ),
                         }
                     }
                     OpSetType::FillSketch => {
@@ -781,5 +786,52 @@ mod tests {
             let staged = paint_world_geom(&world_geometry(el), el, &camera, origin);
             assert_eq!(direct.len(), staged.len());
         }
+    }
+}
+
+#[cfg(test)]
+mod solid_fill_tests {
+    use super::*;
+    use crate::scene::WBounds;
+
+    #[test]
+    fn solid_fill_ellipse_emits_fillpath() {
+        let mut style = ElementStyle::default();
+        style.background = Some(0x4A5560);
+        style.fill_style = crate::scene::FillStyle::Solid;
+        style.opacity = 0.5;
+        let el = Element::new(
+            ElementKind::Ellipse,
+            WBounds::new(0.0, 0.0, 700.0, 240.0),
+            style,
+        );
+        let geom = world_geometry(&el);
+        match &geom {
+            WorldGeom::Rough(sets) => {
+                let kinds: Vec<_> = sets.iter().map(|s| s.op_set_type.clone()).collect();
+                assert!(
+                    kinds.contains(&OpSetType::FillPath),
+                    "solid ellipse must emit a FillPath op, got {kinds:?}"
+                );
+                // FillPath 的 ops 必须非空：roughr Solid 在某些参数组合下会
+                // 生成空 opset（渲染为完全不可见）。
+                for set in sets.iter().filter(|s| s.op_set_type == OpSetType::FillPath) {
+                    assert!(
+                        !set.ops.elements().is_empty(),
+                        "FillPath opset is EMPTY"
+                    );
+                }
+            }
+            other => panic!("expected Rough, got {other:?}"),
+        }
+        let camera = Camera::default();
+        let origin = gpui::point(px(0.0), px(0.0));
+        let paths = paths_for_element(&el, &camera, origin);
+        assert_eq!(
+            paths.len(),
+            2,
+            "solid ellipse must paint fill + stroke, got {}",
+            paths.len()
+        );
     }
 }

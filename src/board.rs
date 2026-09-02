@@ -755,6 +755,21 @@ impl BoardView {
                     styled(style),
                 );
                 let added = self.scene.add(el);
+                #[cfg(debug_assertions)]
+                if let Some(f) = self
+                    .scene
+                    .get(added)
+                    .map(|e| (e.style.background, e.style.fill_style, e.style.opacity))
+                {
+                    let (f, fs, op) = f;
+                    eprintln!(
+                        "[op-diag] shape id={} background={:?} fill_style={:?} opacity={}",
+                        &added.to_string()[..8],
+                        f,
+                        fs,
+                        op
+                    );
+                }
                 if let Some(t) = text.filter(|t| !t.is_empty()) {
                     self.add_bound_label(added, WBounds::new(x, y, w, h), t);
                 }
@@ -782,6 +797,21 @@ impl BoardView {
                     styled(style),
                 );
                 let added = self.scene.add(el);
+                #[cfg(debug_assertions)]
+                if let Some(f) = self
+                    .scene
+                    .get(added)
+                    .map(|e| (e.style.background, e.style.fill_style, e.style.opacity))
+                {
+                    let (f, fs, op) = f;
+                    eprintln!(
+                        "[op-diag] shape id={} background={:?} fill_style={:?} opacity={}",
+                        &added.to_string()[..8],
+                        f,
+                        fs,
+                        op
+                    );
+                }
                 if let Some(t) = text.filter(|t| !t.is_empty()) {
                     self.add_bound_label(added, WBounds::new(x, y, w, h), t);
                 }
@@ -809,6 +839,21 @@ impl BoardView {
                     styled(style),
                 );
                 let added = self.scene.add(el);
+                #[cfg(debug_assertions)]
+                if let Some(f) = self
+                    .scene
+                    .get(added)
+                    .map(|e| (e.style.background, e.style.fill_style, e.style.opacity))
+                {
+                    let (f, fs, op) = f;
+                    eprintln!(
+                        "[op-diag] shape id={} background={:?} fill_style={:?} opacity={}",
+                        &added.to_string()[..8],
+                        f,
+                        fs,
+                        op
+                    );
+                }
                 if let Some(t) = text.filter(|t| !t.is_empty()) {
                     self.add_bound_label(added, WBounds::new(x, y, w, h), t);
                 }
@@ -835,6 +880,21 @@ impl BoardView {
                 );
                 let bounds = el.bounds;
                 let added = self.scene.add(el);
+                #[cfg(debug_assertions)]
+                if let Some(f) = self
+                    .scene
+                    .get(added)
+                    .map(|e| (e.style.background, e.style.fill_style, e.style.opacity))
+                {
+                    let (f, fs, op) = f;
+                    eprintln!(
+                        "[op-diag] shape id={} background={:?} fill_style={:?} opacity={}",
+                        &added.to_string()[..8],
+                        f,
+                        fs,
+                        op
+                    );
+                }
                 if let Some(t) = text.filter(|t| !t.is_empty()) {
                     self.add_bound_label(added, bounds, t);
                 }
@@ -867,6 +927,21 @@ impl BoardView {
                 );
                 let bounds = el.bounds;
                 let added = self.scene.add(el);
+                #[cfg(debug_assertions)]
+                if let Some(f) = self
+                    .scene
+                    .get(added)
+                    .map(|e| (e.style.background, e.style.fill_style, e.style.opacity))
+                {
+                    let (f, fs, op) = f;
+                    eprintln!(
+                        "[op-diag] shape id={} background={:?} fill_style={:?} opacity={}",
+                        &added.to_string()[..8],
+                        f,
+                        fs,
+                        op
+                    );
+                }
                 if let Some(t) = text.filter(|t| !t.is_empty()) {
                     self.add_bound_label(added, bounds, t);
                 }
@@ -923,6 +998,21 @@ impl BoardView {
                     .max(1.0);
                 el.bounds.h = lines as f64 * fs * LINE_HEIGHT;
                 let added = self.scene.add(el);
+                #[cfg(debug_assertions)]
+                if let Some(f) = self
+                    .scene
+                    .get(added)
+                    .map(|e| (e.style.background, e.style.fill_style, e.style.opacity))
+                {
+                    let (f, fs, op) = f;
+                    eprintln!(
+                        "[op-diag] shape id={} background={:?} fill_style={:?} opacity={}",
+                        &added.to_string()[..8],
+                        f,
+                        fs,
+                        op
+                    );
+                }
                 self.pending_measure.push(added);
                 Ok(format!("已添加文本 id={}", &added.to_string()[..8]))
             }
@@ -4453,6 +4543,44 @@ impl BoardView {
                 }));
             }
             bar = bar.child(row);
+
+            // 填充样式：排线（hachure 手绘线）vs 实心（色块）。选中或预设
+            // 均可切换，作用于 shape 的 background 填充。
+            if show_shape_options {
+                let mut fs_row = div().flex().flex_row().gap_1();
+                for (ix, (label, fs)) in [
+                    ("纹", crate::scene::FillStyle::Hachure),
+                    ("实", crate::scene::FillStyle::Solid),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let weak = weak.clone();
+                    let active = self.style.fill_style == fs;
+                    fs_row = fs_row.child(
+                        div()
+                            .id(gpui::ElementId::named_usize("fill-style", ix))
+                            .size_5()
+                            .rounded_sm()
+                            .border_1()
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_xs()
+                            .child(label)
+                            .when(active, |d| d.border_color(rgb(SELECTION_COLOR)).border_2())
+                            .when(!active, |d| d.border_color(rgb(0xcccccc)))
+                            .on_click(move |_, _, cx| {
+                                weak.update(cx, |this, cx| {
+                                    this.apply_style_to_selection(|s| s.fill_style = fs, cx)
+                                })
+                                .ok();
+                            }),
+                    );
+                }
+                bar = bar.child(fs_row);
+            }
         }
 
         // Text options: font size presets + font family + alignment, shown
