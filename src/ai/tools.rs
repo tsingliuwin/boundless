@@ -1125,7 +1125,7 @@ mod tests {
         // Drain events until the CanvasOp, then reply exactly like the
         // eval harness / panel does.
         let mut replied = false;
-        while let Ok(Some(event)) = rx.try_recv() {
+        while let Ok(event) = rx.try_recv() {
             match event {
                 AgentEvent::CanvasOp { reply, .. } => {
                     reply
@@ -1151,7 +1151,7 @@ mod tests {
 
         // The ToolResult must carry is_error=false.
         let mut saw_result = false;
-        while let Ok(Some(event)) = rx.try_recv() {
+        while let Ok(event) = rx.try_recv() {
             if let AgentEvent::ToolResult {
                 is_error, result, ..
             } = event
