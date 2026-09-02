@@ -1008,7 +1008,7 @@ mod tests {
         let budget = report
             .checks
             .iter()
-            .find(|c| c.name.contains("工具调用"))
+            .find(|c| c.name.contains("工具调用 ≤"))
             .unwrap();
         assert!(!budget.passed, "detail: {}", budget.detail);
         let report = evaluate(&canvas, true, 40);
@@ -1016,7 +1016,7 @@ mod tests {
             report
                 .checks
                 .iter()
-                .find(|c| c.name.contains("工具调用"))
+                .find(|c| c.name.contains("工具调用 ≤"))
                 .unwrap()
                 .passed
         );
