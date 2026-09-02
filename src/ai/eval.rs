@@ -846,6 +846,100 @@ pub fn evaluate(
         },
     ));
 
+    // -- 构图 --
+    // 报头横向居中：最大字号标题的中心偏离画布中线 ≤ 120。
+    if let Some(t) = titles
+        .iter()
+        .copied()
+        .max_by(|a, b| a.font_size.total_cmp(&b.font_size))
+    {
+        let center = t.x + t.w / 2.0;
+        let off = (center - CANVAS_W / 2.0).abs();
+        checks.push(check(
+            "报头横向居中",
+            off <= 120.0,
+            format!("标题中心 x={center:.0}，偏离中线 {off:.0}"),
+        ));
+    }
+
+    // 板块利用率：每块分区底板内要有文字，且正文距板顶 ≤ 35% 板高。
+    // 整幅边框不参与。
+    let section_boards: Vec<&VirtualElement> = canvas
+        .elements
+        .iter()
+        .filter(|e| is_base_panel(e) && !(e.w >= 1000.0 && e.h >= 600.0))
+        .collect();
+    if !section_boards.is_empty() {
+        let mut empty_panels: Vec<String> = Vec::new();
+        let mut gappy_panels: Vec<String> = Vec::new();
+        for b in &section_boards {
+            let inside: Vec<&VirtualElement> = texts
+                .iter()
+                .filter(|t| {
+                    let cx = t.x + t.w / 2.0;
+                    let cy = t.y + t.h / 2.0;
+                    cx >= b.x && cx <= b.x + b.w && cy >= b.y && cy <= b.y + b.h
+                })
+                .copied()
+                .collect();
+            if inside.is_empty() {
+                empty_panels.push(format!("({:.0},{:.0})", b.x, b.y));
+                continue;
+            }
+            let top = inside.iter().map(|t| t.y).fold(f64::INFINITY, f64::min);
+            if top - b.y > 0.35 * b.h {
+                gappy_panels.push(format!("({:.0},{:.0})", b.x, b.y));
+            }
+        }
+        checks.push(check(
+            "每块板块都有文字",
+            empty_panels.is_empty(),
+            if empty_panels.is_empty() {
+                "全部板块有内容".to_string()
+            } else {
+                format!("空板块: {}", empty_panels.join("、"))
+            },
+        ));
+        checks.push(check(
+            "正文紧随板块顶部（留白 ≤ 35%）",
+            gappy_panels.is_empty(),
+            if gappy_panels.is_empty() {
+                "无大段顶部留白".to_string()
+            } else {
+                format!("顶部留白过大: {}", gappy_panels.join("、"))
+            },
+        ));
+    }
+
+    // 装饰对称：画布左右两半各 ≥ 2 处装饰（线/箭头/小形状）。
+    let deco_left = canvas
+        .elements
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.kind,
+                "rectangle" | "ellipse" | "diamond" | "line" | "arrow"
+            ) && !is_base_panel(e)
+                && e.x + e.w / 2.0 < CANVAS_W / 2.0
+        })
+        .count();
+    let deco_right = canvas
+        .elements
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.kind,
+                "rectangle" | "ellipse" | "diamond" | "line" | "arrow"
+            ) && !is_base_panel(e)
+                && e.x + e.w / 2.0 >= CANVAS_W / 2.0
+        })
+        .count();
+    checks.push(check(
+        "装饰左右对称（两侧各 ≥ 2）",
+        deco_left >= 2 && deco_right >= 2,
+        format!("左 {deco_left} 处，右 {deco_right} 处"),
+    ));
+
     let out_of_bounds: Vec<String> = canvas
         .elements
         .iter()
@@ -939,7 +1033,7 @@ mod tests {
         vec![
             (CanvasOp::SetBackground { color: Some(0x2A5240) }, None),
             (CanvasOp::Rectangle { x: 30.0, y: 30.0, w: 1540.0, h: 940.0, style: style(Some(0x2A5240), white), text: None }, Some("aaa00001".into())),
-            (CanvasOp::Text { x: 500.0, y: 50.0, text: "教师节快乐".into(), font_size: Some(64.0), align: None, font_family: Some("kai".into()), wrap_width: None, style: style(None, white) }, Some("aaa00002".into())),
+            (CanvasOp::Text { x: 640.0, y: 50.0, text: "教师节快乐".into(), font_size: Some(64.0), align: None, font_family: Some("kai".into()), wrap_width: None, style: style(None, white) }, Some("aaa00002".into())),
             (CanvasOp::Line { points: vec![pt(100.0, 190.0), pt(1500.0, 190.0)], style: style(None, white), text: None }, Some("aaa00003".into())),
             (CanvasOp::Line { points: vec![pt(100.0, 880.0), pt(1500.0, 880.0)], style: style(None, white), text: None }, Some("aaa00004".into())),
             (CanvasOp::Ellipse { x: 60.0, y: 60.0, w: 60.0, h: 60.0, style: style(Some(0xFFC0CB), white), text: None }, Some("aaa00005".into())),
