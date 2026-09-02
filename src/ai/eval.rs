@@ -104,7 +104,7 @@ impl EvalReport {
     pub fn to_text(&self) -> String {
         let mut out = String::new();
         out.push_str(&format!(
-            "=== 黑板报评测报告：{} ===\n",
+            "=== 评测报告：{} ===\n",
             if self.passed {
                 "达标 ✓"
             } else {
