@@ -175,7 +175,9 @@ static DRAG_SESSION: Mutex<Option<DragSession>> = Mutex::new(None);
 #[cfg(target_os = "windows")]
 struct DragSession {
     hwnd: HWND,
-    last: POINT,
+    /// 光标相对窗口左上角的抓取偏移——移动时保持不变，窗口跟着光标平移。
+    grab_dx: i32,
+    grab_dy: i32,
 }
 
 // SAFETY: HWND 是线程无关的窗口句柄；会话仅在创建它的 UI 线程读写，Mutex
@@ -217,15 +219,22 @@ pub fn end_window_drag(window: &Window) {
 #[cfg(target_os = "windows")]
 fn begin_window_drag_windows(window: &Window) -> Result<(), String> {
     use windows::Win32::UI::Input::KeyboardAndMouse::SetCapture;
-    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetWindowRect};
 
     let hwnd = hwnd_of(window)?;
     let mut pt = POINT::default();
+    let mut rect = RECT::default();
     unsafe {
         let _ = GetCursorPos(&mut pt);
+        let _ = GetWindowRect(hwnd, &mut rect);
         SetCapture(hwnd);
     }
-    *DRAG_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = Some(DragSession { hwnd, last: pt });
+    // 记录抓取偏移：光标相对窗口左上角的距离，移动时保持不变。
+    *DRAG_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = Some(DragSession {
+        hwnd,
+        grab_dx: pt.x - rect.left,
+        grab_dy: pt.y - rect.top,
+    });
     Ok(())
 }
 
@@ -243,25 +252,20 @@ fn move_window_drag_windows(_window: &Window) -> Result<(), String> {
     unsafe {
         let _ = GetCursorPos(&mut pt);
     }
-    let dx = pt.x - session.last.x;
-    let dy = pt.y - session.last.y;
-    if dx == 0 && dy == 0 {
-        return Ok(());
-    }
+    // 窗口原点 = 光标位置 − 抓取偏移：窗口钉在光标下，保持按下瞬间的抓取点。
+    let new_x = pt.x - session.grab_dx;
+    let new_y = pt.y - session.grab_dy;
     unsafe {
         let _ = SetWindowPos(
             session.hwnd,
             None,
-            session.last.x + dx,
-            session.last.y + dy,
+            new_x,
+            new_y,
             0,
             0,
             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
         );
     }
-    // 窗口已随光标平移：把会话基准点更新为本次光标位置。
-    session.last = pt;
-    drop(guard);
     Ok(())
 }
 
@@ -295,7 +299,7 @@ fn hwnd_of(window: &Window) -> Result<HWND, String> {
 }
 
 #[cfg(target_os = "windows")]
-use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::Foundation::{HWND, POINT, RECT};
 
 // 非 Windows 平台的空实现（菜单栏拖拽把手仍渲染，拖拽为 no-op）。
 
