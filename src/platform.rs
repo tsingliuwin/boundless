@@ -162,67 +162,142 @@ fn toggle_maximize_windows(window: &Window) -> Result<(), String> {
     Ok(())
 }
 
-/// Start a native window drag from a client-area mouse-down.
-///
-/// GPUI's `start_window_move` is a no-op on Windows, and `window_control_area(
-/// Drag)` only drags when `WM_NCHITTEST` returns `HTCAPTION` - which needs a
-/// current `mouse_hit_test`, but that's often stale by one frame at click time,
-/// so the hit falls back to `HTCLIENT` and the drag never starts. Instead we
-/// release the mouse capture and `SendMessage(WM_NCLBUTTONDOWN, HTCAPTION)`,
-/// which makes Windows enter its caption drag modal loop directly. This is the
-/// standard trick for custom-titlebar windows and doesn't depend on hit-testing.
-pub fn start_window_drag(window: &Window) {
+/// Manual window drag: the OS modal move loop (WM_NCLBUTTONDOWN) is off-limits
+/// here — SendMessageW re-enters it inside the mouse-down handler (crashes with
+/// concurrent AI-stream updates), and gpui consumes posted WM_NCLBUTTONDOWN
+/// messages. So we capture the mouse and move the window ourselves per
+/// mouse-move; no modal loop, no NC messages, fully decoupled from streaming.
+use std::sync::Mutex;
+
+#[cfg(target_os = "windows")]
+static DRAG_SESSION: Mutex<Option<DragSession>> = Mutex::new(None);
+
+#[cfg(target_os = "windows")]
+struct DragSession {
+    hwnd: HWND,
+    last: POINT,
+}
+
+// SAFETY: HWND 是线程无关的窗口句柄；会话仅在创建它的 UI 线程读写，Mutex
+// 只是存放位置。裸指针不跨线程传递。
+#[cfg(target_os = "windows")]
+unsafe impl Send for DragSession {}
+
+/// Begin a manual drag: remember the cursor position and capture the mouse so
+/// move/up events keep arriving even outside the window. No-op while a drag
+/// is already active.
+pub fn begin_window_drag(window: &Window) {
     #[cfg(target_os = "windows")]
     {
-        if let Err(e) = start_window_drag_windows(window) {
-            eprintln!("start_window_drag failed: {e}");
+        if let Err(e) = begin_window_drag_windows(window) {
+            eprintln!("begin_window_drag failed: {e}");
         }
     }
 }
 
+/// One drag step: move the window by the cursor delta since the last step.
+pub fn move_window_drag(window: &Window) {
+    #[cfg(target_os = "windows")]
+    {
+        if let Err(e) = move_window_drag_windows(window) {
+            eprintln!("move_window_drag failed: {e}");
+        }
+    }
+}
+
+/// End the drag: release the mouse capture and drop the session.
+pub fn end_window_drag(window: &Window) {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = window;
+        end_window_drag_windows();
+    }
+}
+
 #[cfg(target_os = "windows")]
-fn start_window_drag_windows(window: &Window) -> Result<(), String> {
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
-    use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+fn begin_window_drag_windows(window: &Window) -> Result<(), String> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::SetCapture;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    let hwnd = hwnd_of(window)?;
+    let mut pt = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut pt);
+        SetCapture(hwnd);
+    }
+    *DRAG_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = Some(DragSession { hwnd, last: pt });
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn move_window_drag_windows(_window: &Window) -> Result<(), String> {
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetCursorPos, PostMessageW, HTCAPTION, WM_NCLBUTTONDOWN,
+        GetCursorPos, SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
     };
 
+    let mut guard = DRAG_SESSION.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(session) = guard.as_mut() else {
+        return Ok(());
+    };
+    let mut pt = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut pt);
+    }
+    let dx = pt.x - session.last.x;
+    let dy = pt.y - session.last.y;
+    if dx == 0 && dy == 0 {
+        return Ok(());
+    }
+    unsafe {
+        let _ = SetWindowPos(
+            session.hwnd,
+            None,
+            session.last.x + dx,
+            session.last.y + dy,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+    // 窗口已随光标平移：把会话基准点更新为本次光标位置。
+    session.last = pt;
+    drop(guard);
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn end_window_drag_windows() {
+    use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+    if DRAG_SESSION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .is_some()
+    {
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+    }
+}
+
+/// Shared HWND lookup for the platform helpers (gpui::Window's inherent
+/// window_handle() shadows the trait method, hence the UFCS).
+#[cfg(target_os = "windows")]
+fn hwnd_of(window: &Window) -> Result<HWND, String> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     let raw = HasWindowHandle::window_handle(window)
         .map_err(|e| format!("window_handle: {e}"))?
         .as_raw();
-    let hwnd = match raw {
-        RawWindowHandle::Win32(h) => HWND(h.hwnd.get() as *mut core::ffi::c_void),
-        _ => return Err("not a Win32 window".into()),
-    };
-    unsafe {
-        // ReleaseCapture so the in-flight button-down doesn't hold the mouse,
-        // then synthesize a caption (HTCAPTION) non-client button-down. Windows
-        // runs its drag modal loop inside that message; the GPUI input
-        // callback is already taken by the outer client mouse-down, so the
-        // WM_NCLBUTTONDOWN skips element dispatch and hits DefWindowProcW,
-        // which starts the drag.
-        //
-        // POST, don't SEND: SendMessageW would enter the modal move loop
-        // synchronously *inside this mouse-down handler*, so agent-stream
-        // updates (a main-thread refresh every ~50ms while the AI is
-        // generating) execute re-entrantly mid-modal-loop — which crashed the
-        // app. Posting defers the modal loop until this handler has returned.
-        let _ = ReleaseCapture();
-        let mut pt = POINT::default();
-        let _ = GetCursorPos(&mut pt);
-        // lparam = screen-space cursor (low word = x, high word = y).
-        let lparam = LPARAM((((pt.y as u32) << 16) | (pt.x as u32 & 0xFFFF)) as isize);
-        let _ = PostMessageW(
-            Some(hwnd),
-            WM_NCLBUTTONDOWN,
-            WPARAM(HTCAPTION as usize),
-            lparam,
-        );
+    match raw {
+        RawWindowHandle::Win32(h) => Ok(HWND(h.hwnd.get() as *mut core::ffi::c_void)),
+        _ => Err("not a Win32 window".to_string()),
     }
-    Ok(())
 }
+
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::{HWND, POINT};
+
+// 非 Windows 平台的空实现（菜单栏拖拽把手仍渲染，拖拽为 no-op）。
 
 // ---------------------------------------------------------------------------
 // Stylus pressure (Windows Ink / WM_POINTER)

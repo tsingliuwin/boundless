@@ -4971,13 +4971,26 @@ impl BoardView {
         // synthesize an HTCAPTION non-client click (see platform::start_window_
         // drag), which reliably starts Windows' caption drag. stop_propagation
         // keeps the board's on_left_down from also firing.
-        bar = bar.child(div().id("title-drag").flex_1().h_full().on_mouse_down(
-            MouseButton::Left,
-            |_, window, cx| {
-                crate::platform::start_window_drag(window);
-                cx.stop_propagation();
-            },
-        ));
+        bar = bar.child(
+            div()
+                .id("title-drag")
+                .flex_1()
+                .h_full()
+                .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                    crate::platform::begin_window_drag(window);
+                    cx.stop_propagation();
+                })
+                .on_mouse_move(|event: &MouseMoveEvent, window, cx| {
+                    if event.pressed_button == Some(MouseButton::Left) {
+                        crate::platform::move_window_drag(window);
+                        cx.stop_propagation();
+                    }
+                })
+                .on_mouse_up(MouseButton::Left, |_, window, cx| {
+                    crate::platform::end_window_drag(window);
+                    cx.stop_propagation();
+                }),
+        );
         // Caption buttons on the right; the OS handles their clicks.
         bar = bar.child(window_controls(window));
         bar
