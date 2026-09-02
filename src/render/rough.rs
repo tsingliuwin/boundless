@@ -119,10 +119,19 @@ fn options_for(style: &ElementStyle, seed: u64, is_freedraw: bool) -> Options {
     }
     if let Some(bg) = style.background {
         options.fill = Some(srgba(bg, style.opacity));
+        // gpui 0.2.2 在 Windows 上 PathBuilder::fill() 的产物不可见（最小
+        // 复现工程 fill_repro 证实：同窗口 quad 正常、fill 路径消失）。因此
+        // 所有填充统一走已被证明可靠的排线（FillSketch→stroke）管线：
+        // - hachure：经典手绘排线，间距 = 线宽×4；
+        // - solid：密排线（间距 = 线宽），线宽 ≥ 间距 → 视觉实心色块，
+        //   且细纹理恰好契合粉笔/水墨质感。
         options.fill_style = Some(match style.fill_style {
-            // Solid = flat chalk-paste block (blackboard poster panels);
-            // hachure keeps fill_weight/gap so the sketch lines stay dense.
-            SceneFillStyle::Solid => FillStyle::Solid,
+            SceneFillStyle::Solid => {
+                let weight = (style.stroke_width as f32 * 0.75).max(0.75);
+                options.fill_weight = Some(weight);
+                options.hachure_gap = Some(weight);
+                FillStyle::Hachure
+            }
             SceneFillStyle::Hachure => {
                 options.fill_weight = Some((style.stroke_width as f32 * 0.5).max(0.5));
                 options.hachure_gap = Some((style.stroke_width as f32 * 4.0).max(4.0));
@@ -808,18 +817,18 @@ mod solid_fill_tests {
         let geom = world_geometry(&el);
         match &geom {
             WorldGeom::Rough(sets) => {
+                // gpui 0.2.2 Windows 上 FillPath（PathBuilder::fill）不可见，
+                // 因此 Solid 统一走 FillSketch（密排线→视觉实心），见 options_for。
                 let kinds: Vec<_> = sets.iter().map(|s| s.op_set_type.clone()).collect();
                 assert!(
-                    kinds.contains(&OpSetType::FillPath),
-                    "solid ellipse must emit a FillPath op, got {kinds:?}"
+                    kinds.contains(&OpSetType::FillSketch),
+                    "solid ellipse must emit a FillSketch op (dense hachure), got {kinds:?}"
                 );
-                // FillPath 的 ops 必须非空：roughr Solid 在某些参数组合下会
-                // 生成空 opset（渲染为完全不可见）。
-                for set in sets.iter().filter(|s| s.op_set_type == OpSetType::FillPath) {
-                    assert!(
-                        !set.ops.elements().is_empty(),
-                        "FillPath opset is EMPTY"
-                    );
+                for set in sets
+                    .iter()
+                    .filter(|s| s.op_set_type == OpSetType::FillSketch)
+                {
+                    assert!(!set.ops.elements().is_empty(), "FillSketch opset is EMPTY");
                 }
             }
             other => panic!("expected Rough, got {other:?}"),
