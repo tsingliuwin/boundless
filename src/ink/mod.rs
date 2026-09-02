@@ -30,4 +30,4 @@ pub mod pressure;
 pub mod smooth;
 
 pub use collector::InkCollector;
-pub use outline::ribbon_outline;
+pub use outline::{dot_outline, ribbon_outline};

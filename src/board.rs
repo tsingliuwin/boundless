@@ -12,9 +12,7 @@ use crate::ai::panel::AiPanel;
 use crate::camera::Camera;
 use crate::history::History;
 use crate::render::rough::{color_u32, paths_for_element, ReadyPath};
-use crate::render::{
-    dot_grid, handle_rects, measure_text, point_handle_rects, shape_text, ShapedTextLine,
-};
+use crate::render::{dot_grid, handle_rects, measure_text, point_handle_rects, ShapedTextLine};
 use crate::scene::{
     Element, ElementId, ElementKind, ElementStyle, LineType, Scene, SceneFile, StrokeStyle,
     TextAlign, WBounds, WPoint, DEFAULT_FONT_SIZE, LINE_HEIGHT,
@@ -165,6 +163,13 @@ pub struct BoardView {
     /// Auto-update flow state (check / download / ready-to-restart). Driven by
     /// the `CheckForUpdates` action + a delayed startup poll; see `src/updater.rs`.
     update_state: crate::updater::UpdateState,
+    /// Per-element world-geometry cache (render/cache.rs): skips roughr
+    /// generation and spline/ribbon rebuilds for unchanged elements. Pan/zoom
+    /// never invalidates it; invalidation is by element fingerprint.
+    render_cache: crate::render::cache::RenderCache,
+    /// Shaped-text cache: skips per-frame text shaping (wrapped paragraphs
+    /// shape per character). Keyed by shaping fingerprint incl. zoom.
+    text_cache: crate::render::cache::TextCache,
 }
 
 impl BoardView {
@@ -206,6 +211,8 @@ impl BoardView {
             show_grid: false,
             menubar_open: None,
             update_state: crate::updater::UpdateState::default(),
+            render_cache: crate::render::cache::RenderCache::new(),
+            text_cache: crate::render::cache::TextCache::new(),
         };
         // Auto-update: poll silently 30s after launch, then every 4h. Only a
         // real available update surfaces (silent = no "up to date" / transient
@@ -2465,7 +2472,9 @@ impl BoardView {
                 }
             }
             DragState::Freedraw { collector, seed } => {
-                if collector.len() >= 2 {
+                // A single sample (tap without movement) commits as a round
+                // ink dot — Excalidraw behavior, see dot_geometry.
+                if collector.len() >= 1 {
                     self.history.record(&self.scene);
                     let stroke = collector.finish();
                     let mut el = Element::from_absolute_points(
@@ -2743,17 +2752,21 @@ impl BoardView {
             None => {
                 let text = ed.session.text();
                 let color = color_u32(0x000000, 1.0);
-                let (lines, line_height) = shape_text(
+                let shaped = self.text_cache.shaped(
                     &text,
                     ed.font_size,
-                    &self.camera,
-                    color,
-                    ed.wrap_width,
                     &ed.font_family,
+                    ed.wrap_width,
+                    color,
+                    &self.camera,
                     window,
                 );
-                let w = lines.iter().map(|l| l.width).fold(px(0.0), |a, b| a.max(b));
-                (w, line_height * lines.len() as f32)
+                let w = shaped
+                    .lines
+                    .iter()
+                    .map(|l| l.width)
+                    .fold(px(0.0), |a, b| a.max(b));
+                (w, shaped.line_height * shaped.lines.len() as f32)
             }
         };
         let tl = self
@@ -2787,18 +2800,20 @@ impl BoardView {
         let el = self.scene.get(ed.element_id)?;
         let text = ed.session.text();
         let color = color_u32(0x000000, 1.0);
-        let (lines, line_height) = shape_text(
+        let shaped = self.text_cache.shaped(
             &text,
             ed.font_size,
-            &self.camera,
-            color,
-            ed.wrap_width,
             &ed.font_family,
+            ed.wrap_width,
+            color,
+            &self.camera,
             window,
         );
-        if lines.is_empty() {
+        if shaped.lines.is_empty() {
             return Some(0);
         }
+        let lines = shaped.lines;
+        let line_height = shaped.line_height;
         let origin = self.editing_origin(el, ed, None, window);
         let offsets = line_offsets(&lines, self.editing_box_width(ed, &lines), ed.text_align);
         let rel_y = (screen.y - origin.y).to_f64();
@@ -2826,15 +2841,17 @@ impl BoardView {
     ) -> Option<(Point<Pixels>, Pixels)> {
         let text = ed.session.text();
         let color = color_u32(0x000000, 1.0);
-        let (lines, line_height) = shape_text(
+        let shaped = self.text_cache.shaped(
             &text,
             ed.font_size,
-            &self.camera,
-            color,
-            ed.wrap_width,
             &ed.font_family,
+            ed.wrap_width,
+            color,
+            &self.camera,
             window,
         );
+        let lines = shaped.lines;
+        let line_height = shaped.line_height;
         if lines.is_empty() {
             return None;
         }
@@ -2998,7 +3015,7 @@ impl EntityInputHandler for BoardView {
 // ---------------------------------------------------------------------
 
 struct TextPaintItem {
-    lines: Vec<ShapedTextLine>,
+    lines: std::sync::Arc<Vec<ShapedTextLine>>,
     /// Per-line horizontal offset within the box (text alignment).
     line_offsets: Vec<Pixels>,
     origin: Point<Pixels>,
@@ -3084,13 +3101,13 @@ impl BoardView {
                 } => {
                     let color = color_u32(el.style.stroke, el.style.opacity);
                     let bg = el.style.background.map(|c| color_u32(c, el.style.opacity));
-                    let (lines, line_height) = shape_text(
+                    let shaped = self.text_cache.shaped(
                         text,
                         *font_size,
-                        &self.camera,
-                        color,
-                        el.wrap_width(),
                         el.font_family(),
+                        el.wrap_width(),
+                        color,
+                        &self.camera,
                         window,
                     );
                     let screen_origin = self
@@ -3104,18 +3121,24 @@ impl BoardView {
                         ),
                     };
                     let line_offsets =
-                        line_offsets(&lines, screen_bounds.size.width, el.text_align());
+                        line_offsets(&shaped.lines, screen_bounds.size.width, el.text_align());
                     texts.push(TextPaintItem {
-                        lines,
+                        lines: shaped.lines,
                         line_offsets,
                         origin: screen_origin,
-                        line_height,
+                        line_height: shaped.line_height,
                         bounds: screen_bounds,
                         background: bg,
                     });
                 }
                 _ => {
-                    paths.extend(paths_for_element(el, &self.camera, origin));
+                    let geom = self.render_cache.geometry(el);
+                    paths.extend(crate::render::rough::paint_world_geom(
+                        &geom,
+                        el,
+                        &self.camera,
+                        origin,
+                    ));
                 }
             }
         }
@@ -3125,7 +3148,8 @@ impl BoardView {
             paths.extend(paths_for_element(draft, &self.camera, origin));
         }
         if let DragState::Freedraw { collector, seed } = &self.drag {
-            if collector.len() >= 2 {
+            // A tap shows its dot immediately on pen-down.
+            if collector.len() >= 1 {
                 let widths = collector.widths().to_vec();
                 let mut draft = Element::from_absolute_points(
                     |points| ElementKind::Freedraw { points, widths },
@@ -3272,15 +3296,17 @@ impl BoardView {
         let el = self.scene.get(ed.element_id)?;
         let text = ed.session.text();
         let color = color_u32(el.style.stroke, el.style.opacity);
-        let (lines, line_height) = shape_text(
+        let shaped = self.text_cache.shaped(
             &text,
             ed.font_size,
-            &self.camera,
-            color,
-            ed.wrap_width,
             &ed.font_family,
+            ed.wrap_width,
+            color,
+            &self.camera,
             window,
         );
+        let lines = shaped.lines;
+        let line_height = shaped.line_height;
         // Live content size; bound labels center themselves on the container.
         let content_w = lines.iter().map(|l| l.width).fold(px(0.0), |a, b| a.max(b));
         let mut content_h = line_height * lines.len() as f32;

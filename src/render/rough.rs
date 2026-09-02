@@ -18,25 +18,42 @@ pub struct ReadyPath {
     pub color: Hsla,
 }
 
-/// Screen-space ribbon outline of a variable-width freedraw stroke: the ink
-/// pipeline's world-space outline scaled through the camera. Shared by the
-/// render branch and its tests (gpui's tessellated `Path` exposes no public
-/// geometry, so tests assert on this instead).
-fn ink_outline_screen(
-    el: &Element,
-    camera: &Camera,
-    canvas_origin: Point<Pixels>,
-) -> Vec<Point<Pixels>> {
-    let points = el.absolute_points();
-    let widths: Vec<f64> = el
-        .ink_widths()
+/// One roughr op set, decoupled from rough_piet's drawable type so the
+/// geometry cache can store them without lifetime entanglement.
+#[derive(Debug)]
+pub struct RoughOpSet {
+    pub op_set_type: OpSetType,
+    pub ops: kurbo::BezPath,
+}
+
+/// Collect the op sets of a roughr drawable into cache-friendly form.
+fn sets_of(drawable: &rough_piet::KurboDrawable<f64>) -> Vec<RoughOpSet> {
+    drawable
+        .sets
         .iter()
-        .map(|ratio| el.style.stroke_width * ratio)
-        .collect();
-    crate::ink::ribbon_outline(&points, &widths)
-        .iter()
-        .map(|wp| camera.world_to_screen(*wp, canvas_origin))
+        .map(|s| RoughOpSet {
+            op_set_type: s.op_set_type.clone(),
+            ops: s.ops.clone(),
+        })
         .collect()
+}
+
+/// World-space render geometry: the expensive, camera-independent part of an
+/// element's paint (roughr seeded generation, spline sampling, ribbon/dot
+/// outlines). Deterministic per (seed, style, geometry), so it caches cleanly
+/// across pans; the per-frame stage ([`paint_world_geom`]) only transforms to
+/// screen space and tessellates.
+#[derive(Debug)]
+pub enum WorldGeom {
+    /// Nothing to paint (degenerate/empty element).
+    Empty,
+    /// roughr op sets in paint order (fills first, then strokes): shapes,
+    /// lines, arrows.
+    Rough(Vec<RoughOpSet>),
+    /// Legacy freedraw: jittered sample polylines, one per rough pass.
+    Sampled(Vec<Vec<WPoint>>),
+    /// Ink freedraw: closed world-space outline polygon (ribbon or dot).
+    Outline(Vec<WPoint>),
 }
 
 /// Convert a 0xRRGGBB color + opacity into an Hsla.
@@ -133,139 +150,87 @@ fn append_bez_path(
 }
 
 /// Generate the rough-styled paint paths for one element.
-/// Returned in paint order: fills first, then strokes.
+/// Returned in paint order: fills first, then strokes. Composition of
+/// [`world_geometry`] + [`paint_world_geom`]; the board's render cache calls
+/// the two stages separately so the geometry stage is skipped on hit.
 pub fn paths_for_element(
     el: &Element,
     camera: &Camera,
     canvas_origin: Point<Pixels>,
 ) -> Vec<ReadyPath> {
+    paint_world_geom(&world_geometry(el), el, camera, canvas_origin)
+}
+
+/// Compute the world-space geometry of one element. Pure and deterministic —
+/// the cache key is the element fingerprint, so this runs only when the
+/// element (or its style/seed) actually changed.
+pub fn world_geometry(el: &Element) -> WorldGeom {
     let style = &el.style;
     let b = &el.bounds;
-    let mut out: Vec<ReadyPath> = Vec::new();
-
-    let stroke_color = color_u32(style.stroke, style.opacity);
-    let fill_color = style
-        .background
-        .map(|c| color_u32(c, style.opacity))
-        .unwrap_or(stroke_color);
-
-    let stroke_width_px = camera.scale(style.stroke_width).max(px(0.5));
-    let fill_weight_px = camera.scale(style.stroke_width * 0.5).max(px(0.5));
-    let dashed = style.stroke_style == StrokeStyle::Dashed;
-
-    let mut push_drawable = |drawable: &rough_piet::KurboDrawable<f64>,
-                             out: &mut Vec<ReadyPath>| {
-        for set in &drawable.sets {
-            match set.op_set_type {
-                OpSetType::FillPath => {
-                    let mut builder = PathBuilder::fill();
-                    append_bez_path(&mut builder, &set.ops, camera, canvas_origin);
-                    if let Ok(path) = builder.build() {
-                        out.push(ReadyPath {
-                            path,
-                            color: fill_color,
-                        });
-                    }
-                }
-                OpSetType::FillSketch => {
-                    let mut builder = PathBuilder::stroke(fill_weight_px);
-                    append_bez_path(&mut builder, &set.ops, camera, canvas_origin);
-                    if let Ok(path) = builder.build() {
-                        out.push(ReadyPath {
-                            path,
-                            color: fill_color,
-                        });
-                    }
-                }
-                OpSetType::Path => {
-                    let mut builder = PathBuilder::stroke(stroke_width_px);
-                    if dashed {
-                        let dash = camera.scale(12.0);
-                        let gap = camera.scale(8.0);
-                        builder = builder.dash_array(&[dash, gap]);
-                    }
-                    append_bez_path(&mut builder, &set.ops, camera, canvas_origin);
-                    if let Ok(path) = builder.build() {
-                        out.push(ReadyPath {
-                            path,
-                            color: stroke_color,
-                        });
-                    }
-                }
-            }
-        }
-    };
-
     match &el.kind {
         ElementKind::Rectangle => {
             if b.w < 0.01 || b.h < 0.01 {
-                return out;
+                return WorldGeom::Empty;
             }
             let gen = KurboGenerator::new(options_for(style, el.seed, false));
-            push_drawable(&gen.rectangle(b.x, b.y, b.w, b.h), &mut out);
+            WorldGeom::Rough(sets_of(&gen.rectangle(b.x, b.y, b.w, b.h)))
         }
         ElementKind::Ellipse => {
             if b.w < 0.01 || b.h < 0.01 {
-                return out;
+                return WorldGeom::Empty;
             }
             let gen = KurboGenerator::new(options_for(style, el.seed, false));
             // roughr's ellipse treats (x, y) as the CENTER and width/height as
             // diameters, but our bounds.x/y is the top-left corner. Translate.
             let center = b.center();
-            push_drawable(&gen.ellipse(center.x, center.y, b.w, b.h), &mut out);
+            WorldGeom::Rough(sets_of(&gen.ellipse(center.x, center.y, b.w, b.h)))
         }
         ElementKind::Diamond => {
             if b.w < 0.01 || b.h < 0.01 {
-                return out;
+                return WorldGeom::Empty;
             }
             let gen = KurboGenerator::new(options_for(style, el.seed, false));
             let points: Vec<_> = diamond_polygon(b).iter().map(|p| to_euclid(*p)).collect();
-            push_drawable(&gen.polygon(&points), &mut out);
+            WorldGeom::Rough(sets_of(&gen.polygon(&points)))
         }
         // Variable-width ink stroke (from the crate::ink pipeline): fill the
         // ribbon outline instead of stroking a centerline. This arm must sit
         // before the generic point-based arm below, which keeps legacy
         // uniform strokes (empty widths) on the original rough path.
         ElementKind::Freedraw { .. } if !el.ink_widths().is_empty() => {
-            let outline = ink_outline_screen(el, camera, canvas_origin);
-            if outline.len() < 2 {
-                return out;
+            let points = el.absolute_points();
+            if points.len() < 2 {
+                return dot_geometry(el, &points);
             }
-            // NonZero fill: the ribbon can self-intersect at sharp turns and
-            // an EvenOdd rule would punch holes there.
-            let mut builder =
-                PathBuilder::fill().with_style(PathStyle::Fill(FillOptions::non_zero()));
-            for (i, sp) in outline.iter().enumerate() {
-                if i == 0 {
-                    builder.move_to(*sp);
-                } else {
-                    builder.line_to(*sp);
-                }
-            }
-            builder.close();
-            if let Ok(path) = builder.build() {
-                out.push(ReadyPath {
-                    path,
-                    color: stroke_color,
-                });
-            }
+            // Widths travel as ratios of the base stroke width; convert to
+            // world units here so the geometry stays style-independent.
+            let widths: Vec<f64> = el
+                .ink_widths()
+                .iter()
+                .map(|ratio| style.stroke_width * ratio)
+                .collect();
+            WorldGeom::Outline(crate::ink::ribbon_outline(&points, &widths))
         }
         ElementKind::Line { .. } | ElementKind::Arrow { .. } | ElementKind::Freedraw { .. } => {
             let points = el.absolute_points();
+            if points.len() == 1 {
+                // A pen tap without movement used to be discarded; it now
+                // produces a round ink dot (Excalidraw behavior).
+                return dot_geometry(el, &points);
+            }
             if points.len() < 2 {
-                return out;
+                return WorldGeom::Empty;
             }
             let is_freedraw = matches!(el.kind, ElementKind::Freedraw { .. });
             // Lines/arrows render as straight polylines by default; the
             // "curved" line type fits a smooth curve through the points
             // (Excalidraw). Freedraw strokes are always smoothed.
-            let curved = is_freedraw || style.line_type == LineType::Curved;
+            let curved = !is_freedraw && style.line_type == LineType::Curved;
 
             if is_freedraw {
-                // Freedraw bypasses roughr entirely (see below): sample a
-                // deterministic Catmull-Rom spline through the pointer
-                // points and stroke it directly. A committed stroke never
-                // moves across re-renders.
+                // Freedraw bypasses roughr entirely: sample a deterministic
+                // Catmull-Rom spline through the pointer points and stroke it
+                // directly. A committed stroke never moves across re-renders.
                 //
                 // Roughness presets, all fully deterministic (sin/cos of
                 // point position + seed, so the same seed always gives the
@@ -279,6 +244,7 @@ pub fn paths_for_element(
                 let samples = curve_samples(&points, 12);
                 let amp = roughness * 3.0;
                 let n_passes = if roughness >= 2.0 { 2 } else { 1 };
+                let mut passes = Vec::with_capacity(n_passes);
                 for pass in 0..n_passes {
                     let pass_f = pass as f64;
                     let offset_fn = |p: &WPoint| {
@@ -295,14 +261,104 @@ pub fn paths_for_element(
                             WPoint::new(p.x + dx, p.y + dy)
                         }
                     };
-                    let mut builder = PathBuilder::stroke(stroke_width_px);
-                    let origin = canvas_origin;
-                    let screen = |p: &WPoint| camera.world_to_screen(offset_fn(p), origin);
-                    if let Some(first) = samples.first() {
-                        builder.move_to(screen(first));
-                        for p in samples.iter().skip(1) {
-                            builder.line_to(screen(p));
+                    passes.push(samples.iter().map(offset_fn).collect());
+                }
+                WorldGeom::Sampled(passes)
+            } else {
+                let gen = KurboGenerator::new(options_for(style, el.seed, false));
+                let euclid_points: Vec<_> = points.iter().map(|p| to_euclid(*p)).collect();
+                let mut sets = if curved {
+                    sets_of(&gen.curve(&euclid_points))
+                } else {
+                    sets_of(&gen.linear_path(&euclid_points, false))
+                };
+                if let ElementKind::Arrow {
+                    end_arrowhead,
+                    start_arrowhead,
+                    ..
+                } = &el.kind
+                {
+                    let head_len = (16.0 + style.stroke_width * 3.0).max(20.0);
+                    if *end_arrowhead && points.len() >= 2 {
+                        push_arrowhead(&gen, &points, points.len() - 1, head_len, &mut sets);
+                    }
+                    if *start_arrowhead && points.len() >= 2 {
+                        push_arrowhead(&gen, &points, 0, head_len, &mut sets);
+                    }
+                }
+                WorldGeom::Rough(sets)
+            }
+        }
+        ElementKind::Text { .. } => {
+            // Text is shaped (via the text-cache) and painted separately.
+            WorldGeom::Empty
+        }
+    }
+}
+
+/// Geometry for a single-point stroke: a round ink dot whose diameter is the
+/// (pressure-scaled) stroke width. Used for pen taps.
+fn dot_geometry(el: &Element, points: &[WPoint]) -> WorldGeom {
+    let ratio = el.ink_widths().first().copied().unwrap_or(1.0);
+    let diameter = (el.style.stroke_width * ratio).max(0.5);
+    WorldGeom::Outline(crate::ink::dot_outline(points[0], diameter))
+}
+
+/// Transform cached world geometry into paintable screen-space paths for the
+/// current camera. This is the only per-frame work: flatten (zoom-dependent
+/// density), world_to_screen, and lyon tessellation.
+pub fn paint_world_geom(
+    geom: &WorldGeom,
+    el: &Element,
+    camera: &Camera,
+    canvas_origin: Point<Pixels>,
+) -> Vec<ReadyPath> {
+    let style = &el.style;
+    let mut out: Vec<ReadyPath> = Vec::new();
+
+    let stroke_color = color_u32(style.stroke, style.opacity);
+    let fill_color = style
+        .background
+        .map(|c| color_u32(c, style.opacity))
+        .unwrap_or(stroke_color);
+
+    let stroke_width_px = camera.scale(style.stroke_width).max(px(0.5));
+    let fill_weight_px = camera.scale(style.stroke_width * 0.5).max(px(0.5));
+    let dashed = style.stroke_style == StrokeStyle::Dashed;
+
+    match geom {
+        WorldGeom::Empty => {}
+        WorldGeom::Rough(sets) => {
+            for set in sets {
+                match set.op_set_type {
+                    OpSetType::FillPath => {
+                        let mut builder = PathBuilder::fill();
+                        append_bez_path(&mut builder, &set.ops, camera, canvas_origin);
+                        if let Ok(path) = builder.build() {
+                            out.push(ReadyPath {
+                                path,
+                                color: fill_color,
+                            });
                         }
+                    }
+                    OpSetType::FillSketch => {
+                        let mut builder = PathBuilder::stroke(fill_weight_px);
+                        append_bez_path(&mut builder, &set.ops, camera, canvas_origin);
+                        if let Ok(path) = builder.build() {
+                            out.push(ReadyPath {
+                                path,
+                                color: fill_color,
+                            });
+                        }
+                    }
+                    OpSetType::Path => {
+                        let mut builder = PathBuilder::stroke(stroke_width_px);
+                        if dashed {
+                            let dash = camera.scale(12.0);
+                            let gap = camera.scale(8.0);
+                            builder = builder.dash_array(&[dash, gap]);
+                        }
+                        append_bez_path(&mut builder, &set.ops, camera, canvas_origin);
                         if let Ok(path) = builder.build() {
                             out.push(ReadyPath {
                                 path,
@@ -311,41 +367,49 @@ pub fn paths_for_element(
                         }
                     }
                 }
-            } else {
-                let gen = KurboGenerator::new(options_for(style, el.seed, false));
-                let euclid_points: Vec<_> = points.iter().map(|p| to_euclid(*p)).collect();
-                if curved {
-                    push_drawable(&gen.curve(&euclid_points), &mut out);
-                } else {
-                    push_drawable(&gen.linear_path(&euclid_points, false), &mut out);
-                }
             }
-
-            if let ElementKind::Arrow {
-                end_arrowhead,
-                start_arrowhead,
-                ..
-            } = &el.kind
-            {
-                let gen = KurboGenerator::new(options_for(style, el.seed, false));
-                let head_len = (16.0 + style.stroke_width * 3.0).max(20.0);
-                if *end_arrowhead && points.len() >= 2 {
-                    push_arrowhead(
-                        &gen,
-                        &points,
-                        points.len() - 1,
-                        head_len,
-                        &mut push_drawable,
-                        &mut out,
-                    );
+        }
+        WorldGeom::Sampled(passes) => {
+            for pass in passes {
+                let Some(first) = pass.first() else {
+                    continue;
+                };
+                let mut builder = PathBuilder::stroke(stroke_width_px);
+                builder.move_to(camera.world_to_screen(*first, canvas_origin));
+                for p in pass.iter().skip(1) {
+                    builder.line_to(camera.world_to_screen(*p, canvas_origin));
                 }
-                if *start_arrowhead && points.len() >= 2 {
-                    push_arrowhead(&gen, &points, 0, head_len, &mut push_drawable, &mut out);
+                if let Ok(path) = builder.build() {
+                    out.push(ReadyPath {
+                        path,
+                        color: stroke_color,
+                    });
                 }
             }
         }
-        ElementKind::Text { .. } => {
-            // Text is shaped and painted separately (see render::text).
+        WorldGeom::Outline(outline) => {
+            if outline.len() < 2 {
+                return out;
+            }
+            // NonZero fill: the ribbon can self-intersect at sharp turns and
+            // an EvenOdd rule would punch holes there.
+            let mut builder =
+                PathBuilder::fill().with_style(PathStyle::Fill(FillOptions::non_zero()));
+            for (i, wp) in outline.iter().enumerate() {
+                let sp = camera.world_to_screen(*wp, canvas_origin);
+                if i == 0 {
+                    builder.move_to(sp);
+                } else {
+                    builder.line_to(sp);
+                }
+            }
+            builder.close();
+            if let Ok(path) = builder.build() {
+                out.push(ReadyPath {
+                    path,
+                    color: stroke_color,
+                });
+            }
         }
     }
 
@@ -357,8 +421,7 @@ fn push_arrowhead(
     points: &[WPoint],
     tip_index: usize,
     head_len: f64,
-    push: &mut impl FnMut(&rough_piet::KurboDrawable<f64>, &mut Vec<ReadyPath>),
-    out: &mut Vec<ReadyPath>,
+    out: &mut Vec<RoughOpSet>,
 ) {
     let tip = points[tip_index];
     // Direction of the segment at the tip: for the end arrowhead it's the
@@ -388,7 +451,7 @@ fn push_arrowhead(
         let dx = ux * cos - uy * sin;
         let dy = ux * sin + uy * cos;
         let end = WPoint::new(tip.x - dx * head_len, tip.y - dy * head_len);
-        push(&gen.line(tip.x, tip.y, end.x, end.y), out);
+        out.extend(sets_of(&gen.line(tip.x, tip.y, end.x, end.y)));
     }
 }
 
@@ -527,6 +590,23 @@ mod tests {
         el
     }
 
+    /// Screen-space outline of an element's cached geometry — the test-side
+    /// equivalent of the old ink_outline_screen helper (gpui's tessellated
+    /// `Path` exposes no public geometry, so tests assert on this instead).
+    fn screen_outline(
+        el: &Element,
+        camera: &Camera,
+        canvas_origin: Point<Pixels>,
+    ) -> Vec<Point<Pixels>> {
+        match world_geometry(el) {
+            WorldGeom::Outline(pts) => pts
+                .iter()
+                .map(|wp| camera.world_to_screen(*wp, canvas_origin))
+                .collect(),
+            other => panic!("expected Outline geometry, got {other:?}"),
+        }
+    }
+
     #[test]
     fn ink_stroke_fills_the_ribbon_outline() {
         // A tapered horizontal stroke (widths 4 → 2 world units) must render
@@ -539,7 +619,7 @@ mod tests {
         let paths = paths_for_element(&el, &camera, origin);
         assert_eq!(paths.len(), 1, "ink stroke renders as one fill path");
 
-        let outline = ink_outline_screen(&el, &camera, origin);
+        let outline = screen_outline(&el, &camera, origin);
         let (mut x0, mut y0, mut x1, mut y1) = (
             f32::INFINITY,
             f32::INFINITY,
@@ -563,8 +643,8 @@ mod tests {
         let camera = Camera::default();
         let origin = gpui::point(px(0.0), px(0.0));
         let el = horizontal_ink_stroke(vec![0.6, 1.0, 0.4]);
-        let a = ink_outline_screen(&el, &camera, origin);
-        let b = ink_outline_screen(&el, &camera, origin);
+        let a = screen_outline(&el, &camera, origin);
+        let b = screen_outline(&el, &camera, origin);
         assert_eq!(a, b);
         assert_eq!(paths_for_element(&el, &camera, origin).len(), 1);
     }
@@ -577,5 +657,122 @@ mod tests {
         let origin = gpui::point(px(0.0), px(0.0));
         let el = horizontal_ink_stroke(Vec::new());
         assert!(!paths_for_element(&el, &camera, origin).is_empty());
+    }
+
+    #[test]
+    fn single_point_freedraw_renders_a_pressure_scaled_dot() {
+        let camera = Camera::default();
+        let origin = gpui::point(px(0.0), px(0.0));
+        let mut el = Element::from_absolute_points(
+            |points| ElementKind::Freedraw {
+                points,
+                widths: Vec::new(),
+            },
+            vec![WPoint::new(10.0, 0.0)],
+            {
+                let mut s = ElementStyle::default();
+                s.stroke_width = 4.0;
+                s
+            },
+        );
+        if let ElementKind::Freedraw { widths, .. } = &mut el.kind {
+            *widths = vec![0.5]; // ratio 0.5 × base 4 → Ø2 dot
+        }
+        let paths = paths_for_element(&el, &camera, origin);
+        assert_eq!(paths.len(), 1, "a pen tap renders one dot fill");
+
+        let outline = screen_outline(&el, &camera, origin);
+        let (x0, y0, x1, y1) = (
+            outline
+                .iter()
+                .map(|p| f32::from(p.x))
+                .fold(f32::INFINITY, f32::min),
+            outline
+                .iter()
+                .map(|p| f32::from(p.y))
+                .fold(f32::INFINITY, f32::min),
+            outline
+                .iter()
+                .map(|p| f32::from(p.x))
+                .fold(f32::NEG_INFINITY, f32::max),
+            outline
+                .iter()
+                .map(|p| f32::from(p.y))
+                .fold(f32::NEG_INFINITY, f32::max),
+        );
+        // Center (10, 0), radius 1.
+        assert!((x0 - 9.0).abs() < 1e-6 && (x1 - 11.0).abs() < 1e-6);
+        assert!((y0 + 1.0).abs() < 1e-6 && (y1 - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn single_point_legacy_freedraw_renders_a_base_width_dot() {
+        // No widths (taper off): the dot uses the base stroke width.
+        let camera = Camera::default();
+        let origin = gpui::point(px(0.0), px(0.0));
+        let el = horizontal_ink_stroke(Vec::new());
+        let mut one = Element::from_absolute_points(
+            |points| ElementKind::Freedraw {
+                points,
+                widths: Vec::new(),
+            },
+            vec![WPoint::new(50.0, 40.0)],
+            {
+                let mut s = ElementStyle::default();
+                s.stroke_width = 2.0;
+                s
+            },
+        );
+        one.seed = el.seed;
+        match world_geometry(&one) {
+            WorldGeom::Outline(pts) => {
+                let max_r = pts
+                    .iter()
+                    .map(|p| (p.x - 50.0).hypot(p.y - 40.0))
+                    .fold(0.0f64, f64::max);
+                assert!(
+                    (max_r - 1.0).abs() < 1e-9,
+                    "radius {max_r} ≠ base width / 2"
+                );
+            }
+            other => panic!("expected Outline, got {other:?}"),
+        }
+        assert_eq!(paths_for_element(&one, &camera, origin).len(), 1);
+    }
+
+    #[test]
+    fn paths_for_element_composes_geometry_and_paint() {
+        // The render cache relies on paths_for_element being exactly
+        // paint_world_geom(world_geometry(el)) — keep the two call paths
+        // from diverging.
+        let camera = Camera::default();
+        let origin = gpui::point(px(0.0), px(0.0));
+        let mut style = ElementStyle::default();
+        style.background = Some(0xa5d8ff);
+        let mut dashed_line = ElementStyle::default();
+        dashed_line.stroke_style = StrokeStyle::Dashed;
+        let els = vec![
+            Element::new(
+                ElementKind::Rectangle,
+                WBounds::new(0.0, 0.0, 100.0, 80.0),
+                style.clone(),
+            ),
+            Element::new(
+                ElementKind::Ellipse,
+                WBounds::new(0.0, 0.0, 100.0, 80.0),
+                style,
+            ),
+            Element::from_absolute_points(
+                |points| ElementKind::Line { points },
+                vec![WPoint::new(0.0, 0.0), WPoint::new(100.0, 0.0)],
+                dashed_line,
+            ),
+            horizontal_ink_stroke(vec![0.6, 1.0, 0.4]),
+        ];
+        for el in &els {
+            let direct = paths_for_element(el, &camera, origin);
+            let staged = paint_world_geom(&world_geometry(el), el, &camera, origin);
+            assert_eq!(direct.len(), staged.len());
+        }
     }
 }

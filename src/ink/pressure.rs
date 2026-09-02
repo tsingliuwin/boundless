@@ -2,19 +2,41 @@
 //!
 //! Two independent sources feed the same width model:
 //!
-//! * **Velocity simulation** (v1, always available): pointer speed maps
-//!   inversely to width — slow strokes are thick, fast strokes are thin —
-//!   which is the classic calligraphic "笔锋" feel and works with a plain
-//!   mouse.
-//! * **Hardware pressure** (v2, planned): a WM_POINTER window hook will feed
-//!   the stylus digitizer pressure through [`width_from_hardware_pressure`].
-//!   The function is pure and tested now so the v2 hook only has to supply
-//!   the value.
+//! * **Velocity simulation** (always available): pointer speed maps inversely
+//!   to width — slow strokes are thick, fast strokes are thin — which is the
+//!   classic calligraphic "笔锋" feel and works with a plain mouse.
+//! * **Hardware pressure** (live on Windows): the WM_POINTER hook in
+//!   `crate::platform` feeds the stylus digitizer pressure through
+//!   [`width_from_hardware_pressure`], overriding the simulation per sample
+//!   while a pen draws.
 //!
 //! All functions return a *width ratio* relative to the stroke's base width
 //! (`style.stroke_width`), never an absolute width. Storing ratios in the
 //! element keeps serialization small and makes later restyling (changing the
 //! base width) scale the whole stroke naturally.
+//!
+//! # Tuning guide (手感调参)
+//!
+//! All knobs live here; none of the capture/render code embeds magic feel
+//! numbers. Adjust, then `cargo test ink::` — the tests assert structural
+//! invariants (monotonicity, floors, taper-in), not exact values, so tuning
+//! won't break them:
+//!
+//! | Symptom | Knob | Direction |
+//! |---|---|---|
+//! | Fast strokes too thin / vanish | `WIDTH_MIN_RATIO` | ↑ (0.35 → 0.45) |
+//! | Slow strokes not thick enough | `PRESSURE_GAMMA` | ↓ (0.5 → 0.35) |
+//! | Width flickers on direction changes | `PRESSURE_EMA_ALPHA` | ↓ (0.3 → 0.2) |
+//! | Width lags the hand too much | `PRESSURE_EMA_ALPHA` | ↑ |
+//! | Even slow writing looks thin overall | `SPEED_MAX` | ↑ (4.0 → 6.0) |
+//! | Every stroke starts as a wide blob | `PRESSURE_START` | ↓ (0.6 → 0.45) |
+//! | Strokes feel over-smoothed / laggy | `collector::SMOOTH_ALPHA` | ↑ (0.5 → 0.65) |
+//! | Hand jitter still visible | `collector::SMOOTH_ALPHA` | ↓ |
+//! | Light pen touches not delicate enough | `HARDWARE_MIN_RATIO` | ↓ (0.25 → 0.15) |
+//!
+//! These values were chosen for mouse-driven writing at 100% zoom; real
+//! digitizer feedback may warrant revisiting `SPEED_MAX` first (touchpad and
+//! pen speeds differ a lot).
 
 use crate::ink::smooth::exp_smooth;
 

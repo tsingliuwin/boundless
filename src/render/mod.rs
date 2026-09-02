@@ -1,5 +1,6 @@
 //! Painting helpers: dot grid, text shaping, selection overlay geometry.
 
+pub mod cache;
 pub mod rough;
 
 use gpui::{
@@ -39,11 +40,7 @@ pub fn canvas_font_with(family: &str) -> Font {
 pub const GRID_SPACING: f64 = 20.0;
 
 /// Build tiny quads for the dot grid covering the viewport.
-pub fn dot_grid(
-    camera: &Camera,
-    viewport: Bounds<Pixels>,
-    color: Hsla,
-) -> Vec<PaintQuad> {
+pub fn dot_grid(camera: &Camera, viewport: Bounds<Pixels>, color: Hsla) -> Vec<PaintQuad> {
     // Keep the on-screen spacing in a comfortable range by doubling the
     // world-space step when zoomed far out.
     let mut spacing = GRID_SPACING;
@@ -58,7 +55,10 @@ pub fn dot_grid(
     let origin = viewport.origin;
     let top_left_world = camera.screen_to_world(origin, origin);
     let bottom_right_world = camera.screen_to_world(
-        point(origin.x + viewport.size.width, origin.y + viewport.size.height),
+        point(
+            origin.x + viewport.size.width,
+            origin.y + viewport.size.height,
+        ),
         origin,
     );
 

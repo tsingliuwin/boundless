@@ -117,6 +117,23 @@ pub fn ribbon_outline(points: &[WPoint], widths: &[f64]) -> Vec<WPoint> {
     out
 }
 
+/// Tessellation steps for [`dot_outline`]. 24 makes a pen tap visually round
+/// at any zoom a dot is drawn at, at negligible vertex cost.
+pub const DOT_SEGMENTS: usize = 24;
+
+/// Closed circular outline for a pen tap (dot) of `diameter` world units
+/// around `center`. A single-point stroke can't go through
+/// [`ribbon_outline`] (it needs ≥ 2 points), so dots get their own polygon.
+pub fn dot_outline(center: WPoint, diameter: f64) -> Vec<WPoint> {
+    let r = (diameter / 2.0).max(0.25);
+    (0..DOT_SEGMENTS)
+        .map(|i| {
+            let theta = std::f64::consts::TAU * i as f64 / DOT_SEGMENTS as f64;
+            WPoint::new(center.x + r * theta.cos(), center.y + r * theta.sin())
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,5 +266,30 @@ mod tests {
         assert!((x1 - 12.0).abs() < 1e-9);
         assert!((y0 + 2.0).abs() < 1e-9);
         assert!((y1 - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dot_outline_is_a_circle_of_the_requested_diameter() {
+        let dot = dot_outline(WPoint::new(100.0, 50.0), 4.0);
+        assert_eq!(dot.len(), DOT_SEGMENTS);
+        let (x0, y0, x1, y1) = bbox(&dot);
+        assert!((x0 - 98.0).abs() < 1e-9, "left {x0}");
+        assert!((x1 - 102.0).abs() < 1e-9, "right {x1}");
+        assert!((y0 - 48.0).abs() < 1e-9, "top {y0}");
+        assert!((y1 - 52.0).abs() < 1e-9, "bottom {y1}");
+        // Every vertex sits on the circle.
+        for p in &dot {
+            let d = (p.x - 100.0).hypot(p.y - 50.0);
+            assert!((d - 2.0).abs() < 1e-9, "radius {d}");
+        }
+    }
+
+    #[test]
+    fn dot_outline_clamps_tiny_diameters() {
+        // Degenerate input still yields a visible circle.
+        let dot = dot_outline(WPoint::new(0.0, 0.0), 0.0);
+        let (_, y0, _, y1) = bbox(&dot);
+        assert!((y0 + 0.25).abs() < 1e-9);
+        assert!((y1 - 0.25).abs() < 1e-9);
     }
 }
