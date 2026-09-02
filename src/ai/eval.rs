@@ -1024,7 +1024,7 @@ pub fn evaluate_ink(
         },
     ));
 
-    // -- 远山层：宽扁椭圆、带填充、淡墨 --
+    // -- 远山层：宽扁椭圆、带填充、墨色可见 --
     let is_mountain = |e: &VirtualElement| {
         matches!(e.kind, "ellipse")
             && e.w >= 250.0
@@ -1034,16 +1034,39 @@ pub fn evaluate_ink(
     };
     let mountains: Vec<&VirtualElement> =
         canvas.elements.iter().filter(|e| is_mountain(e)).collect();
-    let light_mountains = mountains.iter().filter(|m| m.opacity <= 0.5).count();
+    // 有效墨色：fill 按透明度与宣纸混合后的亮度，须与纸面拉开 ≥ 0.24，
+    // 否则该山在宣纸上不可见（opacity 过低的实测教训）。
+    let paper_lum = canvas.background.map(luminance).unwrap_or(0.94);
+    let visible_ink = |e: &VirtualElement| {
+        let fill_lum = luminance(e.fill.unwrap_or(0xFFFFFF));
+        let eff = fill_lum * e.opacity + paper_lum * (1.0 - e.opacity);
+        (paper_lum - eff).abs() >= 0.24
+    };
+    let visible_mountains = mountains.iter().filter(|m| visible_ink(m)).count();
     checks.push(check(
-        "远山层 ≥ 3（宽扁椭圆淡墨填充）",
-        light_mountains >= 3,
+        "远山层 ≥ 3（宽扁椭圆，墨色可见）",
+        visible_mountains >= 3,
         format!(
-            "宽扁椭圆 {} 只，其中淡墨填充 {} 只",
+            "宽扁椭圆 {} 只，其中墨色可见 {} 只（宣纸亮度 {:.2}）",
             mountains.len(),
-            light_mountains
+            visible_mountains,
+            paper_lum
         ),
     ));
+
+    // 不可见的山单独提示：透明度过低 = 墨太淡
+    let invisible: Vec<String> = mountains
+        .iter()
+        .filter(|m| !visible_ink(m))
+        .map(|m| format!("opacity {:.2}", m.opacity))
+        .collect();
+    if !invisible.is_empty() {
+        checks.push(check(
+            "远山透明度不可低于可见下限",
+            false,
+            format!("过淡的山: {}", invisible.join("、")),
+        ));
+    }
 
     // -- 墨色递进：远山透明度或墨色有梯度（不能全画布一个浓淡）--
     let opacities: Vec<f64> = mountains.iter().map(|m| m.opacity).collect();
@@ -1073,6 +1096,7 @@ pub fn evaluate_ink(
             matches!(e.kind, "rectangle" | "ellipse")
                 && e.fill.is_some()
                 && (e.opacity >= 0.55 || luminance(e.fill.unwrap_or(0xFFFFFF)) <= 0.35)
+                && visible_ink(e)
         })
         .count();
     checks.push(check(
@@ -1250,10 +1274,10 @@ mod ink_tests {
             None,
         )];
         let layers = [
-            (80.0, 120.0, 700.0, 240.0, 0.2),
-            (300.0, 180.0, 750.0, 260.0, 0.3),
-            (520.0, 260.0, 700.0, 250.0, 0.42),
-            (200.0, 420.0, 800.0, 280.0, 0.8),
+            (80.0, 120.0, 700.0, 240.0, 0.5),
+            (300.0, 180.0, 750.0, 260.0, 0.6),
+            (520.0, 260.0, 700.0, 250.0, 0.72),
+            (200.0, 420.0, 800.0, 280.0, 0.9),
         ];
         for (x, y, w, h, op) in layers {
             ops.push((
@@ -1263,7 +1287,7 @@ mod ink_tests {
                     w,
                     h,
                     style: CanvasStyle {
-                        fill: Some(0x6b7680),
+                        fill: Some(0x4a5560),
                         opacity: Some(op),
                         fill_style: Some(OpFillStyle::Solid),
                         ..Default::default()
