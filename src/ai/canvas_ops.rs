@@ -246,6 +246,18 @@ impl CanvasOp {
     }
 }
 
+/// Normalize text from model output: models occasionally double-escape
+/// newlines, so the canvas sees the literal two-character sequence
+/// backslash + `n` instead of a real line break — which then renders as a
+/// visible `\n`. Collapse those into real newlines. Idempotent.
+pub fn normalize_text(text: impl Into<String>) -> String {
+    const LITERAL_CRLF: &str = "\\r\\n";
+    const LITERAL_LF: &str = "\\n";
+    text.into()
+        .replace(LITERAL_CRLF, "\n")
+        .replace(LITERAL_LF, "\n")
+}
+
 impl CanvasStyle {
     /// Reject out-of-range color values — models occasionally emit 7-digit
     /// hex, which would render as a garbage color. `None` fields pass.
@@ -388,6 +400,19 @@ mod tests {
             }
             _ => panic!("expected arrow"),
         }
+    }
+
+    #[test]
+    fn normalize_text_unwraps_double_escaped_newlines() {
+        // The model wrote \\n inside its JSON string: after JSON parsing the
+        // canvas text holds the literal two characters backslash + n.
+        // normalize_text collapses those into real newlines.
+        let raw = "一块黑板\\n三尺讲台\\n\\n春晖遍四方";
+        assert_eq!(raw, "一块黑板\\n三尺讲台\\n\\n春晖遍四方"); // raw is literal
+        let out = normalize_text(raw);
+        assert_eq!(out, "一块黑板\n三尺讲台\n\n春晖遍四方");
+        // Real newlines pass through unchanged (idempotent).
+        assert_eq!(normalize_text("a\nb"), "a\nb");
     }
 
     #[test]

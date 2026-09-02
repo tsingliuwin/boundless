@@ -618,6 +618,39 @@ pub fn evaluate(
         },
     ));
 
+    // 字面换行残留：模型双重转义的 "\\n" 会原样渲染出来（实测事故）。
+    // 板端 normalize_text 会清洗，这里兜底检测其他路径。
+    const LITERAL_LF: &str = "\\n";
+    let literal_n: Vec<String> = texts
+        .iter()
+        .filter(|t| {
+            t.text
+                .as_deref()
+                .map(|s| s.contains(LITERAL_LF))
+                .unwrap_or(false)
+        })
+        .map(|t| {
+            format!(
+                "「{}…」",
+                t.text
+                    .as_deref()
+                    .unwrap_or("")
+                    .chars()
+                    .take(8)
+                    .collect::<String>()
+            )
+        })
+        .collect();
+    checks.push(check(
+        "无字面换行符残留",
+        literal_n.is_empty(),
+        if literal_n.is_empty() {
+            "无".to_string()
+        } else {
+            format!("含字面 \\n 的文本: {}", literal_n.join("、"))
+        },
+    ));
+
     // 文字与有效板面的对比：深底要浅字，浅底要深字。
     let contrast_fail: Vec<String> = match surface {
         Some(s) => {
@@ -1020,6 +1053,31 @@ mod tests {
                 .unwrap()
                 .passed
         );
+    }
+
+    #[test]
+    fn literal_newline_remnants_fail() {
+        let mut canvas = VirtualCanvas::default();
+        canvas.background = Some(0x2A5240);
+        canvas.elements.push(VirtualElement {
+            id: "t1".into(),
+            kind: "text",
+            x: 100.0,
+            y: 100.0,
+            w: 400.0,
+            h: 30.0,
+            text: Some("一块黑板\\n三尺讲台".into()),
+            font_size: 20.0,
+            stroke: 0xFFFFFF,
+            fill: None,
+        });
+        let report = evaluate(&canvas, true, 0);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name.contains("字面换行"))
+            .unwrap();
+        assert!(!check.passed, "detail: {}", check.detail);
     }
 
     #[test]

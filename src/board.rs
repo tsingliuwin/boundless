@@ -887,6 +887,7 @@ impl BoardView {
                 };
                 let fs = font_size.unwrap_or(self.text_font_size).max(4.0);
                 let ta = align.map(Into::into).unwrap_or(self.text_align);
+                let text = crate::ai::canvas_ops::normalize_text(text);
                 self.history.record(&self.scene);
                 let mut el = Element::new_text(WPoint::new(x, y), text, styled(style));
                 // Override the auto-generated id with the pre-assigned one.
@@ -942,7 +943,7 @@ impl BoardView {
                 id,
                 x,
                 y,
-                text,
+                mut text,
                 style,
                 font_size,
             } => {
@@ -951,6 +952,7 @@ impl BoardView {
                 let Some(uuid) = self.scene.find_by_id_prefix(&id) else {
                     return Err(CanvasOpError::not_found(format!("找不到元素 id={id}")));
                 };
+                text = text.map(|t| crate::ai::canvas_ops::normalize_text(t));
                 self.history.record(&self.scene);
                 // Phase 1: update position / style / font size (needs a mutable
                 // borrow of the element).
