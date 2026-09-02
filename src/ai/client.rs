@@ -199,7 +199,9 @@ mod tests {
         // New-format messages keep their ordered steps after serialize/deserialize.
         let mut m = ChatMessage::assistant("画好了");
         m.steps = vec![
-            AssistantStep::Reasoning { text: "先画框".into() },
+            AssistantStep::Reasoning {
+                text: "先画框".into(),
+            },
             AssistantStep::Tool {
                 name: "draw_rectangle".into(),
                 args: serde_json::json!({ "x": 10.0, "y": 20.0, "w": 100.0, "h": 50.0 }),
@@ -208,7 +210,9 @@ mod tests {
                 id: String::new(),
                 result: String::new(),
             },
-            AssistantStep::Reasoning { text: "再连线".into() },
+            AssistantStep::Reasoning {
+                text: "再连线".into(),
+            },
             AssistantStep::Tool {
                 name: "draw_arrow".into(),
                 args: serde_json::json!({ "points": [{"x":0.0,"y":0.0},{"x":1.0,"y":1.0}] }),

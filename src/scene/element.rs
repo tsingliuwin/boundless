@@ -160,6 +160,17 @@ pub enum LineType {
     Curved,
 }
 
+/// How shape backgrounds are filled: hachure sketch lines (the classic
+/// Excalidraw look, default) or a solid flat block (chalk-paste panels on a
+/// blackboard poster).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FillStyle {
+    #[default]
+    Hachure,
+    Solid,
+}
+
 /// Visual style shared by all elements. Colors are 0xRRGGBB.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ElementStyle {
@@ -172,6 +183,9 @@ pub struct ElementStyle {
     /// Straight vs curved polylines (lines/arrows only).
     #[serde(default)]
     pub line_type: LineType,
+    /// Hachure sketch fill vs solid flat fill (shape backgrounds only).
+    #[serde(default)]
+    pub fill_style: FillStyle,
 }
 
 impl Default for ElementStyle {
@@ -184,6 +198,7 @@ impl Default for ElementStyle {
             stroke_style: StrokeStyle::Solid,
             opacity: 1.0,
             line_type: LineType::Straight,
+            fill_style: FillStyle::Hachure,
         }
     }
 }

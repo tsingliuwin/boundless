@@ -46,7 +46,8 @@ pub fn next_tool_id(name: &str) -> String {
 pub type Model = openai::completion::CompletionModel;
 /// Items yielded by an agent stream: `StreamedAssistantContent` + tool results.
 #[allow(dead_code)]
-pub type StreamItem = MultiTurnStreamItem<<Model as rig_core::completion::CompletionModel>::StreamingResponse>;
+pub type StreamItem =
+    MultiTurnStreamItem<<Model as rig_core::completion::CompletionModel>::StreamingResponse>;
 
 /// System prompt for the drawing agent. Describes the coordinate system,
 /// available tools, and the expectation that the agent draws rather than only
@@ -54,7 +55,7 @@ pub type StreamItem = MultiTurnStreamItem<<Model as rig_core::completion::Comple
 pub const SYSTEM_PROMPT: &str = r##"你是 boundless 白板应用的绘图助手。你的核心职责是通过调用绘图工具把内容直接画到画布上，而不是只做文字说明。
 
 ## 角色与完成标准
-- 你把用户的描述变成画布上可读、完整、无交叉的图形（流程图、架构图、示意图、概念图等）。
+- 你把用户的描述变成画布上可读、完整、无交叉的图形（流程图、架构图、示意图、概念图、黑板报、海报等）。
 - 完成标准：图形结构完整、节点都有文字、连线方向明确、布局不重叠不交叉、文字不溢出框外、说明简洁。
 - 只有当图形达到以上标准时，才算真正完成；不要画到一半就当作结束。
 
@@ -84,12 +85,13 @@ pub const SYSTEM_PROMPT: &str = r##"你是 boundless 白板应用的绘图助手
 - draw_diamond(x, y, w, h, text?)：画菱形（判断节点）。text 写条件，如「密码正确？」。
 - draw_arrow(points, text?)：画带箭头的连线，points 是两个或更多坐标点，默认末端箭头。用于连接流程节点；text 在线上标注条件，如「是」「否」。
 - draw_line(points, text?)：画无箭头的连线。同样支持 text 参数标注。
-- draw_text(x, y, text)：画独立文本，用于标题或说明（不属于任何形状的文字）。
+- draw_text(x, y, text, font_size?, align?, font_family?, wrap_width?, style?)：画独立文本，text 可含换行。font_family 别名：handwritten（默认手写体）/ kai（楷体）/ hei（黑体）/ song（宋体）。wrap_width 是自动换行宽度（世界单位）——正文段落务必提供。颜色用 style.stroke。
+- set_canvas_background(preset?, color?)：设置画布底色。preset: greenboard（墨绿粉笔板）/ blackboard（黑板黑）/ white（白板）。
 - update_element(id, x?, y?, text?, style?, font_size?)：修改已有元素——移动（x/y）、改文字（text）、改样式（style，只改提供的字段）或改字号（font_size，仅文本）。画错了优先用它修正，不必删除重画。
 - delete_element(id)：删除一个元素（及其标签）。
 - clear_canvas()：清空画布上的所有元素。用户要求「重新开始」「全部重画」时使用。
 - list_elements()：列出画布所有元素的 id、类型、文字和位置，用于查询现状和完成前自检。
-- 所有 draw_* 与 update_element 均可省略 style，沿用画板当前样式；style 可选字段：stroke（描边 0xRRGGBB）、fill（填充）、stroke_width（线宽）、roughness（粗糙度 0~2）、opacity（透明度 0~1）。
+- 所有 draw_* 与 update_element 均可省略 style，沿用画板当前样式；style 可选字段：stroke（描边 0xRRGGBB）、fill（填充）、fill_style（hachure 手绘排线 / solid 整块填充）、stroke_width（线宽）、roughness（粗糙度 0~2）、opacity（透明度 0~1）。
 
 ## 画布坐标系与尺寸
 - 原点在左上角，x 向右增大，y 向下增大。可见范围约 x∈[0,1600]、y∈[0,1000]。
@@ -103,6 +105,21 @@ pub const SYSTEM_PROMPT: &str = r##"你是 boundless 白板应用的绘图助手
 - 回环线（如"失败后回到输入"）走外侧绕行，不要穿过中间的形状。用多个折线点让线绕开障碍。
 - 箭头端点对齐到形状的边缘中点（上/下/左/右中点），不要连到形状内部。
 - 先规划好所有形状的位置，再画连线——这样你知道每条线的起点和终点在哪里，能避免交叉。
+
+## 黑板报 / 海报构图模式
+用户要求黑板报、板报、海报、宣传版面时，按以下流程与规范绘制：
+
+1. **底色**：第一步调用 set_canvas_background(preset="greenboard")（墨绿粉笔板）。
+2. **版面分区**（在思考里先定坐标，典型三栏）：
+   - 报头区：y∈[40,180]，横向通栏或居中；
+   - 内容板块：2~3 个板块，每个宽 420~500、高 520~640，x 分别 ≈ [50,470]、[550,970]、[1050,1470]，y∈[210,860]；
+   - 每个板块：先画底板矩形（fill_style="solid"、fill 用深色板块底、stroke 白色细边），再在底板内放板块标题和正文。
+3. **字号层级**（必须拉开）：报头大标题 64~72、板块标题 28~32、正文 18~20。标题用 font_family="kai" 或 "hei"，正文用 "kai"。
+4. **粉笔配色**（深底上只允许这些高亮色）：白 0xFFFFFF、米黄 0xFFF2CC、粉红 0xFFC0CB、浅蓝 0xA8D8EA、浅绿 0xB8E0C8、浅黄 0xFFE699。描边和文字都必须用这些色，不要用黑色。
+5. **正文**：每段用 draw_text，必须给 wrap_width（≈ 板块宽 - 60），配合 \n 分段；文字块的 y 依次向下排，块间距 ≥ 24，绝不能互相重叠。
+6. **装饰**：板块之间用 draw_line 画分隔花边（波浪用多段折线），四角或空隙画小插图（太阳/花朵/书本等用 2~4 个形状组合，solid 填充粉笔色）。
+7. **纪律**：所有元素必须完全在 (40,40)-(1560,960) 内；文字永远在所属底板矩形内部（四周留 ≥ 20 边距）；一个板块画完再画下一个。
+8. **完成自检**：list_elements 核对——文字块两两不重叠、无越界、标题/正文字号层级清晰。
 
 ## 完成前自检
 画完后调用一次 list_elements 核对：节点是否齐全、是否有重叠、连线是否交叉、文字是否溢出。发现问题用 update_element 修正后再结束。
@@ -160,7 +177,11 @@ pub enum AgentEvent {
     /// so the UI can mark the corresponding step done; `result` is the tool's
     /// return text (e.g. "已添加到画布"), and `is_error` marks a failure (e.g.
     /// a validation rejection or a missing element id).
-    ToolResult { id: String, result: String, is_error: bool },
+    ToolResult {
+        id: String,
+        result: String,
+        is_error: bool,
+    },
     /// Stream completed; `text` is the full final assistant message.
     /// `drew_anything` is true if at least one tool call was made this turn —
     /// the UI uses it to warn when the model replied without drawing.
@@ -260,12 +281,7 @@ impl BoundlessAgent {
                 }
                 match item {
                     Ok(stream_item) => {
-                        if !handle_agent_item(
-                            stream_item,
-                            &tx,
-                            &mut full_text,
-                            &mut tool_called,
-                        ) {
+                        if !handle_agent_item(stream_item, &tx, &mut full_text, &mut tool_called) {
                             break;
                         }
                     }
@@ -290,10 +306,7 @@ impl BoundlessAgent {
             });
         });
 
-        Ok(AgentRequest {
-            events: rx,
-            cancel,
-        })
+        Ok(AgentRequest { events: rx, cancel })
     }
 }
 
@@ -310,9 +323,7 @@ pub struct BoundlessAgent;
 /// primary lifecycle is tool-emitted), so the caller can report
 /// `drew_anything` on Done.
 fn handle_agent_item(
-    item: MultiTurnStreamItem<
-        <Model as rig_core::completion::CompletionModel>::StreamingResponse,
-    >,
+    item: MultiTurnStreamItem<<Model as rig_core::completion::CompletionModel>::StreamingResponse>,
     tx: &futures::channel::mpsc::UnboundedSender<AgentEvent>,
     full_text: &mut String,
     tool_called: &mut bool,
@@ -344,8 +355,7 @@ fn handle_agent_item(
         },
         // Tool results, completion calls, and any future variants: the tools
         // own their lifecycle; ignore rig's internal representations.
-        MultiTurnStreamItem::StreamUserItem(_)
-        | MultiTurnStreamItem::CompletionCall(_) => {}
+        MultiTurnStreamItem::StreamUserItem(_) | MultiTurnStreamItem::CompletionCall(_) => {}
         MultiTurnStreamItem::FinalResponse(final_resp) => {
             // Prefer the aggregated final text if the deltas didn't capture it.
             let text = final_resp.response().to_string();
@@ -379,8 +389,7 @@ fn msg_to_rig(m: ChatMessage) -> Option<RigMessage> {
 /// Header for the per-turn runtime-context snapshot, mirroring the harness
 /// convention that each snapshot supersedes earlier ones (so stale state never
 /// accumulates across turns).
-const RUNTIME_CONTEXT_HEADER: &str =
-    "当前画布运行时上下文。此快照取代之前的所有运行时上下文快照。";
+const RUNTIME_CONTEXT_HEADER: &str = "当前画布运行时上下文。此快照取代之前的所有运行时上下文快照。";
 
 /// Prepend the fresh runtime context to the user's message. Empty context is a
 /// no-op so a failure to snapshot the board never blocks the request.
@@ -417,10 +426,7 @@ mod tests {
     #[test]
     fn runtime_context_prepends_once_and_omits_when_empty() {
         // Empty context is a no-op: the user's message passes through unchanged.
-        assert_eq!(
-            with_runtime_context("画个流程图".into(), ""),
-            "画个流程图"
-        );
+        assert_eq!(with_runtime_context("画个流程图".into(), ""), "画个流程图");
         assert_eq!(
             with_runtime_context("画个流程图".into(), "   \n"),
             "画个流程图"

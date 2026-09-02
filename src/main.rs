@@ -8,20 +8,7 @@
 // still shows `eprintln!` diagnostics.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod ai;
-mod board;
-mod camera;
-mod history;
-mod icons;
-mod ink;
-mod platform;
-mod render;
-mod scene;
-mod text;
-mod tools;
-mod updater;
-
-use board::{
+use boundless::board::{
     ArrowTool, BoardView, BringForward, BringToFront, CancelOp, CheckForUpdates, DeleteSelection,
     DiamondTool, EllipseTool, EraserTool, HandTool, LineTool, OpenScene, PenTool, Quit, RectTool,
     Redo, SaveScene, SelectTool, SendBackward, SendToBack, TextTool, ToggleAi, Undo, ZoomIn,
@@ -41,7 +28,7 @@ fn main() {
 
             // Set the Dock/application icon at runtime (macOS). No-op on other
             // platforms; Windows embeds its icon via build.rs.
-            crate::platform::set_app_icon();
+            boundless::platform::set_app_icon();
 
             // Register the embedded Excalifont handwriting font (Excalidraw's
             // default) so text elements use a hand-drawn look for Latin glyphs;
@@ -128,7 +115,7 @@ fn main() {
             // Remove leftover `.old` files/dirs from a previous in-place update
             // (applied on the last run before restart). Best-effort, before any
             // window opens.
-            updater::cleanup_old();
+            boundless::updater::cleanup_old();
 
             let bounds = Bounds::centered(None, size(px(1440.0), px(900.0)), cx);
             cx.open_window(

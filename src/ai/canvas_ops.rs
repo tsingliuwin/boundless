@@ -40,6 +40,16 @@ pub enum OpStrokeStyle {
     Dashed,
 }
 
+/// How shape backgrounds are filled: hachure sketch lines (default) or a
+/// solid flat block — the "chalk paste" panels of a blackboard poster.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OpFillStyle {
+    #[default]
+    Hachure,
+    Solid,
+}
+
 /// Optional visual style. Every field is optional: when omitted the element
 /// inherits the board's current style (the "last used wins" style bar state),
 /// matching how a user drawing by hand would get styled.
@@ -63,6 +73,10 @@ pub struct CanvasStyle {
     /// Opacity 0.0 .. 1.0. Omit = fully opaque.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub opacity: Option<f32>,
+    /// Fill pattern for shape backgrounds: `hachure` (sketch lines, default)
+    /// or `solid` (flat chalk-paste block). Omit = hachure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fill_style: Option<OpFillStyle>,
 }
 
 /// Horizontal alignment of a text element's content.
@@ -185,8 +199,26 @@ pub enum CanvasOp {
         /// Horizontal alignment within the text box. Omit = left.
         #[serde(skip_serializing_if = "Option::is_none")]
         align: Option<OpTextAlign>,
+        /// Font family alias: `handwritten` (default), `kai` (楷体, brush
+        /// headings), `hei` (黑体, heavy poster headings), `song` (宋体),
+        /// `system`. Omit = handwritten.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        font_family: Option<String>,
+        /// Wrap width in world units: lines longer than this wrap onto the
+        /// next line. Strongly recommended for body-text blocks so paragraphs
+        /// stay inside their panel. Omit = natural width (no wrapping).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        wrap_width: Option<f64>,
         #[serde(default)]
         style: CanvasStyle,
+    },
+    /// Set the canvas surface color (the "board"). `None` restores the
+    /// default white board. First move for a blackboard poster.
+    SetBackground {
+        /// `0xRRGGBB` integer, e.g. `0x2a5240` (chalkboard green).
+        /// `null` = white.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<u32>,
     },
 }
 
@@ -209,11 +241,27 @@ impl CanvasOp {
             CanvasOp::UpdateElement { .. } => "修改",
             CanvasOp::DeleteElement { .. } => "删除",
             CanvasOp::Clear => "清空",
+            CanvasOp::SetBackground { .. } => "底色",
         }
     }
 }
 
 impl CanvasStyle {
+    /// Reject out-of-range color values — models occasionally emit 7-digit
+    /// hex, which would render as a garbage color. `None` fields pass.
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, c) in [("stroke", self.stroke), ("fill", self.fill)] {
+            if let Some(c) = c {
+                if c > 0xFF_FF_FF {
+                    return Err(format!(
+                        "{name} 颜色 0x{c:x} 超出 0xRRGGBB 范围（最大 0xFFFFFF）"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Overlay this optional style onto a base `ElementStyle`, returning a new
     /// style. Fields left `None` inherit the base — so an AI op that omits the
     /// style draws with the board's current ("last used wins") style.
@@ -240,6 +288,12 @@ impl CanvasStyle {
         if let Some(opacity) = self.opacity {
             out.opacity = opacity;
         }
+        if let Some(fill_style) = self.fill_style {
+            out.fill_style = match fill_style {
+                OpFillStyle::Hachure => crate::scene::FillStyle::Hachure,
+                OpFillStyle::Solid => crate::scene::FillStyle::Solid,
+            };
+        }
         out
     }
 }
@@ -264,13 +318,22 @@ pub struct CanvasOpError {
 
 impl CanvasOpError {
     pub fn invalid_args(msg: impl Into<String>) -> Self {
-        Self { code: CanvasOpErrorCode::InvalidArgs, message: msg.into() }
+        Self {
+            code: CanvasOpErrorCode::InvalidArgs,
+            message: msg.into(),
+        }
     }
     pub fn not_found(msg: impl Into<String>) -> Self {
-        Self { code: CanvasOpErrorCode::NotFound, message: msg.into() }
+        Self {
+            code: CanvasOpErrorCode::NotFound,
+            message: msg.into(),
+        }
     }
     pub fn internal(msg: impl Into<String>) -> Self {
-        Self { code: CanvasOpErrorCode::Internal, message: msg.into() }
+        Self {
+            code: CanvasOpErrorCode::Internal,
+            message: msg.into(),
+        }
     }
 }
 

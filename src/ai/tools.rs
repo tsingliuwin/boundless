@@ -47,13 +47,22 @@ pub struct ToolError {
 
 impl ToolError {
     pub fn invalid_args(msg: impl Into<String>) -> Self {
-        Self { code: CanvasOpErrorCode::InvalidArgs, message: msg.into() }
+        Self {
+            code: CanvasOpErrorCode::InvalidArgs,
+            message: msg.into(),
+        }
     }
     pub fn not_found(msg: impl Into<String>) -> Self {
-        Self { code: CanvasOpErrorCode::NotFound, message: msg.into() }
+        Self {
+            code: CanvasOpErrorCode::NotFound,
+            message: msg.into(),
+        }
     }
     fn from_op(e: CanvasOpError) -> Self {
-        Self { code: e.code, message: e.message }
+        Self {
+            code: e.code,
+            message: e.message,
+        }
     }
 }
 
@@ -78,6 +87,7 @@ fn validate_box(args: &BoxArgs) -> Result<(), ToolError> {
     if args.w <= 0.0 || args.h <= 0.0 {
         return Err(ToolError::invalid_args("宽高必须为正数"));
     }
+    args.style.validate().map_err(ToolError::invalid_args)?;
     Ok(())
 }
 
@@ -88,6 +98,8 @@ fn validate_points(points: &[OpPoint]) -> Result<(), ToolError> {
     if points.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
         return Err(ToolError::invalid_args("坐标点必须是有限数值"));
     }
+    // Style is validated at the call sites that carry one (draw_line/draw_arrow
+    // share PointsArgs with the style field on the tool args).
     Ok(())
 }
 
@@ -103,6 +115,12 @@ fn validate_text(args: &TextArgs) -> Result<(), ToolError> {
             return Err(ToolError::invalid_args("字号必须为正数"));
         }
     }
+    if let Some(w) = args.wrap_width {
+        if !w.is_finite() || w <= 0.0 {
+            return Err(ToolError::invalid_args("wrap_width 必须为正数"));
+        }
+    }
+    args.style.validate().map_err(ToolError::invalid_args)?;
     Ok(())
 }
 
@@ -110,11 +128,13 @@ fn validate_update(args: &UpdateElementArgs) -> Result<(), ToolError> {
     if args.id.trim().is_empty() {
         return Err(ToolError::invalid_args("id 不能为空"));
     }
+    args.style.validate().map_err(ToolError::invalid_args)?;
     let has_style = args.style.stroke.is_some()
         || args.style.fill.is_some()
         || args.style.stroke_width.is_some()
         || args.style.roughness.is_some()
         || args.style.stroke_style.is_some()
+        || args.style.fill_style.is_some()
         || args.style.opacity.is_some();
     if args.x.is_none()
         && args.y.is_none()
@@ -122,7 +142,9 @@ fn validate_update(args: &UpdateElementArgs) -> Result<(), ToolError> {
         && !has_style
         && args.font_size.is_none()
     {
-        return Err(ToolError::invalid_args("至少提供 x/y/text/style/font_size 之一"));
+        return Err(ToolError::invalid_args(
+            "至少提供 x/y/text/style/font_size 之一",
+        ));
     }
     if args.x.is_some_and(|v| !v.is_finite()) || args.y.is_some_and(|v| !v.is_finite()) {
         return Err(ToolError::invalid_args("坐标必须是有限数值"));
@@ -132,6 +154,7 @@ fn validate_update(args: &UpdateElementArgs) -> Result<(), ToolError> {
             return Err(ToolError::invalid_args("字号必须为正数"));
         }
     }
+    args.style.validate().map_err(ToolError::invalid_args)?;
     Ok(())
 }
 
@@ -145,7 +168,9 @@ fn validate_delete(args: &DeleteElementArgs) -> Result<(), ToolError> {
 /// True if `id` (an 8-char prefix or a full UUID) matches any live snapshot
 /// entry. Matches the scene's `find_by_id_prefix` semantics.
 fn snapshot_has_id(snapshot: &[ElementSnapshot], id: &str) -> bool {
-    snapshot.iter().any(|e| e.id.starts_with(id) || id.starts_with(&e.id))
+    snapshot
+        .iter()
+        .any(|e| e.id.starts_with(id) || id.starts_with(&e.id))
 }
 
 // ---------------------------------------------------------------------------
@@ -182,7 +207,11 @@ async fn run_canvas_op(
         Ok(msg) => (false, msg.clone()),
         Err(e) => (true, e.message.clone()),
     };
-    let _ = events.unbounded_send(AgentEvent::ToolResult { id, result: message, is_error });
+    let _ = events.unbounded_send(AgentEvent::ToolResult {
+        id,
+        result: message,
+        is_error,
+    });
     outcome.map_err(ToolError::from_op)
 }
 
@@ -265,6 +294,14 @@ pub struct TextArgs {
     /// Horizontal alignment. Omit for left.
     #[serde(default)]
     pub align: Option<OpTextAlign>,
+    /// Font family alias: `handwritten` (default), `kai` (楷体), `hei` (黑体),
+    /// `song` (宋体), `system`. Omit = handwritten.
+    #[serde(default)]
+    pub font_family: Option<String>,
+    /// Wrap width in world units: lines longer than this wrap. Strongly
+    /// recommended for body-text blocks. Omit = natural width.
+    #[serde(default)]
+    pub wrap_width: Option<f64>,
     /// Optional visual style (opacity etc.).
     #[serde(default)]
     pub style: CanvasStyle,
@@ -297,7 +334,10 @@ impl Tool for RectangleTool {
     type Args = BoxArgs;
     type Output = String;
 
-    fn definition(&self, _prompt: String) -> impl std::future::Future<Output = ToolDefinition> + Send {
+    fn definition(
+        &self,
+        _prompt: String,
+    ) -> impl std::future::Future<Output = ToolDefinition> + Send {
         let def = tool_def::<BoxArgs>(
             Self::NAME,
             "在画布上画一个矩形。x/y 是左上角，w/h 是宽高（世界坐标）。",
@@ -342,7 +382,10 @@ impl Tool for EllipseTool {
     type Args = BoxArgs;
     type Output = String;
 
-    fn definition(&self, _prompt: String) -> impl std::future::Future<Output = ToolDefinition> + Send {
+    fn definition(
+        &self,
+        _prompt: String,
+    ) -> impl std::future::Future<Output = ToolDefinition> + Send {
         let def = tool_def::<BoxArgs>(
             Self::NAME,
             "在画布上画一个椭圆，内接于 x/y/w/h 定义的矩形框。",
@@ -387,7 +430,10 @@ impl Tool for DiamondTool {
     type Args = BoxArgs;
     type Output = String;
 
-    fn definition(&self, _prompt: String) -> impl std::future::Future<Output = ToolDefinition> + Send {
+    fn definition(
+        &self,
+        _prompt: String,
+    ) -> impl std::future::Future<Output = ToolDefinition> + Send {
         let def = tool_def::<BoxArgs>(
             Self::NAME,
             "在画布上画一个菱形，内接于 x/y/w/h 定义的矩形框。常用于流程图判断节点。",
@@ -432,7 +478,10 @@ impl Tool for LineTool {
     type Args = PointsArgs;
     type Output = String;
 
-    fn definition(&self, _prompt: String) -> impl std::future::Future<Output = ToolDefinition> + Send {
+    fn definition(
+        &self,
+        _prompt: String,
+    ) -> impl std::future::Future<Output = ToolDefinition> + Send {
         let def = tool_def::<PointsArgs>(
             Self::NAME,
             "在画布上画一条折线（无箭头），经过给定的若干点（世界坐标，至少两点）。",
@@ -451,6 +500,9 @@ impl Tool for LineTool {
             let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
             if let Err(e) = validate_points(&args.points) {
                 return fail_tool(&events, id, name, args_json, e).await;
+            }
+            if let Err(msg) = args.style.validate() {
+                return fail_tool(&events, id, name, args_json, ToolError::invalid_args(msg)).await;
             }
             let op = CanvasOp::Line {
                 points: args.points,
@@ -474,7 +526,10 @@ impl Tool for ArrowTool {
     type Args = PointsArgs;
     type Output = String;
 
-    fn definition(&self, _prompt: String) -> impl std::future::Future<Output = ToolDefinition> + Send {
+    fn definition(
+        &self,
+        _prompt: String,
+    ) -> impl std::future::Future<Output = ToolDefinition> + Send {
         let def = tool_def::<PointsArgs>(
             Self::NAME,
             "在画布上画一个带箭头的折线，连接两点或多点。默认在末端画箭头（end_arrowhead=true）。常用于流程图/示意图中表示方向。",
@@ -493,6 +548,9 @@ impl Tool for ArrowTool {
             let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
             if let Err(e) = validate_points(&args.points) {
                 return fail_tool(&events, id, name, args_json, e).await;
+            }
+            if let Err(msg) = args.style.validate() {
+                return fail_tool(&events, id, name, args_json, ToolError::invalid_args(msg)).await;
             }
             let op = CanvasOp::Arrow {
                 points: args.points,
@@ -518,7 +576,10 @@ impl Tool for TextTool {
     type Args = TextArgs;
     type Output = String;
 
-    fn definition(&self, _prompt: String) -> impl std::future::Future<Output = ToolDefinition> + Send {
+    fn definition(
+        &self,
+        _prompt: String,
+    ) -> impl std::future::Future<Output = ToolDefinition> + Send {
         let def = tool_def::<TextArgs>(
             Self::NAME,
             "在画布上添加文本。x/y 是左上角，text 可含换行。用于标签、标题、节点说明等。颜色、流程图箭头方向等说明性内容也用文字表示。",
@@ -544,6 +605,8 @@ impl Tool for TextTool {
                 text: args.text,
                 font_size: args.font_size,
                 align: args.align,
+                font_family: args.font_family,
+                wrap_width: args.wrap_width,
                 style: args.style,
             };
             run_canvas_op(&events, id, name, args_json, op, Some(new_element_id())).await
@@ -588,7 +651,10 @@ impl Tool for UpdateElementTool {
     type Args = UpdateElementArgs;
     type Output = String;
 
-    fn definition(&self, _prompt: String) -> impl std::future::Future<Output = ToolDefinition> + Send {
+    fn definition(
+        &self,
+        _prompt: String,
+    ) -> impl std::future::Future<Output = ToolDefinition> + Send {
         let def = tool_def::<UpdateElementArgs>(
             Self::NAME,
             "修改已有元素：移动（x/y）、改文字（text）、改样式（style：描边/填充/线宽/粗糙度/透明度）或改字号（font_size，仅文本）。id 是创建时返回的元素 ID。",
@@ -654,7 +720,10 @@ impl Tool for DeleteElementTool {
     type Args = DeleteElementArgs;
     type Output = String;
 
-    fn definition(&self, _prompt: String) -> impl std::future::Future<Output = ToolDefinition> + Send {
+    fn definition(
+        &self,
+        _prompt: String,
+    ) -> impl std::future::Future<Output = ToolDefinition> + Send {
         let def = tool_def::<DeleteElementArgs>(
             Self::NAME,
             "删除画布上的一个元素（及其绑定的文字标签）。id 是创建时返回的元素 ID。",
@@ -704,7 +773,10 @@ impl Tool for ClearCanvasTool {
     type Args = NoArgs;
     type Output = String;
 
-    fn definition(&self, _prompt: String) -> impl std::future::Future<Output = ToolDefinition> + Send {
+    fn definition(
+        &self,
+        _prompt: String,
+    ) -> impl std::future::Future<Output = ToolDefinition> + Send {
         let def = tool_def::<NoArgs>(
             Self::NAME,
             "清空画布上的所有元素。用于用户要求重新开始或全部重画时。",
@@ -721,6 +793,114 @@ impl Tool for ClearCanvasTool {
         async move {
             let id = next_tool_id(name);
             run_canvas_op(&events, id, name, Value::Null, CanvasOp::Clear, None).await
+        }
+    }
+}
+
+// --- Set Canvas Background --------------------------------------------------
+
+/// Arguments for `set_canvas_background`.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct SetBackgroundArgs {
+    /// Preset surface: `greenboard` (墨绿粉笔板，黑板报首选), `blackboard`
+    /// (黑板黑), or `white` (恢复白板). Either preset or color is required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+    /// Explicit surface color as `0xRRGGBB`. Overrides `preset`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<u32>,
+}
+
+pub struct SetBackgroundTool {
+    pub events: UnboundedSender<AgentEvent>,
+}
+
+impl Tool for SetBackgroundTool {
+    const NAME: &'static str = "set_canvas_background";
+    type Error = ToolError;
+    type Args = SetBackgroundArgs;
+    type Output = String;
+
+    fn definition(
+        &self,
+        _prompt: String,
+    ) -> impl std::future::Future<Output = ToolDefinition> + Send {
+        let def = tool_def::<SetBackgroundArgs>(
+            Self::NAME,
+            "设置画布底色（板面）。黑板报/海报类作品的第一步：先用 preset=\"greenboard\" 把画布设为墨绿粉笔板，之后所有元素用粉笔色（白/米黄/粉/浅蓝）绘制。",
+        );
+        async move { def }
+    }
+
+    fn call(
+        &self,
+        args: Self::Args,
+    ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
+        let events = self.events.clone();
+        let name = Self::NAME;
+        async move {
+            let id = next_tool_id(name);
+            let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
+            if let Some(c) = args.color {
+                if c > 0xFF_FF_FF {
+                    return fail_tool(
+                        &events,
+                        id,
+                        name,
+                        args_json,
+                        ToolError::invalid_args(format!(
+                            "颜色 0x{c:x} 超出 0xRRGGBB 范围（最大 0xFFFFFF）"
+                        )),
+                    )
+                    .await;
+                }
+            }
+            let color = if let Some(c) = args.color {
+                Some(c)
+            } else {
+                match args
+                    .preset
+                    .as_deref()
+                    .map(|s| s.trim().to_ascii_lowercase())
+                {
+                    Some(p) => match p.as_str() {
+                        "greenboard" | "墨绿" => Some(0x2A5240),
+                        "blackboard" | "黑板" | "black" => Some(0x1F1F1F),
+                        "white" | "白板" | "whiteboard" => None,
+                        other => {
+                            return fail_tool(
+                                &events,
+                                id,
+                                name,
+                                args_json,
+                                ToolError::invalid_args(format!(
+                                    "未知 preset: {other}（可用 greenboard/blackboard/white）"
+                                )),
+                            )
+                            .await;
+                        }
+                    },
+                    None => {
+                        return fail_tool(
+                            &events,
+                            id,
+                            name,
+                            args_json,
+                            ToolError::invalid_args("需要 preset 或 color 之一"),
+                        )
+                        .await;
+                    }
+                }
+            };
+            run_canvas_op(
+                &events,
+                id,
+                name,
+                args_json,
+                CanvasOp::SetBackground { color },
+                None,
+            )
+            .await
         }
     }
 }
@@ -766,7 +946,10 @@ impl Tool for ListElementsTool {
     type Args = NoArgs;
     type Output = String;
 
-    fn definition(&self, _prompt: String) -> impl std::future::Future<Output = ToolDefinition> + Send {
+    fn definition(
+        &self,
+        _prompt: String,
+    ) -> impl std::future::Future<Output = ToolDefinition> + Send {
         let def = tool_def::<NoArgs>(
             Self::NAME,
             "列出画布上当前所有元素的 ID、类型、文字和位置。用于查询已有元素以便修改或删除。",
@@ -838,6 +1021,9 @@ pub fn all_tools(
         Box::new(ClearCanvasTool {
             events: events.clone(),
         }),
+        Box::new(SetBackgroundTool {
+            events: events.clone(),
+        }),
         Box::new(ListElementsTool { snapshot }),
     ]
 }
@@ -885,14 +1071,15 @@ mod tests {
     #[test]
     fn validate_points_requires_two_finite_points() {
         assert!(validate_points(&[OpPoint { x: 0.0, y: 0.0 }]).is_err());
+        assert!(
+            validate_points(&[OpPoint { x: 0.0, y: 0.0 }, OpPoint { x: 1.0, y: 1.0 },]).is_ok()
+        );
         assert!(validate_points(&[
             OpPoint { x: 0.0, y: 0.0 },
-            OpPoint { x: 1.0, y: 1.0 },
-        ])
-        .is_ok());
-        assert!(validate_points(&[
-            OpPoint { x: 0.0, y: 0.0 },
-            OpPoint { x: f64::INFINITY, y: 1.0 },
+            OpPoint {
+                x: f64::INFINITY,
+                y: 1.0
+            },
         ])
         .is_err());
     }

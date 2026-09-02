@@ -127,7 +127,10 @@ impl Scene {
             .rev()
             .take_while(|e| ids.contains(&e.id))
             .count()
-            < ids.iter().filter(|id| self.elements.iter().any(|e| e.id == **id)).count()
+            < ids
+                .iter()
+                .filter(|id| self.elements.iter().any(|e| e.id == **id))
+                .count()
     }
 
     /// Can the selected group move to the back?
@@ -136,22 +139,23 @@ impl Scene {
             .iter()
             .take_while(|e| ids.contains(&e.id))
             .count()
-            < ids.iter().filter(|id| self.elements.iter().any(|e| e.id == **id)).count()
+            < ids
+                .iter()
+                .filter(|id| self.elements.iter().any(|e| e.id == **id))
+                .count()
     }
 
     /// Can the selected group move one layer up? (Some selected element has a
     /// non-selected element immediately above it.)
     pub fn can_forward(&self, ids: &[ElementId]) -> bool {
-        (0..self.elements.len().saturating_sub(1)).any(|i| {
-            ids.contains(&self.elements[i].id) && !ids.contains(&self.elements[i + 1].id)
-        })
+        (0..self.elements.len().saturating_sub(1))
+            .any(|i| ids.contains(&self.elements[i].id) && !ids.contains(&self.elements[i + 1].id))
     }
 
     /// Can the selected group move one layer down?
     pub fn can_backward(&self, ids: &[ElementId]) -> bool {
-        (1..self.elements.len()).any(|i| {
-            ids.contains(&self.elements[i].id) && !ids.contains(&self.elements[i - 1].id)
-        })
+        (1..self.elements.len())
+            .any(|i| ids.contains(&self.elements[i].id) && !ids.contains(&self.elements[i - 1].id))
     }
 }
 
@@ -174,6 +178,10 @@ pub struct SceneFile {
     /// before this field existed.
     #[serde(default = "default_false")]
     pub show_grid: bool,
+    /// Canvas background color (0xRRGGBB), e.g. the dark green of a
+    /// blackboard theme. None = the default white board.
+    #[serde(default)]
+    pub background: Option<u32>,
 }
 
 impl SceneFile {
@@ -184,6 +192,7 @@ impl SceneFile {
             camera,
             elements: scene.elements.clone(),
             show_grid: false,
+            background: None,
         }
     }
 
@@ -281,8 +290,8 @@ mod tests {
     #[test]
     fn move_to_front_and_send_to_back_preserve_relative_order() {
         let (mut scene, ids) = scene_with_ids(4); // [a, b, c, d] bottom->top
-        // Bring b and d (non-contiguous) to the front: order should be
-        // [a, c, b, d] (non-selected keep order, selected keep order).
+                                                  // Bring b and d (non-contiguous) to the front: order should be
+                                                  // [a, c, b, d] (non-selected keep order, selected keep order).
         scene.move_to_front(&[ids[1], ids[3]]);
         assert_eq!(
             scene.elements.iter().map(|e| e.id).collect::<Vec<_>>(),
@@ -299,9 +308,9 @@ mod tests {
     #[test]
     fn bring_forward_and_send_backward_shift_group_one_layer() {
         let (mut scene, ids) = scene_with_ids(5); // [a, b, c, d, e]
-        // Select b and d. bring_forward once: each swaps up if the slot above
-        // is free. b->above is c (free) => b swaps with c. d->above is e
-        // (free) => d swaps with e. Result: [a, c, b, e, d].
+                                                  // Select b and d. bring_forward once: each swaps up if the slot above
+                                                  // is free. b->above is c (free) => b swaps with c. d->above is e
+                                                  // (free) => d swaps with e. Result: [a, c, b, e, d].
         scene.bring_forward(&[ids[1], ids[3]]);
         assert_eq!(
             scene.elements.iter().map(|e| e.id).collect::<Vec<_>>(),

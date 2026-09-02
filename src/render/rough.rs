@@ -7,8 +7,8 @@ use roughr::Srgba;
 
 use crate::camera::Camera;
 use crate::scene::{
-    curve_samples, diamond_polygon, Element, ElementKind, ElementStyle, LineType, StrokeStyle,
-    WPoint,
+    curve_samples, diamond_polygon, Element, ElementKind, ElementStyle,
+    FillStyle as SceneFillStyle, LineType, StrokeStyle, WPoint,
 };
 use roughr::core::{FillStyle, LineCap, LineJoin, OpSetType, Options};
 
@@ -119,9 +119,16 @@ fn options_for(style: &ElementStyle, seed: u64, is_freedraw: bool) -> Options {
     }
     if let Some(bg) = style.background {
         options.fill = Some(srgba(bg, style.opacity));
-        options.fill_style = Some(FillStyle::Hachure);
-        options.fill_weight = Some((style.stroke_width as f32 * 0.5).max(0.5));
-        options.hachure_gap = Some((style.stroke_width as f32 * 4.0).max(4.0));
+        options.fill_style = Some(match style.fill_style {
+            // Solid = flat chalk-paste block (blackboard poster panels);
+            // hachure keeps fill_weight/gap so the sketch lines stay dense.
+            SceneFillStyle::Solid => FillStyle::Solid,
+            SceneFillStyle::Hachure => {
+                options.fill_weight = Some((style.stroke_width as f32 * 0.5).max(0.5));
+                options.hachure_gap = Some((style.stroke_width as f32 * 4.0).max(4.0));
+                FillStyle::Hachure
+            }
+        });
         options.disable_multi_stroke_fill = Some(true);
     }
     options

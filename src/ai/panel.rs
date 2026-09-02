@@ -3,9 +3,9 @@
 //! Input fields use gpui-component's `InputState`/`Input` (multi-line with
 //! auto-grow, IME, selection, clipboard) instead of a hand-rolled TextField.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::collections::HashSet;
 
 use futures::StreamExt;
 use gpui::prelude::*;
@@ -26,11 +26,9 @@ use super::store::{
 };
 use super::tools::ElementSnapshot;
 
-
 // ---------------------------------------------------------------------
 // AiPanel
 // ---------------------------------------------------------------------
-
 
 struct StreamingState {
     buffer: String,
@@ -149,13 +147,15 @@ impl AiPanel {
 
         let mut subscriptions = Vec::new();
         // Enter (without Shift) in the chat input sends the message.
-        subscriptions.push(cx.subscribe(&input, |this, _entity, event: &InputEvent, cx| {
-            if let InputEvent::PressEnter { secondary } = event {
-                if !secondary {
-                    this.send_message(cx);
+        subscriptions.push(
+            cx.subscribe(&input, |this, _entity, event: &InputEvent, cx| {
+                if let InputEvent::PressEnter { secondary } = event {
+                    if !secondary {
+                        this.send_message(cx);
+                    }
                 }
-            }
-        }));
+            }),
+        );
 
         // Load stored sessions; resume the most recent one if any, else start a
         // fresh (not-yet-persisted) session.
@@ -361,6 +361,10 @@ impl AiPanel {
         // Share the snapshot so tools see live state: the main thread refreshes
         // it after every applied op (list_elements + update/delete id checks).
         let snapshot: Arc<Mutex<Vec<ElementSnapshot>>> = Arc::new(Mutex::new(snapshot));
+        // Structured run log: every tool call/result/end of this request
+        // lands in ~/.boundless/agent-logs/run-<ts>.jsonl for later analysis.
+        super::log::begin_run(&prompt, &self.settings.model);
+
         match BoundlessAgent::stream(
             &self.settings,
             prompt,
@@ -510,8 +514,7 @@ impl AiPanel {
             s.buffer.push_str(text);
             match s.steps.last() {
                 Some(super::client::AssistantStep::Text { .. }) => {
-                    if let Some(super::client::AssistantStep::Text { text: t }) =
-                        s.steps.last_mut()
+                    if let Some(super::client::AssistantStep::Text { text: t }) = s.steps.last_mut()
                     {
                         t.push_str(text);
                     }
@@ -557,7 +560,11 @@ impl AiPanel {
     ) -> bool {
         match event {
             AgentEvent::Delta(_) | AgentEvent::Reasoning(_) => true,
-            AgentEvent::CanvasOp { op, pre_assigned_id, reply } => {
+            AgentEvent::CanvasOp {
+                op,
+                pre_assigned_id,
+                reply,
+            } => {
                 // Apply on the main thread, refresh the shared snapshot, and
                 // relay the authoritative outcome back to the waiting tool.
                 let outcome = board
@@ -578,6 +585,7 @@ impl AiPanel {
                 true
             }
             AgentEvent::ToolCall { id, name, args } => {
+                super::log::log_tool_call(&name, &args);
                 if let Some(s) = panel.streaming.as_mut() {
                     s.reasoning_active = false;
                     s.steps.push(super::client::AssistantStep::Tool {
@@ -592,7 +600,12 @@ impl AiPanel {
                 cx.notify();
                 true
             }
-            AgentEvent::ToolResult { id, result, is_error } => {
+            AgentEvent::ToolResult {
+                id,
+                result,
+                is_error,
+            } => {
+                super::log::log_tool_result(is_error, &result);
                 if let Some(s) = panel.streaming.as_mut() {
                     for step in s.steps.iter_mut() {
                         if let super::client::AssistantStep::Tool {
@@ -615,11 +628,16 @@ impl AiPanel {
                 cx.notify();
                 true
             }
-            AgentEvent::Done { text, drew_anything } => {
+            AgentEvent::Done {
+                text,
+                drew_anything,
+            } => {
+                super::log::end_run(drew_anything, &text);
                 panel.finish_streaming(text, drew_anything, cx);
                 false
             }
             AgentEvent::Error(err) => {
+                super::log::log_error(&err);
                 panel.error = Some(err);
                 panel.streaming = None;
                 cx.notify();
@@ -628,7 +646,12 @@ impl AiPanel {
         }
     }
 
-    fn finish_streaming(&mut self, final_text: String, drew_anything: bool, cx: &mut Context<Self>) {
+    fn finish_streaming(
+        &mut self,
+        final_text: String,
+        drew_anything: bool,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(s) = self.streaming.take() {
             // Prefer the aggregated final text; fall back to the streamed buffer
             // (some providers only emit deltas, never a final response).
@@ -689,8 +712,7 @@ impl Render for AiPanel {
         // re-entrancy.
         if self.pending_clear_input {
             self.pending_clear_input = false;
-            self.input
-                .update(cx, |s, cx| s.set_value("", window, cx));
+            self.input.update(cx, |s, cx| s.set_value("", window, cx));
         }
         let streaming = self.streaming.is_some();
 
@@ -738,9 +760,10 @@ impl Render for AiPanel {
                             },
                         )),
                     )
-                    .child(panel_button("新建", false).on_click(cx.listener(
-                        |this, _, _, cx| this.clear_chat(cx),
-                    ))),
+                    .child(
+                        panel_button("新建", false)
+                            .on_click(cx.listener(|this, _, _, cx| this.clear_chat(cx))),
+                    ),
             );
 
         // ---- settings section ----
@@ -764,9 +787,10 @@ impl Render for AiPanel {
                         .items_center()
                         .justify_between()
                         .child(div().text_xs().text_color(rgb(0x2f9e44)).child(notice))
-                        .child(panel_button("保存设置", false).on_click(cx.listener(
-                            |this, _, _, cx| this.save_settings(cx),
-                        ))),
+                        .child(
+                            panel_button("保存设置", false)
+                                .on_click(cx.listener(|this, _, _, cx| this.save_settings(cx))),
+                        ),
                 )
         } else {
             div().hidden()
@@ -790,9 +814,10 @@ impl Render for AiPanel {
                         .items_center()
                         .justify_between()
                         .child(div().text_xs().text_color(rgb(0x777777)).child("会话历史"))
-                        .child(panel_button("＋ 新建", false).on_click(cx.listener(
-                            |this, _, _, cx| this.new_session(cx),
-                        ))),
+                        .child(
+                            panel_button("＋ 新建", false)
+                                .on_click(cx.listener(|this, _, _, cx| this.new_session(cx))),
+                        ),
                 );
             if self.sessions.is_empty() {
                 col = col.child(
@@ -878,12 +903,10 @@ impl Render for AiPanel {
         // ---- messages ----
         let mut messages = div().flex().flex_col().gap_2().p_3().w_full();
         if self.messages.is_empty() && !streaming {
-            messages = messages.child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(0x999999))
-                    .child("描述你想画的内容，例如「画一个登录流程图」，AI 会直接把它画到画布上。"),
-            );
+            messages =
+                messages.child(div().text_sm().text_color(rgb(0x999999)).child(
+                    "描述你想画的内容，例如「画一个登录流程图」，AI 会直接把它画到画布上。",
+                ));
         }
         for (idx, msg) in self.messages.iter().enumerate() {
             messages = messages.child(self.render_message(idx, msg, window, cx));
@@ -894,13 +917,7 @@ impl Render for AiPanel {
             // reasoning chunks and tool calls interleaved in the order they
             // actually happened — so the "think → tool → think → tool → answer"
             // loop reads like a person narrating their work.
-            let mut step = div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .w_full()
-                .px_1()
-                .py_1();
+            let mut step = div().flex().flex_col().gap_1().w_full().px_1().py_1();
 
             // While no content has arrived yet, show "🤖 思考中…" with a bot icon.
             let has_content = !s.steps.is_empty() || !s.buffer.is_empty();
@@ -934,9 +951,7 @@ impl Render for AiPanel {
             for (i, item) in s.steps.iter().enumerate() {
                 let is_last = i + 1 == s.steps.len();
                 let default_open = match item {
-                    super::client::AssistantStep::Reasoning { .. } => {
-                        is_last && s.reasoning_active
-                    }
+                    super::client::AssistantStep::Reasoning { .. } => is_last && s.reasoning_active,
                     super::client::AssistantStep::Text { .. } => {
                         // Text steps are rendered inline by render_stream_step;
                         // pass the streaming cursor flag via default_open.
@@ -944,13 +959,7 @@ impl Render for AiPanel {
                     }
                     _ => false,
                 };
-                step = step.child(self.render_stream_step(
-                    i,
-                    item,
-                    default_open,
-                    window,
-                    cx,
-                ));
+                step = step.child(self.render_stream_step(i, item, default_open, window, cx));
             }
 
             messages = messages.child(step);
@@ -992,9 +1001,13 @@ impl Render for AiPanel {
             .overflow_hidden()
             .border_1()
             .border_color(rgb(0xd6d4d0));
-        for (i, level) in [ReasoningLevel::Low, ReasoningLevel::Medium, ReasoningLevel::High]
-            .into_iter()
-            .enumerate()
+        for (i, level) in [
+            ReasoningLevel::Low,
+            ReasoningLevel::Medium,
+            ReasoningLevel::High,
+        ]
+        .into_iter()
+        .enumerate()
         {
             let active = level == current_reasoning;
             let mut seg = div()
@@ -1007,20 +1020,21 @@ impl Render for AiPanel {
             if active {
                 seg = seg.bg(rgb(0x1a5fd7)).text_color(rgb(0xffffff));
             } else {
-                seg = seg
-                    .hover(|s| s.bg(rgb(0xefeeec)))
-                    .text_color(rgb(0x555555));
+                seg = seg.hover(|s| s.bg(rgb(0xefeeec))).text_color(rgb(0x555555));
             }
-            reasoning_control = reasoning_control.child(seg.on_click(cx.listener(
-                move |this, _, _, cx| {
+            reasoning_control =
+                reasoning_control.child(seg.on_click(cx.listener(move |this, _, _, cx| {
                     this.set_reasoning(level, cx);
-                },
-            )));
+                })));
         }
 
         // Send/stop icon button (gpui-component Button).
         let send_btn = Button::new("send-btn")
-            .icon(if streaming_now { IconName::Close } else { IconName::ArrowUp })
+            .icon(if streaming_now {
+                IconName::Close
+            } else {
+                IconName::ArrowUp
+            })
             .small()
             .on_click(cx.listener(move |this, _, _window, cx| {
                 if streaming_now {
@@ -1192,10 +1206,7 @@ impl AiPanel {
         match item {
             super::client::AssistantStep::Reasoning { text } => {
                 // Live reasoning defaults open while streaming, closed after.
-                let open = self
-                    .open_stream_steps
-                    .contains(&idx)
-                    ^ default_open;
+                let open = self.open_stream_steps.contains(&idx) ^ default_open;
                 // Collapsed = header only (no body). Expanded = text in a
                 // height-capped, internally scrolling box. While actively
                 // streaming, use plain_body (instant SharedString, pinned to
@@ -1250,7 +1261,14 @@ impl AiPanel {
                 )
                 .into_any_element()
             }
-            super::client::AssistantStep::Tool { name, args, done, error, result, .. } => {
+            super::client::AssistantStep::Tool {
+                name,
+                args,
+                done,
+                error,
+                result,
+                ..
+            } => {
                 // Each tool call is its own full-width expandable step - like a
                 // reasoning panel, but with a tool label + status glyph. The
                 // header's icon/verb/color identify add/modify/delete/query;
@@ -1303,10 +1321,7 @@ impl AiPanel {
             super::client::AssistantStep::Text { text } => {
                 if default_open {
                     // Active streaming: plain SharedString, instant display.
-                    div()
-                        .text_sm()
-                        .child(format!("{text}▍"))
-                        .into_any_element()
+                    div().text_sm().child(format!("{text}▍")).into_any_element()
                 } else {
                     // Completed: selectable markdown.
                     div()
@@ -1370,7 +1385,14 @@ impl AiPanel {
                 )
                 .into_any_element()
             }
-            super::client::AssistantStep::Tool { name, args, done, error, result, .. } => {
+            super::client::AssistantStep::Tool {
+                name,
+                args,
+                done,
+                error,
+                result,
+                ..
+            } => {
                 let open = self.open_done_steps.contains(&key);
                 let body_text = tool_body_text(name, args, result, *error);
                 let (status, status_color) = if !*done {
@@ -1412,23 +1434,18 @@ impl AiPanel {
                 .into_any_element()
             }
             // Text steps: inline rendered, selectable, not collapsible.
-            super::client::AssistantStep::Text { text } => {
-                div()
-                    .text_sm()
-                    .child(
-                        TextView::markdown(
-                            ElementId::named_usize(
-                                "ai-msg-text",
-                                msg_idx * 100000 + step_idx,
-                            ),
-                            text.clone(),
-                            window,
-                            cx,
-                        )
-                        .selectable(true),
+            super::client::AssistantStep::Text { text } => div()
+                .text_sm()
+                .child(
+                    TextView::markdown(
+                        ElementId::named_usize("ai-msg-text", msg_idx * 100000 + step_idx),
+                        text.clone(),
+                        window,
+                        cx,
                     )
-                    .into_any_element()
-            }
+                    .selectable(true),
+                )
+                .into_any_element(),
         }
     }
 
@@ -1445,11 +1462,9 @@ impl AiPanel {
         let insert_button = if !is_user {
             let content = content.clone();
             Some(
-                panel_button("插入画布", false).on_click(cx.listener(
-                    move |this, _, _, cx| {
-                        this.insert_to_canvas(content.clone(), cx);
-                    },
-                )),
+                panel_button("插入画布", false).on_click(cx.listener(move |this, _, _, cx| {
+                    this.insert_to_canvas(content.clone(), cx);
+                })),
             )
         } else {
             None
@@ -1459,13 +1474,7 @@ impl AiPanel {
         // a step bubble (same style as the streaming step) so the thinking
         // process and tools survive after streaming completes, in order.
         if !is_user && !steps.is_empty() {
-            let mut step = div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .w_full()
-                .px_1()
-                .py_1();
+            let mut step = div().flex().flex_col().gap_1().w_full().px_1().py_1();
 
             // Render each step in order — no grouping. Each tool call is its
             // own full-width expandable step, matching the streaming bubble.
@@ -1614,8 +1623,8 @@ enum ToolOp {
 
 fn tool_op(name: &str) -> ToolOp {
     match name {
-        "draw_rectangle" | "draw_ellipse" | "draw_diamond" | "draw_line"
-        | "draw_arrow" | "draw_text" => ToolOp::Add,
+        "draw_rectangle" | "draw_ellipse" | "draw_diamond" | "draw_line" | "draw_arrow"
+        | "draw_text" => ToolOp::Add,
         "update_element" => ToolOp::Update,
         "delete_element" => ToolOp::Delete,
         "clear_canvas" => ToolOp::Clear,
@@ -1647,7 +1656,7 @@ impl ToolOp {
     }
     fn color(&self) -> Rgba {
         match self {
-            ToolOp::Add => rgb(0x2f9e44),   // green
+            ToolOp::Add => rgb(0x2f9e44),    // green
             ToolOp::Update => rgb(0x1a5fd7), // blue
             ToolOp::Delete => rgb(0xc92a2a), // red
             ToolOp::Clear => rgb(0xc92a2a),  // red
@@ -1964,8 +1973,7 @@ fn tool_chip_preview(name: &str, args: &serde_json::Value) -> String {
     match name {
         "draw_text" => {
             let text = obj.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            let one_line: String =
-                text.chars().filter(|c| *c != '\n').take(10).collect();
+            let one_line: String = text.chars().filter(|c| *c != '\n').take(10).collect();
             if text.chars().count() > 10 {
                 format!("「{one_line}…」")
             } else if !one_line.is_empty() {
@@ -2051,10 +2059,7 @@ fn tool_call_detail(name: &str, args: &serde_json::Value) -> String {
             out
         }
         "draw_text" => {
-            let text = obj
-                .get("text")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let text = obj.get("text").and_then(|v| v.as_str()).unwrap_or("");
             let mut out = format!("文本「{}」", text.replace('\n', " "));
             let (x, y) = (f("x"), f("y"));
             if let (Some(x), Some(y)) = (x, y) {
@@ -2095,17 +2100,22 @@ fn push_style(out: &mut String, style: Option<&serde_json::Value>) {
     let fill = color_hex(style.get("fill"));
     if stroke.is_some() || fill.is_some() {
         out.push('\n');
-        let parts: Vec<String> = [stroke.map(|c| format!("描边 {c}")), fill.map(|c| format!("填充 {c}"))]
-            .into_iter()
-            .flatten()
-            .collect();
+        let parts: Vec<String> = [
+            stroke.map(|c| format!("描边 {c}")),
+            fill.map(|c| format!("填充 {c}")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         out.push_str(&parts.join(" · "));
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{tool_body_text, tool_call_detail, tool_chip_preview, tool_header, tool_op, ToolOp};
+    use super::{
+        tool_body_text, tool_call_detail, tool_chip_preview, tool_header, tool_op, ToolOp,
+    };
 
     #[test]
     fn tool_detail_describes_rectangle_with_coords_and_size() {
@@ -2134,9 +2144,10 @@ mod tests {
 
     #[test]
     fn tool_detail_counts_points_for_arrow() {
-        let args: serde_json::Value =
-            serde_json::from_str(r#"{"points":[{"x":0.0,"y":0.0},{"x":10.0,"y":0.0},{"x":10.0,"y":20.0}]}"#)
-                .unwrap();
+        let args: serde_json::Value = serde_json::from_str(
+            r#"{"points":[{"x":0.0,"y":0.0},{"x":10.0,"y":0.0},{"x":10.0,"y":20.0}]}"#,
+        )
+        .unwrap();
         let detail = tool_call_detail("draw_arrow", &args);
         assert!(detail.contains("箭头"));
         assert!(detail.contains("3 个点"));
@@ -2144,8 +2155,7 @@ mod tests {
 
     #[test]
     fn tool_detail_falls_back_to_json_for_unknown_args() {
-        let args: serde_json::Value =
-            serde_json::from_str(r#"{"weird":true}"#).unwrap();
+        let args: serde_json::Value = serde_json::from_str(r#"{"weird":true}"#).unwrap();
         let detail = tool_call_detail("draw_rectangle", &args);
         // No recognizable shape fields → pretty JSON fallback.
         assert!(detail.contains("weird"));
@@ -2241,9 +2251,18 @@ mod tests {
     #[test]
     fn tool_op_colors_differ_by_operation() {
         // Add (green) != Update (blue) != Delete (red) != Query (gray).
-        assert_ne!(tool_op("draw_rectangle").color(), tool_op("update_element").color());
-        assert_ne!(tool_op("draw_rectangle").color(), tool_op("delete_element").color());
-        assert_ne!(tool_op("draw_rectangle").color(), tool_op("list_elements").color());
+        assert_ne!(
+            tool_op("draw_rectangle").color(),
+            tool_op("update_element").color()
+        );
+        assert_ne!(
+            tool_op("draw_rectangle").color(),
+            tool_op("delete_element").color()
+        );
+        assert_ne!(
+            tool_op("draw_rectangle").color(),
+            tool_op("list_elements").color()
+        );
         assert_eq!(tool_op("list_elements"), ToolOp::Query);
     }
 }

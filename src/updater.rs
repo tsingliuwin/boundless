@@ -188,8 +188,8 @@ pub fn verify(artifact: &Path, signature: &str) -> Result<()> {
     }
     let pk = minisign_verify::PublicKey::from_base64(MINISIGN_PUBKEY)
         .context("invalid minisign public key")?;
-    let sig = minisign_verify::Signature::decode(signature)
-        .context("invalid minisign signature")?;
+    let sig =
+        minisign_verify::Signature::decode(signature).context("invalid minisign signature")?;
     let data = fs::read(artifact).context("read artifact for verification")?;
     pk.verify(&data, &sig, false)
         .map_err(|e| anyhow!("signature verification failed: {e}"))?;
@@ -211,10 +211,7 @@ fn temp_sibling(target: &Path) -> PathBuf {
     // Process id + a coarse timestamp is enough to avoid collisions within a
     // single machine; we also wipe these on startup (cleanup_old).
     name.push_str(&std::process::id().to_string());
-    target
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(name)
+    target.parent().unwrap_or_else(|| Path::new(".")).join(name)
 }
 
 /// Replace the running executable / `.app` bundle with the artifact at
@@ -250,9 +247,7 @@ fn apply_windows(zip_path: &Path) -> Result<()> {
     let mut archive = zip::ZipArchive::new(file).context("read update zip")?;
     let mut found = false;
     for i in 0..archive.len() {
-        let mut entry = archive
-            .by_index(i)
-            .context("read zip entry")?;
+        let mut entry = archive.by_index(i).context("read zip entry")?;
         let name = entry.name().to_lowercase();
         // The release zip contains `boundless.exe` at the archive root.
         if name == "boundless.exe" || (name.ends_with(".exe") && !name.contains('/')) {
@@ -279,8 +274,7 @@ fn apply_windows(zip_path: &Path) -> Result<()> {
     if old.exists() {
         let _ = fs::remove_file(&old);
     }
-    fs::rename(&cur, &old)
-        .with_context(|| format!("rename current exe aside {:?}", cur))?;
+    fs::rename(&cur, &old).with_context(|| format!("rename current exe aside {:?}", cur))?;
     if let Err(e) = fs::rename(&new_exe, &cur) {
         // Rollback so the app can still start.
         let _ = fs::rename(&old, &cur);
@@ -334,8 +328,7 @@ fn finish_macos_swap(new_bundle: &Path, bundle: &Path, parent: &Path) -> Result<
     }
     // Move the running bundle aside (the running binary is already memory-mapped;
     // renaming the bundle directory is safe).
-    fs::rename(bundle, &old)
-        .with_context(|| format!("move current bundle aside {:?}", bundle))?;
+    fs::rename(bundle, &old).with_context(|| format!("move current bundle aside {:?}", bundle))?;
     if let Err(e) = fs::rename(new_bundle, bundle) {
         let _ = fs::rename(&old, bundle); // rollback
         return Err(e).context("move new bundle into place");

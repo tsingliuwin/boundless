@@ -155,6 +155,10 @@ pub struct BoardView {
     /// Whether the dot grid is painted behind the canvas. Toggled from the
     /// zoom-bar; persisted in the scene file.
     show_grid: bool,
+    /// Canvas background color (0xRRGGBB) — the "board surface". None = the
+    /// default white board. Switchable from the zoom-bar swatches and by the
+    /// AI (`set_canvas_background`); persisted in the scene file.
+    canvas_background: Option<u32>,
     /// Index of the currently open top-level menu in the Windows in-app menu
     /// bar (None = all collapsed). Unused on macOS, which uses the native
     /// `set_menus` bar; the field compiles everywhere because the menu-bar
@@ -209,6 +213,7 @@ impl BoardView {
             modifiers: Modifiers::default(),
             context_menu: None,
             show_grid: false,
+            canvas_background: None,
             menubar_open: None,
             update_state: crate::updater::UpdateState::default(),
             render_cache: crate::render::cache::RenderCache::new(),
@@ -873,6 +878,8 @@ impl BoardView {
                 text,
                 font_size,
                 align,
+                font_family,
+                wrap_width,
                 style,
             } => {
                 let Some(id) = pre_assigned_id else {
@@ -885,26 +892,51 @@ impl BoardView {
                 // Override the auto-generated id with the pre-assigned one.
                 el.id = id;
                 if let ElementKind::Text {
-                    font_size: ref mut fs2,
-                    text_align: ref mut ta2,
+                    font_size: fs2,
+                    text_align: ta2,
+                    font_family: family2,
+                    wrap_width: wrap2,
                     ..
-                } = el.kind
+                } = &mut el.kind
                 {
                     *fs2 = fs;
                     *ta2 = ta;
+                    // Font alias → concrete family (unknown aliases degrade to
+                    // the hand-drawn default instead of tofu).
+                    if let Some(family) = font_family {
+                        *family2 = crate::render::resolve_font_family(&family);
+                    }
+                    *wrap2 = wrap_width;
                 }
                 // Rough estimate; render() refines with the real text system,
                 // matching how insert_ai_text pre-sizes a new text element.
+                // With wrap_width the estimated width is capped so the
+                // pre-measure box approximates the wrapped layout.
                 let lines = el.text().map(|t| t.lines().count()).unwrap_or(1).max(1);
                 let max_chars = el
                     .text()
                     .map(|t| t.lines().map(|l| l.chars().count()).max().unwrap_or(1))
                     .unwrap_or(1);
-                el.bounds.w = (max_chars as f64 * fs).max(1.0);
+                el.bounds.w = (max_chars as f64 * fs)
+                    .min(wrap_width.unwrap_or(f64::MAX))
+                    .max(1.0);
                 el.bounds.h = lines as f64 * fs * LINE_HEIGHT;
                 let added = self.scene.add(el);
                 self.pending_measure.push(added);
                 Ok(format!("已添加文本 id={}", &added.to_string()[..8]))
+            }
+            CanvasOp::SetBackground { color } => {
+                let label = match color {
+                    Some(c) => {
+                        self.set_canvas_background(Some(c), cx);
+                        format!("画布底色已设为 #{:06x}", c)
+                    }
+                    None => {
+                        self.set_canvas_background(None, cx);
+                        "画布底色已恢复白色".to_string()
+                    }
+                };
+                Ok(label)
             }
             CanvasOp::UpdateElement {
                 id,
@@ -1558,6 +1590,7 @@ impl BoardView {
         let file = SceneFile::new(&self.scene, self.camera);
         let file = SceneFile {
             show_grid: self.show_grid,
+            background: self.canvas_background,
             ..file
         };
         let result = serde_json::to_string_pretty(&file)
@@ -1589,6 +1622,7 @@ impl BoardView {
                 self.scene.restore(file.elements);
                 self.camera = file.camera;
                 self.show_grid = file.show_grid;
+                self.canvas_background = file.background;
                 self.selection.clear();
                 self.history = History::new();
                 self.file_path = Some(path.clone());
@@ -1602,6 +1636,16 @@ impl BoardView {
 
     // ------------------------------------------------------------------
     // zoom actions
+
+    /// Set the canvas surface color (None = default white board). Used by the
+    /// zoom-bar swatches and the AI's `set_canvas_background` tool. Board
+    /// state (like show_grid): persisted in the scene file, not in undo
+    /// history.
+    pub fn set_canvas_background(&mut self, color: Option<u32>, cx: &mut Context<Self>) {
+        self.canvas_background = color;
+        self.mark_dirty();
+        cx.notify();
+    }
 
     fn zoom_by(&mut self, factor: f64, cx: &mut Context<Self>) {
         let vp = self.viewport_bounds(cx);
@@ -3052,6 +3096,8 @@ struct EditingPaint {
 }
 
 struct BoardPaint {
+    /// Canvas surface color (blackboard theme); painted before everything.
+    background: Option<PaintQuad>,
     grid: Vec<PaintQuad>,
     paths: Vec<ReadyPath>,
     texts: Vec<TextPaintItem>,
@@ -3077,6 +3123,14 @@ impl BoardView {
             origin,
         );
         let view_world = WBounds::from_corners(view_world_tl, view_world_br);
+
+        // Board surface: a custom background color (e.g. the dark green of a
+        // blackboard theme) covers the whole viewport beneath grid/content.
+        // The dot grid keeps its fixed color — on dark surfaces it reads as
+        // faint chalk dust.
+        let background = self
+            .canvas_background
+            .map(|c| gpui::fill(viewport, color_u32(c, 1.0)));
 
         let grid = if self.show_grid {
             dot_grid(&self.camera, viewport, color_u32(GRID_COLOR, 1.0))
@@ -3281,6 +3335,7 @@ impl BoardView {
         let editing = self.build_editing_paint(window);
 
         BoardPaint {
+            background,
             grid,
             paths,
             texts,
@@ -3525,6 +3580,9 @@ impl Render for BoardView {
             {
                 let focus = focus.clone();
                 move |_bounds, paint: BoardPaint, window, cx| {
+                    if let Some(q) = paint.background {
+                        window.paint_quad(q);
+                    }
                     for q in paint.grid {
                         window.paint_quad(q);
                     }
@@ -5201,7 +5259,47 @@ impl BoardView {
                                     })
                                     .ok();
                             }),
-                    ),
+                    )
+                    // Canvas surface swatches: white board / green chalkboard
+                    // / black chalkboard. Same colors the AI's
+                    // set_canvas_background presets use.
+                    .child({
+                        let mut swatches = div().flex().flex_row().gap_1().items_center();
+                        for (i, (_name, color)) in [
+                            ("白板", None),
+                            ("墨绿黑板", Some(0x2A5240_u32)),
+                            ("黑板黑", Some(0x1F1F1F_u32)),
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        {
+                            let weak_bg = weak.clone();
+                            let active = self.canvas_background == color;
+                            swatches = swatches.child(
+                                div()
+                                    .id(gpui::ElementId::named_usize("bg-swatch", i))
+                                    .w_4()
+                                    .h_4()
+                                    .rounded_full()
+                                    .cursor_pointer()
+                                    .border_1()
+                                    .when(active, |d| d.border_2().border_color(rgb(0x2563eb)))
+                                    .when(!active, |d| d.border_color(rgb(0xc9c9c9)))
+                                    .bg(match color {
+                                        Some(c) => color_u32(c, 1.0),
+                                        None => white(),
+                                    })
+                                    .on_click(move |_, _, cx| {
+                                        weak_bg
+                                            .update(cx, |this, cx| {
+                                                this.set_canvas_background(color, cx)
+                                            })
+                                            .ok();
+                                    }),
+                            );
+                        }
+                        swatches
+                    }),
             )
     }
 

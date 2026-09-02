@@ -16,6 +16,28 @@ pub const HANDWRITTEN_FONT: &str = "Excalifont";
 /// Font family for the plain (system UI) text style.
 pub const SYSTEM_FONT: &str = ".SystemUIFont";
 
+/// Resolve an AI/user font alias to a concrete font family name. Unknown
+/// aliases fall back to the hand-drawn default, so a model hallucinating a
+/// family degrades gracefully instead of rendering tofu.
+///
+/// Aliases: `handwritten`/`default` → Excalifont (拉丁手写体，中文回落楷体);
+/// `kai`/`楷体` → KaiTi (brush-style, good for chalk headings);
+/// `hei`/`黑体` → SimHei (heavy sans, poster headings);
+/// `song`/`宋体` → SimSun (serif body); `system` → system UI font.
+pub fn resolve_font_family(alias: &str) -> String {
+    match alias.trim().to_ascii_lowercase().as_str() {
+        "kai" | "楷体" | "kaishu" | "楷" => "KaiTi".to_string(),
+        "hei" | "黑体" | "simhei" | "bold" => "SimHei".to_string(),
+        "song" | "宋体" | "simsun" | "serif" => "SimSun".to_string(),
+        "system" | "ui" => SYSTEM_FONT.to_string(),
+        "handwritten" | "default" | "hand" => HANDWRITTEN_FONT.to_string(),
+        // A concrete family name passed straight through — trust it; if the
+        // system lacks it, gpui falls back per its own chain.
+        other if !other.is_empty() => other.to_string(),
+        _ => HANDWRITTEN_FONT.to_string(),
+    }
+}
+
 /// Font used for canvas text elements. Defaults to the hand-drawn Caveat;
 /// CJK glyphs fall back to the system UI font via GPUI's fallback chain.
 pub fn canvas_font() -> Font {

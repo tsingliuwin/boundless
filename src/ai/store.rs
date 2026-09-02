@@ -120,7 +120,10 @@ fn list_sessions_in(chat_dir: &std::path::Path) -> Vec<SessionMeta> {
             Some(s) => s.to_string(),
             None => continue,
         };
-        let mtime = entry.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
         let messages = load_messages_in(chat_dir, &id).unwrap_or_default();
         let preview = messages
             .iter()

@@ -56,7 +56,12 @@ impl Camera {
 
     /// Zoom by `factor`, keeping the world point under `screen_focus` fixed.
     /// `screen_focus` is relative to the canvas origin.
-    pub fn zoom_at(&mut self, factor: f64, screen_focus: Point<Pixels>, canvas_origin: Point<Pixels>) {
+    pub fn zoom_at(
+        &mut self,
+        factor: f64,
+        screen_focus: Point<Pixels>,
+        canvas_origin: Point<Pixels>,
+    ) {
         let focus_world = self.screen_to_world(screen_focus, canvas_origin);
         self.zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
         // Re-anchor so focus_world stays under the cursor.
