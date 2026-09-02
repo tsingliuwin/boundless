@@ -268,7 +268,7 @@ pub fn apply(
             style,
             text,
         } => {
-            push_shape(
+            msg = push_shape(
                 c,
                 assigned_id,
                 "rectangle",
@@ -278,7 +278,7 @@ pub fn apply(
                 *h,
                 style,
                 text.as_deref(),
-            );
+            )?;
         }
         CanvasOp::Ellipse {
             x,
@@ -288,7 +288,7 @@ pub fn apply(
             style,
             text,
         } => {
-            push_shape(
+            msg = push_shape(
                 c,
                 assigned_id,
                 "ellipse",
@@ -298,7 +298,7 @@ pub fn apply(
                 *h,
                 style,
                 text.as_deref(),
-            );
+            )?;
         }
         CanvasOp::Diamond {
             x,
@@ -308,7 +308,7 @@ pub fn apply(
             style,
             text,
         } => {
-            push_shape(
+            msg = push_shape(
                 c,
                 assigned_id,
                 "diamond",
@@ -318,7 +318,7 @@ pub fn apply(
                 *h,
                 style,
                 text.as_deref(),
-            );
+            )?;
         }
         CanvasOp::Line {
             points,

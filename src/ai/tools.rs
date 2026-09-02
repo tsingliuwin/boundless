@@ -1105,16 +1105,13 @@ mod tests {
     /// this is the exact chain the headless eval harness depends on.
     #[test]
     fn tool_result_not_error_after_successful_reply() {
-        use futures::future::FutureExt;
         use futures::task::noop_waker_ref;
         use std::task::Context;
 
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<AgentEvent>();
         let tool = TextTool { events: tx };
-        let args: TextArgs = serde_json::from_str(
-            r#"{"x":10.0,"y":10.0,"text":"你好","font_size":20.0}"#,
-        )
-        .unwrap();
+        let args: TextArgs =
+            serde_json::from_str(r#"{"x":10.0,"y":10.0,"text":"你好","font_size":20.0}"#).unwrap();
         let mut fut = Box::pin(tool.call(args));
         let waker = noop_waker_ref();
         let mut cx = Context::from_waker(waker);
@@ -1128,7 +1125,7 @@ mod tests {
         // Drain events until the CanvasOp, then reply exactly like the
         // eval harness / panel does.
         let mut replied = false;
-        while let Ok(Some(event)) = rx.try_next() {
+        while let Ok(Some(event)) = rx.try_recv() {
             match event {
                 AgentEvent::CanvasOp { reply, .. } => {
                     reply
@@ -1136,7 +1133,9 @@ mod tests {
                         .expect("reply send");
                     replied = true;
                 }
-                AgentEvent::ToolResult { is_error, result, .. } => {
+                AgentEvent::ToolResult {
+                    is_error, result, ..
+                } => {
                     panic!("ToolResult before reply: is_error={is_error} {result}");
                 }
                 _ => {}
@@ -1152,8 +1151,11 @@ mod tests {
 
         // The ToolResult must carry is_error=false.
         let mut saw_result = false;
-        while let Ok(Some(event)) = rx.try_next() {
-            if let AgentEvent::ToolResult { is_error, result, .. } = event {
+        while let Ok(Some(event)) = rx.try_recv() {
+            if let AgentEvent::ToolResult {
+                is_error, result, ..
+            } = event
+            {
                 saw_result = true;
                 assert!(!is_error, "successful reply logged as error: {result}");
             }
