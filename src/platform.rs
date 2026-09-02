@@ -186,7 +186,7 @@ fn start_window_drag_windows(window: &Window) -> Result<(), String> {
     use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
     use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetCursorPos, SendMessageW, HTCAPTION, WM_NCLBUTTONDOWN,
+        GetCursorPos, PostMessageW, HTCAPTION, WM_NCLBUTTONDOWN,
     };
 
     let raw = HasWindowHandle::window_handle(window)
@@ -199,20 +199,26 @@ fn start_window_drag_windows(window: &Window) -> Result<(), String> {
     unsafe {
         // ReleaseCapture so the in-flight button-down doesn't hold the mouse,
         // then synthesize a caption (HTCAPTION) non-client button-down. Windows
-        // runs its drag modal loop synchronously inside SendMessageW; the GPUI
-        // input callback is already taken by the outer client mouse-down, so the
-        // reentrant WM_NCLBUTTONDOWN skips element dispatch and hits
-        // DefWindowProcW, which starts the drag.
+        // runs its drag modal loop inside that message; the GPUI input
+        // callback is already taken by the outer client mouse-down, so the
+        // WM_NCLBUTTONDOWN skips element dispatch and hits DefWindowProcW,
+        // which starts the drag.
+        //
+        // POST, don't SEND: SendMessageW would enter the modal move loop
+        // synchronously *inside this mouse-down handler*, so agent-stream
+        // updates (a main-thread refresh every ~50ms while the AI is
+        // generating) execute re-entrantly mid-modal-loop — which crashed the
+        // app. Posting defers the modal loop until this handler has returned.
         let _ = ReleaseCapture();
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
         // lparam = screen-space cursor (low word = x, high word = y).
         let lparam = LPARAM((((pt.y as u32) << 16) | (pt.x as u32 & 0xFFFF)) as isize);
-        let _ = SendMessageW(
-            hwnd,
+        let _ = PostMessageW(
+            Some(hwnd),
             WM_NCLBUTTONDOWN,
-            Some(WPARAM(HTCAPTION as usize)),
-            Some(lparam),
+            WPARAM(HTCAPTION as usize),
+            lparam,
         );
     }
     Ok(())

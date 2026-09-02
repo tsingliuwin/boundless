@@ -17,7 +17,60 @@ use boundless::board::{
 use gpui::*;
 use gpui_component::Root;
 
+/// Install a process-wide panic hook that appends the panic message,
+/// location, and backtrace to `~/.boundless/panic.log`. Panics inside GPUI's
+/// event loop previously just made the window vanish (debug console closed /
+/// release build), leaving nothing to diagnose.
+fn install_panic_hook() {
+    let log_path = boundless::ai::store::data_dir().join("panic.log");
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic payload".to_string()
+        };
+        let thread = std::thread::current()
+            .name()
+            .unwrap_or("<unnamed>")
+            .to_string();
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let text = format!(
+            "=== panic @ {} (thread: {thread}) ===
+payload: {payload}
+location: {location}
+backtrace:
+{}
+",
+            ts,
+            std::backtrace::Backtrace::force_capture()
+        );
+        eprintln!("{text}");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            use std::io::Write;
+            let _ = f.write_all(text.as_bytes());
+        }
+    }));
+}
+
 fn main() {
+    // Crash diagnostics: any panic on any thread appends to
+    // ~/.boundless/panic.log (and stderr) so a "window just vanished" report
+    // comes with a location and backtrace instead of nothing.
+    install_panic_hook();
+
     Application::new()
         .with_assets(gpui_component_assets::Assets)
         .run(|cx: &mut App| {
