@@ -1116,7 +1116,14 @@ impl BoardView {
                         Element::new(ElementKind::Rectangle, spec.bounds, style)
                     };
                     let added = self.scene.add(el);
-                    self.add_bound_label(added, spec.bounds, spec.text.clone());
+                    // Node boxes are sized to the text (+ margin), so the
+                    // label folds only on a gross estimate miss.
+                    self.add_bound_label_with_wrap(
+                        added,
+                        spec.bounds,
+                        spec.text.clone(),
+                        Some(spec.bounds.w + 40.0),
+                    );
                 }
                 Ok(format!(
                     "已添加思维导图（{node_count} 个节点）id={}",
@@ -1272,6 +1279,22 @@ impl BoardView {
     /// For line/arrow containers, a white background is added to the label so
     /// the text is readable over the line stroke.
     fn add_bound_label(&mut self, container_id: ElementId, bounds: WBounds, text: String) {
+        self.add_bound_label_with_wrap(container_id, bounds, text, None);
+    }
+
+    /// Like [`add_bound_label`] with an explicit wrap width. `None` wraps
+    /// 6px inside the container's border — right for fixed-size shapes
+    /// (flowchart nodes). Shapes whose box is SIZED to the text (mind map
+    /// nodes) pass a wide gate instead: the box already carries the safety
+    /// margin, so a 1px underestimate folding the last character onto a
+    /// spilling second line is pure harm (实测：「分析型 OLAP 引擎」).
+    fn add_bound_label_with_wrap(
+        &mut self,
+        container_id: ElementId,
+        bounds: WBounds,
+        text: String,
+        wrap_override: Option<f64>,
+    ) {
         // Check if the container is a line/arrow — those need a label background
         // so text is legible over the stroke.
         let is_line_container = self.scene.get(container_id).is_some_and(|e| {
@@ -1285,11 +1308,7 @@ impl BoardView {
             ..
         } = &mut el.kind
         {
-            // Wrap 6px inside the container's border, not AT it — otherwise
-            // any 1px underestimate of the rendered width wraps the last
-            // character onto a second line that spills out of the shape
-            // (实测：思维导图混排节点「无缝集成Python」折行出框).
-            *wrap_width = Some((bounds.w - 12.0).max(10.0));
+            *wrap_width = Some(wrap_override.unwrap_or_else(|| (bounds.w - 12.0).max(10.0)));
             *cid = Some(container_id);
             *text_align = TextAlign::Center;
         }

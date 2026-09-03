@@ -515,14 +515,15 @@ pub fn apply(
                     opacity: 1.0,
                     points: None,
                 });
-                // Bound label centered in the node, wrapping 6px inside the
-                // border (matches add_bound_label).
+                // Bound label centered in the node; the box is sized to the
+                // text, so the fold gate sits past the box (emergency brake
+                // only — matches the board's mind map labels).
                 let (_, _, tw, th) = text_bbox(
                     spec.bounds.x,
                     spec.bounds.y,
                     &spec.text,
                     spec.font_size,
-                    Some((spec.bounds.w - 12.0).max(10.0)),
+                    Some(spec.bounds.w + 40.0),
                 );
                 c.elements.push(VirtualElement {
                     id: format!("{id}-label"),

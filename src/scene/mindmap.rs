@@ -63,7 +63,7 @@ const BRANCH_PALETTE: [(u32, u32); 6] = [
     (0x2F9E44, 0xE6F6EA), // 绿
     (0xE03131, 0xFDEBEB), // 红
     (0x9C36B5, 0xF6EAFB), // 紫
-    (0xF08C00, 0xFFF4DE), // 金
+    (0x0B7285, 0xE3FAFC), // 青（原金色与橙色色相偏近，目验反馈）
 ];
 
 /// Root styling: warm fill + near-black stroke so it reads as the title node.
