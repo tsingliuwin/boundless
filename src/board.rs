@@ -1285,7 +1285,11 @@ impl BoardView {
             ..
         } = &mut el.kind
         {
-            *wrap_width = Some(bounds.w.max(10.0));
+            // Wrap 6px inside the container's border, not AT it — otherwise
+            // any 1px underestimate of the rendered width wraps the last
+            // character onto a second line that spills out of the shape
+            // (实测：思维导图混排节点「无缝集成Python」折行出框).
+            *wrap_width = Some((bounds.w - 12.0).max(10.0));
             *cid = Some(container_id);
             *text_align = TextAlign::Center;
         }

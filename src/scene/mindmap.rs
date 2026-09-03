@@ -101,20 +101,25 @@ fn is_cjk(c: char) -> bool {
         0x3000..=0x303F | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF)
 }
 
-/// Rough single-line text width: CJK/fullwidth chars ≈ 1.0 × font size,
-/// everything else ≈ 0.55 ×. Mirrors the estimator the eval harness uses.
+/// Rough single-line text width, biased wide on purpose: CJK/fullwidth
+/// chars ≈ 1.1 × font size (the real fallback font runs wider than 1em),
+/// everything else ≈ 0.62 × (Caveat caps are wide). Underestimating wraps
+/// the bound label's last character out of the node box — the generous
+/// factors are cheaper than a wrapped line.
 pub fn estimate_text_width(text: &str, font_size: f64) -> f64 {
     text.chars()
-        .map(|c| if is_cjk(c) { font_size } else { font_size * 0.55 })
+        .map(|c| if is_cjk(c) { font_size * 1.1 } else { font_size * 0.62 })
         .sum()
 }
 
 /// Node box size for a text at a given depth level and global fit scale.
+/// The width estimate is deliberately generous: the real renderer's CJK
+/// fallback runs ~1.1em and Caveat caps are wide, and a 1px underestimate
+/// wraps the bound label's last character out of the box (实测教训).
 fn node_size(text: &str, level: usize, scale: f64) -> (f64, f64) {
     let fs = font_size_for_level(level) * scale;
-    let w = (estimate_text_width(text, fs) + PAD_X * 2.0 * scale).max(fs * 2.0);
-    let h = fs * crate::scene::LINE_HEIGHT + PAD_Y * scale;
-    (w, h)
+    let w = estimate_text_width(text, fs) + PAD_X * 2.0 * scale + 6.0 * scale;
+    (w.max(fs * 2.0), fs * crate::scene::LINE_HEIGHT + PAD_Y * scale)
 }
 
 /// A laid-out node: box, level, and branch colors (the root carries its own).
@@ -628,8 +633,10 @@ mod tests {
 
     #[test]
     fn text_width_estimates_cjk_and_latin() {
-        assert!((estimate_text_width("四个汉字", 20.0) - 80.0).abs() < 1e-9);
-        assert!((estimate_text_width("abcd", 20.0) - 44.0).abs() < 1e-9);
+        // Deliberately generous: 1.1× CJK, 0.62× Latin (wrapped labels
+        // spill out of the box — underestimate is the failure mode).
+        assert!((estimate_text_width("四个汉字", 20.0) - 88.0).abs() < 1e-9);
+        assert!((estimate_text_width("abcd", 20.0) - 49.6).abs() < 1e-9);
     }
 
     #[test]

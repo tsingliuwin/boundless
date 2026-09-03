@@ -515,13 +515,14 @@ pub fn apply(
                     opacity: 1.0,
                     points: None,
                 });
-                // Bound label centered in the node (matches add_bound_label).
+                // Bound label centered in the node, wrapping 6px inside the
+                // border (matches add_bound_label).
                 let (_, _, tw, th) = text_bbox(
                     spec.bounds.x,
                     spec.bounds.y,
                     &spec.text,
                     spec.font_size,
-                    Some((spec.bounds.w - 20.0).max(10.0)),
+                    Some((spec.bounds.w - 12.0).max(10.0)),
                 );
                 c.elements.push(VirtualElement {
                     id: format!("{id}-label"),
@@ -584,13 +585,14 @@ fn push_shape(
     });
     if let Some(t) = label {
         if !t.is_empty() {
-            // Bound label: centered inside the shape (matches add_bound_label).
+            // Bound label: centered inside the shape, wrapping 6px inside
+            // the border (matches add_bound_label).
             let fs = 20.0;
-            let (_, _, tw, th) = text_bbox(x, y, t, fs, Some(w - 20.0));
+            let (_, _, tw, th) = text_bbox(x, y, t, fs, Some((w - 12.0).max(10.0)));
             c.elements.push(VirtualElement {
                 id: format!("{label_owner_id}-label"),
                 kind: "label",
-                x: x + 10.0,
+                x: x + (w - tw.max(1.0)) / 2.0,
                 y: y + h / 2.0 - th / 2.0,
                 w: tw.max(1.0),
                 h: th,
