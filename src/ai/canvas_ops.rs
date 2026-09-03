@@ -287,6 +287,25 @@ fn default_true() -> bool {
     true
 }
 
+/// Gaudy fill: the magenta-card failure mode from the 9:16 rubric round —
+/// the model filled every content card with saturated magenta while
+/// *narrating* the mandated pastel blue. Catches the magenta/pink-purple
+/// family, pure red, and any ultra-bright ultra-saturated fill. Restrained
+/// palettes all pass: chalk pinks (0xFFC0CB), seal red (0xB33A2B), accent
+/// blue (0x1a5fd7), pastel card tints (0xE7F0FF). Lives here because
+/// `CanvasStyle::validate` enforces it at the tool boundary and the slides
+/// rubric re-checks it as a replay sentinel.
+pub fn is_gaudy_fill(c: u32) -> bool {
+    let r = ((c >> 16) & 0xff) as i32;
+    let g = ((c >> 8) & 0xff) as i32;
+    let b = (c & 0xff) as i32;
+    let magenta_like = r >= 180 && b >= 150 && g <= 140;
+    let pure_red = r >= 200 && g <= 90 && b <= 90;
+    let spread = r.max(g.max(b)) - r.min(g.min(b));
+    let neon = (r + g + b) >= 600 && spread >= 180;
+    magenta_like || pure_red || neon
+}
+
 impl CanvasOp {
     /// Short human-readable label describing the op, used for the live
     /// "drawing…" status bubble while the agent works.
@@ -331,6 +350,16 @@ impl CanvasStyle {
                 if c > 0xFF_FF_FF {
                     return Err(format!(
                         "{name} 颜色 0x{c:x} 超出 0xRRGGBB 范围（最大 0xFFFFFF）"
+                    ));
+                }
+                // Hard boundary, not just a skill guideline: the model once
+                // filled every content card with magenta while *narrating*
+                // that it used the mandated pastel blue — prompt-level rules
+                // don't hold for color values, rejection with the correct
+                // hex does (the draw_mindmap lesson: enforce, don't plead).
+                if name == "fill" && is_gaudy_fill(c) {
+                    return Err(format!(
+                        "fill #{c:06x} 是高饱和刺眼色，已拒绝。大面积填充请用主色的浅色调（蓝 0xE7F0FF / 绿 0xE6F4EA / 紫 0xEDE6FD），或白底 + 主色描边；洋红、纯红、荧光色禁止用作填充"
                     ));
                 }
             }

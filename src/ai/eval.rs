@@ -254,7 +254,9 @@ pub fn apply(
             }
             let is_text = matches!(e.kind, "text" | "label");
             if is_text && text.is_some() {
-                e.text = Some(text.clone().unwrap());
+                // Mirror the board: normalize_text collapses the models'
+                // double-escaped "\n" before it lands on an element.
+                e.text = Some(crate::ai::canvas_ops::normalize_text(text.clone().unwrap()));
             }
             if is_text {
                 if let Some(fs) = font_size {
@@ -450,7 +452,10 @@ pub fn apply(
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("t{}", c.elements.len()));
             let id8 = id[..id.len().min(8)].to_string();
-            let (ex, ey, ew, eh) = text_bbox(*x, *y, text, font_size.unwrap_or(20.0), *wrap_width);
+            // Mirror the board's normalize_text: double-escaped "\n" from the
+            // model becomes real line breaks before anything measures it.
+            let text = crate::ai::canvas_ops::normalize_text(text);
+            let (ex, ey, ew, eh) = text_bbox(*x, *y, &text, font_size.unwrap_or(20.0), *wrap_width);
             // Center anchor: x is the horizontal center line (the board
             // shifts left by half the width; mirror that here).
             let ex = if anchor.as_deref() == Some("center") {
@@ -1778,21 +1783,9 @@ fn covering_page<'a>(
     })
 }
 
-/// Gaudy fill: the magenta-card failure mode from the 9:16 rubric round —
-/// the model filled content cards with saturated magenta, clashing with its
-/// own declared blue accent. Catches the magenta/pink-purple family, pure
-/// red, and any ultra-bright ultra-saturated fill. Blue/green/pastel palettes
-/// (chalk pinks, seal red 0xB33A2B, accent blue 0x1a5fd7) all pass.
-fn is_gaudy_fill(c: u32) -> bool {
-    let r = ((c >> 16) & 0xff) as i32;
-    let g = ((c >> 8) & 0xff) as i32;
-    let b = (c & 0xff) as i32;
-    let magenta_like = r >= 180 && b >= 150 && g <= 140;
-    let pure_red = r >= 200 && g <= 90 && b <= 90;
-    let spread = r.max(g.max(b)) - r.min(g.min(b));
-    let neon = (r + g + b) >= 600 && spread >= 180;
-    magenta_like || pure_red || neon
-}
+// Gaudy-fill detection lives in canvas_ops (is_gaudy_fill): the tool boundary
+// enforces it (CanvasStyle::validate) and the check below is the replay
+// sentinel for the same rule.
 
 /// Grade a replayed slide-deck run. Structure (page count, expected ratio),
 /// per-page content (each page has text + enough elements), placement
@@ -1910,12 +1903,21 @@ pub fn evaluate_slides(
             max_bottom = max_bottom.max(e.y + e.h);
         }
         let span = (max_bottom - p.y) / p.h;
-        if span < 0.55 {
-            shallow_pages.push(format!("第{}页(纵向跨度 {:.0}%)", i + 1, span * 100.0));
+        // The cover page (first) is allowed generous whitespace — a title
+        // block over an intentional empty field is good cover design — so
+        // its bar is lower; content pages must actually spread.
+        let min_span = if i == 0 { 0.45 } else { 0.55 };
+        if span < min_span {
+            shallow_pages.push(format!(
+                "第{}页(纵向跨度 {:.0}%,要求 {:.0}%)",
+                i + 1,
+                span * 100.0,
+                min_span * 100.0
+            ));
         }
     }
     checks.push(check(
-        "每页内容纵向铺开（跨度 ≥ 55% 页高）",
+        "每页内容纵向铺开（跨度 ≥ 55% 页高，封面 ≥ 45%）",
         shallow_pages.is_empty(),
         if shallow_pages.is_empty() {
             "全部页面纵向铺满".to_string()
@@ -1993,7 +1995,7 @@ pub fn evaluate_slides(
     let gaudy: Vec<String> = canvas
         .elements
         .iter()
-        .filter(|e| e.fill.map(is_gaudy_fill).unwrap_or(false))
+        .filter(|e| e.fill.map(crate::ai::canvas_ops::is_gaudy_fill).unwrap_or(false))
         .map(|e| {
             format!(
                 "{} #{:06x}",
@@ -2197,11 +2199,11 @@ mod slides_tests {
             report.to_text()
         );
         // Accent blue and chalk pastels stay legal.
-        assert!(!is_gaudy_fill(0x1a5fd7));
-        assert!(!is_gaudy_fill(0xFFC0CB));
-        assert!(!is_gaudy_fill(0xB33A2B));
-        assert!(is_gaudy_fill(0xFF00FF));
-        assert!(is_gaudy_fill(0xFF0000));
+        assert!(!crate::ai::canvas_ops::is_gaudy_fill(0x1a5fd7));
+        assert!(!crate::ai::canvas_ops::is_gaudy_fill(0xFFC0CB));
+        assert!(!crate::ai::canvas_ops::is_gaudy_fill(0xB33A2B));
+        assert!(crate::ai::canvas_ops::is_gaudy_fill(0xFF00FF));
+        assert!(crate::ai::canvas_ops::is_gaudy_fill(0xFF0000));
     }
 
     #[test]
