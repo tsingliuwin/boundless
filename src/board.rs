@@ -1996,6 +1996,25 @@ impl BoardView {
         cx.notify();
     }
 
+    /// Delete the page the camera is looking at. Only the page frame is
+    /// removed — its elements stay on the canvas (a mistaken delete costs
+    /// nothing), which the notice says out loud.
+    fn delete_current_page(&mut self, cx: &mut Context<Self>) {
+        let Some(i) = self.current_page_index() else {
+            self.set_notice("视图中心不在任何页面内，无法确定要删除哪页", cx);
+            return;
+        };
+        let title = self.scene.pages[i].title.clone();
+        self.scene.pages.remove(i);
+        // Keep the presenting index valid (page flip clamps on next use).
+        if let Some(p) = self.presenting {
+            self.presenting = Some(if i < p { p - 1 } else { p.min(self.scene.pages.len().saturating_sub(1)) });
+        }
+        self.mark_dirty();
+        self.set_notice(format!("已删除页面「{title}」（页内元素保留在画布上）"), cx);
+        cx.notify();
+    }
+
     /// Manually add a page (page-bar button). The AI creates pages via the
     /// `add_page` tool with an explicit ratio; a manual page extends the
     /// current deck in its existing ratio (a stray 16:9 page in the middle
@@ -5844,8 +5863,8 @@ impl BoardView {
     /// started before any page exists).
     fn render_page_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let weak = cx.weak_entity();
-        let (weak_prev, weak_next, weak_present, weak_add) =
-            (weak.clone(), weak.clone(), weak.clone(), weak.clone());
+        let (weak_prev, weak_next, weak_present, weak_add, weak_del) =
+            (weak.clone(), weak.clone(), weak.clone(), weak.clone(), weak.clone());
         let total = self.scene.pages.len();
         let current = self
             .current_page_index()
@@ -5880,6 +5899,11 @@ impl BoardView {
             .child(bar_button("＋页", false).on_click(move |_, _, cx| {
                 weak_add.update(cx, |this, cx| this.add_page_manual(cx)).ok();
             }))
+            .when(total > 0, |d| {
+                d.child(bar_button("删页", false).on_click(move |_, _, cx| {
+                    weak_del.update(cx, |this, cx| this.delete_current_page(cx)).ok();
+                }))
+            })
     }
 
     /// Full-screen presentation overlay: the current page number and the

@@ -1770,6 +1770,22 @@ fn covering_page<'a>(
     })
 }
 
+/// Gaudy fill: the magenta-card failure mode from the 9:16 rubric round —
+/// the model filled content cards with saturated magenta, clashing with its
+/// own declared blue accent. Catches the magenta/pink-purple family, pure
+/// red, and any ultra-bright ultra-saturated fill. Blue/green/pastel palettes
+/// (chalk pinks, seal red 0xB33A2B, accent blue 0x1a5fd7) all pass.
+fn is_gaudy_fill(c: u32) -> bool {
+    let r = ((c >> 16) & 0xff) as i32;
+    let g = ((c >> 8) & 0xff) as i32;
+    let b = (c & 0xff) as i32;
+    let magenta_like = r >= 180 && b >= 150 && g <= 140;
+    let pure_red = r >= 200 && g <= 90 && b <= 90;
+    let spread = r.max(g.max(b)) - r.min(g.min(b));
+    let neon = (r + g + b) >= 600 && spread >= 180;
+    magenta_like || pure_red || neon
+}
+
 /// Grade a replayed slide-deck run. Structure (page count, expected ratio),
 /// per-page content (each page has text + enough elements), placement
 /// discipline (no element in the gap between pages), per-page text
@@ -1965,6 +1981,29 @@ pub fn evaluate_slides(
         },
     ));
 
+    // -- 配色纪律：无刺眼高饱和填充 --
+    let gaudy: Vec<String> = canvas
+        .elements
+        .iter()
+        .filter(|e| e.fill.map(is_gaudy_fill).unwrap_or(false))
+        .map(|e| {
+            format!(
+                "{} #{:06x}",
+                e.kind,
+                e.fill.unwrap_or(0)
+            )
+        })
+        .collect();
+    checks.push(check(
+        "无刺眼高饱和填充（洋红/纯红/荧光色）",
+        gaudy.is_empty(),
+        if gaudy.is_empty() {
+            "配色克制".to_string()
+        } else {
+            format!("刺眼填充: {}", gaudy.join("、"))
+        },
+    ));
+
     // -- 字面换行残留 --
     const LITERAL_LF: &str = "\\n";
     let literal_n: Vec<String> = texts
@@ -2116,6 +2155,44 @@ mod slides_tests {
             "crammed page must fail:\n{}",
             report.to_text()
         );
+    }
+
+    #[test]
+    fn gaudy_magenta_fills_fail() {
+        let ops = sample_deck(2, "16:9");
+        let canvas = replay(&ops);
+        // A content card filled with the failure-mode magenta.
+        let mut ops = ops;
+        ops.push((
+            CanvasOp::Rectangle {
+                x: 200.0,
+                y: 400.0,
+                w: 300.0,
+                h: 150.0,
+                style: crate::ai::canvas_ops::CanvasStyle {
+                    fill: Some(0xFF00FF),
+                    ..Default::default()
+                },
+                text: None,
+            },
+            None,
+        ));
+        let canvas = replay(&ops);
+        let report = evaluate_slides(&canvas, true, ops.len(), 2, PageRatio::Ratio16_9);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.name.contains("刺眼") && !c.passed),
+            "magenta card must fail:\n{}",
+            report.to_text()
+        );
+        // Accent blue and chalk pastels stay legal.
+        assert!(!is_gaudy_fill(0x1a5fd7));
+        assert!(!is_gaudy_fill(0xFFC0CB));
+        assert!(!is_gaudy_fill(0xB33A2B));
+        assert!(is_gaudy_fill(0xFF00FF));
+        assert!(is_gaudy_fill(0xFF0000));
     }
 
     #[test]
