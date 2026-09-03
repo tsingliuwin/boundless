@@ -211,6 +211,17 @@ pub fn world_geometry(el: &Element) -> WorldGeom {
             let points: Vec<_> = diamond_polygon(b).iter().map(|p| to_euclid(*p)).collect();
             WorldGeom::Rough(sets_of(&gen.polygon(&points)))
         }
+        // 封闭多边形（水墨山形/岸块等不规则形状）：roughr polygon，
+        // 填充走 options_for 的统一管线（solid → 密排线 FillSketch）。
+        ElementKind::Polygon { .. } => {
+            let points = el.absolute_points();
+            if points.len() < 3 {
+                return WorldGeom::Empty;
+            }
+            let gen = KurboGenerator::new(options_for(style, el.seed, false));
+            let pts: Vec<_> = points.iter().map(|p| to_euclid(*p)).collect();
+            WorldGeom::Rough(sets_of(&gen.polygon(&pts)))
+        }
         // Variable-width ink stroke (from the crate::ink pipeline): fill the
         // ribbon outline instead of stroking a centerline. This arm must sit
         // before the generic point-based arm below, which keeps legacy

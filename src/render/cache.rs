@@ -149,6 +149,10 @@ fn fingerprint_into(h: &mut Fnv, el: &Element) {
                 h.write_f64(*w);
             }
         }
+        ElementKind::Polygon { points } => {
+            h.write_u64(8);
+            hash_points(h, points);
+        }
         ElementKind::Text {
             text,
             font_size,

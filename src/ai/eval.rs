@@ -302,6 +302,33 @@ pub fn apply(
                 text.as_deref(),
             )?;
         }
+        CanvasOp::Polygon { points, style } => {
+            if points.len() < 3 || points.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
+                c.ops_failed += 1;
+                return Err("多边形至少需要三个有限坐标点".to_string());
+            }
+            let id = assigned_id.map(str::to_string).unwrap_or_else(|| format!("p{}", c.elements.len()));
+            let min_x = points.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
+            let min_y = points.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
+            let max_x = points.iter().map(|p| p.x).fold(f64::NEG_INFINITY, f64::max);
+            let max_y = points.iter().map(|p| p.y).fold(f64::NEG_INFINITY, f64::max);
+            let id8 = id[..id.len().min(8)].to_string();
+            c.elements.push(VirtualElement {
+                id,
+                kind: "polygon",
+                x: min_x,
+                y: min_y,
+                w: (max_x - min_x).max(1.0),
+                h: (max_y - min_y).max(1.0),
+                text: None,
+                font_size: 0.0,
+                stroke: style.stroke.unwrap_or(0x1e1e1e),
+                fill: style.fill,
+                opacity: f64::from(style.opacity.unwrap_or(1.0)),
+            });
+            c.ops_applied += 1;
+            msg = format!("已添加多边形 id={id8}");
+        }
         CanvasOp::Diamond {
             x,
             y,
@@ -1026,11 +1053,8 @@ pub fn evaluate_ink(
 
     // -- 远山层：宽扁椭圆、带填充、墨色可见 --
     let is_mountain = |e: &VirtualElement| {
-        matches!(e.kind, "ellipse")
-            && e.w >= 250.0
-            && e.h >= 80.0
-            && e.w / e.h.max(1.0) >= 1.8
-            && e.fill.is_some()
+        let shaped = matches!(e.kind, "ellipse" | "polygon");
+        shaped && e.fill.is_some() && (e.w >= 250.0 && e.h >= 80.0 || e.w * e.h >= 120_000.0)
     };
     let mountains: Vec<&VirtualElement> =
         canvas.elements.iter().filter(|e| is_mountain(e)).collect();

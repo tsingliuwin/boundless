@@ -817,6 +817,42 @@ impl BoardView {
                 }
                 Ok(format!("已添加椭圆 id={}", &added.to_string()[..8]))
             }
+            CanvasOp::Polygon { points, style } => {
+                if points.len() < 3 || points.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
+                    return Err(CanvasOpError::invalid_args(
+                        "多边形至少需要三个有限坐标点",
+                    ));
+                }
+                let Some(id) = pre_assigned_id else {
+                    return Err(CanvasOpError::internal("内部错误：缺少元素 ID"));
+                };
+                self.history.record(&self.scene);
+                let pts: Vec<WPoint> = points.iter().map(|p| WPoint::new(p.x, p.y)).collect();
+                let mut el = Element::from_absolute_points_with_id(
+                    id,
+                    |points| ElementKind::Polygon { points },
+                    pts,
+                    styled(style),
+                );
+                el.style.fill_style = crate::scene::FillStyle::Solid;
+                let added = self.scene.add(el);
+                #[cfg(debug_assertions)]
+                if let Some(f) = self
+                    .scene
+                    .get(added)
+                    .map(|e| (e.style.background, e.style.fill_style, e.style.opacity))
+                {
+                    let (f, fs, op) = f;
+                    eprintln!(
+                        "[op-diag] shape id={} background={:?} fill_style={:?} opacity={}",
+                        &added.to_string()[..8],
+                        f,
+                        fs,
+                        op
+                    );
+                }
+                Ok(format!("已添加多边形 id={}", &added.to_string()[..8]))
+            }
             CanvasOp::Diamond {
                 x,
                 y,
@@ -1222,6 +1258,7 @@ impl BoardView {
                     ElementKind::Line { .. } => ("line", el.text().map(|t| t.to_string())),
                     ElementKind::Text { text, .. } => ("text", Some(text.clone())),
                     ElementKind::Freedraw { .. } => ("freedraw", None),
+                    ElementKind::Polygon { .. } => ("polygon", None),
                 };
                 ElementSnapshot {
                     id: el.id.to_string()[..8].to_string(),
@@ -4849,6 +4886,7 @@ impl BoardView {
             ElementKind::Line { .. } => "直线",
             ElementKind::Text { .. } => "文本",
             ElementKind::Freedraw { .. } => "手绘",
+            ElementKind::Polygon { .. } => "多边形",
         };
         let short_id = &el_ref.id.to_string()[..8];
         let b = &el_ref.bounds;

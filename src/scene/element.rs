@@ -249,6 +249,13 @@ pub enum ElementKind {
         #[serde(default)]
         widths: Vec<f64>,
     },
+    /// Closed polygon with optional fill; points relative to the element
+    /// origin. The irregular-shape workhorse for the ink-wash style
+    /// (mountains, land masses) — the fill renders through the dense-hachure
+    /// stroke pipeline like the other closed shapes.
+    Polygon {
+        points: Vec<WPoint>,
+    },
     Text {
         text: String,
         font_size: f64,
@@ -370,7 +377,10 @@ impl Element {
     pub fn is_point_based(&self) -> bool {
         matches!(
             self.kind,
-            ElementKind::Line { .. } | ElementKind::Arrow { .. } | ElementKind::Freedraw { .. }
+            ElementKind::Line { .. }
+                | ElementKind::Arrow { .. }
+                | ElementKind::Freedraw { .. }
+                | ElementKind::Polygon { .. }
         )
     }
 
@@ -441,7 +451,8 @@ impl Element {
         match &self.kind {
             ElementKind::Line { points }
             | ElementKind::Arrow { points, .. }
-            | ElementKind::Freedraw { points, .. } => points.iter().map(|p| origin + *p).collect(),
+            | ElementKind::Freedraw { points, .. }
+            | ElementKind::Polygon { points } => points.iter().map(|p| origin + *p).collect(),
             _ => Vec::new(),
         }
     }
@@ -471,7 +482,8 @@ impl Element {
         match &mut self.kind {
             ElementKind::Line { points }
             | ElementKind::Arrow { points, .. }
-            | ElementKind::Freedraw { points, .. } => {
+            | ElementKind::Freedraw { points, .. }
+            | ElementKind::Polygon { points } => {
                 for p in points.iter_mut() {
                     p.x *= sx.abs();
                     p.y *= sy.abs();
@@ -506,7 +518,8 @@ impl Element {
         let new_origin = WPoint::new(new_bounds.x, new_bounds.y);
         if let ElementKind::Line { points }
         | ElementKind::Arrow { points, .. }
-        | ElementKind::Freedraw { points, .. } = &mut self.kind
+        | ElementKind::Freedraw { points, .. }
+        | ElementKind::Polygon { points } = &mut self.kind
         {
             for p in points.iter_mut() {
                 *p = old_origin + *p - new_origin;
@@ -524,7 +537,8 @@ impl Element {
         match &mut self.kind {
             ElementKind::Line { points }
             | ElementKind::Arrow { points, .. }
-            | ElementKind::Freedraw { points, .. } => match points.get_mut(index) {
+            | ElementKind::Freedraw { points, .. }
+            | ElementKind::Polygon { points } => match points.get_mut(index) {
                 Some(pt) => *pt = p - origin,
                 None => return,
             },
@@ -597,6 +611,12 @@ impl Element {
     pub fn hit_test(&self, p: WPoint, tol: f64) -> bool {
         let stroke_tol = (self.effective_stroke_width() / 2.0).max(2.0) + tol;
         match &self.kind {
+            // 封闭多边形：内部可点选 + 边缘可精确命中（与矩形一致）。
+            ElementKind::Polygon { .. } => {
+                let abs = self.absolute_points();
+                point_in_polygon(p, &abs)
+                    || distance_to_polygon(p, &abs, true) <= stroke_tol
+            }
             // Closed shapes: the whole bounding area is hit-testable (so a
             // click anywhere on the shape selects/moves it), regardless of
             // fill — matching Excalidraw. The border still wins for precise

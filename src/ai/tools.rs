@@ -905,6 +905,85 @@ impl Tool for SetBackgroundTool {
     }
 }
 
+// --- Polygon -----------------------------------------------------------------
+
+/// Arguments for the polygon tool.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct PolygonArgs {
+    /// Closed polygon vertices (≥3) in world coordinates, in drawing order.
+    /// The last point connects back to the first. For mountains: 6~10 points
+    /// with an irregular ridgeline reads best.
+    pub points: Vec<OpPoint>,
+    /// Optional visual style. Ink-wash guidance: fill + fill_style="solid"
+    /// with opacity 0.35~0.5 for 远山，0.6~0.7 for 近岸.
+    #[serde(default)]
+    pub style: CanvasStyle,
+}
+
+pub struct PolygonTool {
+    pub events: UnboundedSender<AgentEvent>,
+}
+
+impl Tool for PolygonTool {
+    const NAME: &'static str = "draw_polygon";
+    type Error = ToolError;
+    type Args = PolygonArgs;
+    type Output = String;
+
+    fn definition(&self, _prompt: String) -> impl std::future::Future<Output = ToolDefinition> + Send {
+        let def = tool_def::<PolygonArgs>(
+            Self::NAME,
+            "画一个封闭多边形（≥3 个顶点，末点自动连回首点）。不规则形状的首选：水墨的远山、近岸、坡地都用它（6~10 个顶点勾出起伏轮廓，fill+fill_style=solid 半透明填充）。",
+        );
+        async move { def }
+    }
+
+    fn call(
+        &self,
+        args: Self::Args,
+    ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
+        let events = self.events.clone();
+        let name = Self::NAME;
+        async move {
+            let id = next_tool_id(name);
+            let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
+            if args.points.len() < 3 {
+                return fail_tool(
+                    &events,
+                    id,
+                    name,
+                    args_json,
+                    ToolError::invalid_args("多边形至少需要三个顶点"),
+                )
+                .await;
+            }
+            if args
+                .points
+                .iter()
+                .any(|p| !p.x.is_finite() || !p.y.is_finite())
+            {
+                return fail_tool(
+                    &events,
+                    id,
+                    name,
+                    args_json,
+                    ToolError::invalid_args("坐标必须是有限数值"),
+                )
+                .await;
+            }
+            if let Err(msg) = args.style.validate() {
+                return fail_tool(&events, id, name, args_json, ToolError::invalid_args(msg))
+                    .await;
+            }
+            let op = CanvasOp::Polygon {
+                points: args.points,
+                style: args.style,
+            };
+            run_canvas_op(&events, id, name, args_json, op, Some(new_element_id())).await
+        }
+    }
+}
+
 // --- List Elements ---------------------------------------------------------
 
 /// A lightweight summary of one canvas element, for the `list_elements` tool.
@@ -1022,6 +1101,9 @@ pub fn all_tools(
             events: events.clone(),
         }),
         Box::new(SetBackgroundTool {
+            events: events.clone(),
+        }),
+        Box::new(PolygonTool {
             events: events.clone(),
         }),
         Box::new(ListElementsTool { snapshot }),

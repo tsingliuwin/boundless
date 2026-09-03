@@ -188,6 +188,14 @@ pub enum CanvasOp {
     DeleteElement { id: String },
     /// Delete every element on the canvas (clear it for a fresh start).
     Clear,
+    /// Closed polygon through the given absolute points (≥3) — irregular
+    /// shapes for the ink-wash style (mountains, land masses). The last
+    /// point connects back to the first.
+    Polygon {
+        points: Vec<OpPoint>,
+        #[serde(default)]
+        style: CanvasStyle,
+    },
     /// Standalone text. `text` may contain newlines for multi-line.
     Text {
         x: f64,
@@ -237,6 +245,7 @@ impl CanvasOp {
             CanvasOp::Diamond { .. } => "菱形",
             CanvasOp::Line { .. } => "直线",
             CanvasOp::Arrow { .. } => "箭头",
+            CanvasOp::Polygon { .. } => "多边形",
             CanvasOp::Text { .. } => "文本",
             CanvasOp::UpdateElement { .. } => "修改",
             CanvasOp::DeleteElement { .. } => "删除",
