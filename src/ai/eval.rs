@@ -1131,28 +1131,6 @@ pub fn evaluate_ink(
         format!("共 {dark_near} 处"),
     ));
 
-    // 浓墨克制：近岸/浓墨大块面积 ≤ 画布 1/4——过重会压满画面下部，
-    // 挤掉留白与呼吸空间（实测教训）。
-    let dark_area: f64 = canvas
-        .elements
-        .iter()
-        .filter(|e| {
-            matches!(e.kind, "rectangle" | "ellipse" | "polygon")
-                && e.fill.is_some()
-                && (e.opacity >= 0.55 || luminance(e.fill.unwrap_or(0xFFFFFF)) <= 0.35)
-                && (e.w * e.h) >= 40_000.0
-        })
-        .map(|e| e.w * e.h)
-        .sum();
-    checks.push(check(
-        "浓墨面积克制（≤ 画布 1/4）",
-        dark_area <= 0.25 * CANVAS_W * CANVAS_H,
-        format!(
-            "浓墨大块合计约 {:.0}%",
-            dark_area / (CANVAS_W * CANVAS_H) * 100.0
-        ),
-    ));
-
     // -- 竖排题跋：一列单字（≥3 字、横向聚拢）或窄高文本块 --
     let single_chars: Vec<&VirtualElement> = texts_of(canvas)
         .into_iter()
@@ -1236,16 +1214,27 @@ pub fn evaluate_ink(
         format!("小型线形 {small_lines}，小形状 {small_shapes}"),
     ));
 
-    // -- 留白密度（粗代理：元素 bbox 总面积，重叠会高估，阈值放宽）--
-    let total_area: f64 = canvas.elements.iter().map(|e| e.w * e.h).sum();
-    let sparse = total_area <= 0.75 * CANVAS_W * CANVAS_H;
+    // 浓墨压场克制：渲染后接近黑色的大块（合成亮度 ≤ 0.3）合计 ≤ 画布
+    // 20%——过重会压满画面下部，挤掉留白与呼吸空间（实测教训）。中景的
+    // 深灰层次（合成亮度 > 0.3）不算压场。
+    let near_black_count = canvas
+        .elements
+        .iter()
+        .filter(|e| {
+            matches!(e.kind, "rectangle" | "ellipse" | "polygon")
+                && e.fill.is_some()
+                && e.w * e.h >= 40_000.0
+        })
+        .map(|e| {
+            let fill_lum = luminance(e.fill.unwrap_or(0xFFFFFF));
+            fill_lum * e.opacity + 0.94 * (1.0 - e.opacity)
+        })
+        .filter(|eff| *eff <= 0.30)
+        .count();
     checks.push(check(
-        "画面密度 ≤ 75%（留白）",
-        sparse,
-        format!(
-            "元素面积合计约 {:.0}%",
-            total_area / (CANVAS_W * CANVAS_H) * 100.0
-        ),
+        "近黑压场克制（无大面积近黑色块）",
+        near_black_count == 0,
+        format!("近黑大块 {near_black_count} 块"),
     ));
 
     // -- 无越界 --
