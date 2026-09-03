@@ -1,12 +1,12 @@
 //! boundless — an Excalidraw-style infinite whiteboard on GPUI,
 //! with OpenAI-compatible AI text generation.
 
-// Hide the console window in release builds. The binary is a console-subsystem
-// app by default, so double-clicking the exe (or the Start Menu shortcut the
-// NSIS installer creates) opens a black terminal alongside the window. Switching
-// to the windows subsystem suppresses it. Kept on in debug builds so `cargo run`
-// still shows `eprintln!` diagnostics.
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Windows-subsystem binary: no console window alongside the app, in any
+// build. A console-subsystem exe pops a black terminal when launched from
+// Explorer/`start` (debug builds included), which users read as a bug.
+// Diagnostics don't rely on stderr: panics append to ~/.boundless/panic.log
+// and agent runs to ~/.boundless/agent-logs/*.jsonl.
+#![windows_subsystem = "windows"]
 
 use boundless::board::{
     ArrowTool, BoardView, BringForward, BringToFront, CancelOp, CheckForUpdates, DeleteSelection,
