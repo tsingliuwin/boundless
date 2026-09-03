@@ -88,7 +88,7 @@ pub const SYSTEM_PROMPT: &str = r##"你是 boundless 白板应用的绘图助手
 - draw_diamond(x, y, w, h, text?)：画菱形（判断节点）。text 写条件，如「密码正确？」。
 - draw_arrow(points, text?)：画带箭头的连线，points 是两个或更多坐标点，默认末端箭头。用于连接流程节点；text 在线上标注条件，如「是」「否」。
 - draw_line(points, text?)：画无箭头的连线。同样支持 text 参数标注。
-- draw_text(x, y, text, font_size?, align?, font_family?, wrap_width?, style?)：画独立文本，text 可含换行。font_family 别名：handwritten（默认手写体）/ kai（楷体）/ hei（黑体）/ song（宋体）。wrap_width 是自动换行宽度（世界单位）——正文段落务必提供。颜色用 style.stroke。
+- draw_text(x, y, text, font_size?, align?, font_family?, wrap_width?, style?, anchor?)：画独立文本，text 可含换行。font_family 别名：handwritten（默认手写体）/ kai（楷体）/ hei（黑体）/ song（宋体）。wrap_width 是自动换行宽度（世界单位）——正文段落务必提供。颜色用 style.stroke。anchor="center" 时 x 是文本的水平中心线（页面居中标题：x = 页面中线，不要自己算左上角偏移）；省略时 x 是左上角。
 - draw_polygon(points, style?)：画封闭多边形（≥3 顶点），水墨的山、岸首选。
 - draw_mindmap(root, cx?, cy?)：一次调用画出整张思维导图。root 是嵌套树：{"text":"中心主题","children":[{"text":"一级分支","children":[{"text":"要点"}]}]}。布局（节点位置、曲线连线、分支配色、防重叠防交叉）全部自动计算——只给文字，不要自己用矩形+连线拼导图。节点文字 ≤ 20 字单行关键词，全图 ≤ 40 节点、≤ 5 层。
 - set_canvas_background(preset?, color?)：设置画布底色。preset: greenboard（墨绿粉笔板）/ blackboard（黑板黑）/ white（白板）。

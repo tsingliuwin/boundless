@@ -439,6 +439,7 @@ pub fn apply(
             font_size,
             wrap_width,
             style,
+            anchor,
             ..
         } => {
             if text.trim().is_empty() {
@@ -450,6 +451,13 @@ pub fn apply(
                 .unwrap_or_else(|| format!("t{}", c.elements.len()));
             let id8 = id[..id.len().min(8)].to_string();
             let (ex, ey, ew, eh) = text_bbox(*x, *y, text, font_size.unwrap_or(20.0), *wrap_width);
+            // Center anchor: x is the horizontal center line (the board
+            // shifts left by half the width; mirror that here).
+            let ex = if anchor.as_deref() == Some("center") {
+                ex - ew / 2.0
+            } else {
+                ex
+            };
             c.elements.push(VirtualElement {
                 id,
                 kind: "text",
@@ -2082,6 +2090,7 @@ mod slides_tests {
                 align: None,
                 font_family: None,
                 wrap_width: None,
+                anchor: None,
                 style: CanvasStyle::default(),
             },
             None,
@@ -2210,6 +2219,7 @@ mod slides_tests {
                 align: None,
                 font_family: None,
                 wrap_width: None,
+                anchor: None,
                 style: CanvasStyle::default(),
             },
             None,
@@ -2287,6 +2297,7 @@ mod ink_tests {
                     align: None,
                     font_family: Some("kai".into()),
                     wrap_width: None,
+                    anchor: None,
                     style: CanvasStyle {
                         stroke: Some(0x3a3a3a),
                         ..Default::default()
@@ -2694,6 +2705,7 @@ mod tests {
                 align: None,
                 font_family: Some("kai".into()),
                 wrap_width: wrap,
+                anchor: None,
                 style: style(None, 0xFFFFFF),
             },
             None,
@@ -2706,7 +2718,7 @@ mod tests {
         vec![
             (CanvasOp::SetBackground { color: Some(0x2A5240) }, None),
             (CanvasOp::Rectangle { x: 30.0, y: 30.0, w: 1540.0, h: 940.0, style: style(Some(0x2A5240), white), text: None }, Some("aaa00001".into())),
-            (CanvasOp::Text { x: 640.0, y: 50.0, text: "教师节快乐".into(), font_size: Some(64.0), align: None, font_family: Some("kai".into()), wrap_width: None, style: style(None, white) }, Some("aaa00002".into())),
+            (CanvasOp::Text { x: 640.0, y: 50.0, text: "教师节快乐".into(), font_size: Some(64.0), align: None, font_family: Some("kai".into()), wrap_width: None, anchor: None, style: style(None, white) }, Some("aaa00002".into())),
             (CanvasOp::Line { points: vec![pt(100.0, 190.0), pt(1500.0, 190.0)], style: style(None, white), text: None }, Some("aaa00003".into())),
             (CanvasOp::Line { points: vec![pt(100.0, 880.0), pt(1500.0, 880.0)], style: style(None, white), text: None }, Some("aaa00004".into())),
             (CanvasOp::Ellipse { x: 60.0, y: 60.0, w: 60.0, h: 60.0, style: style(Some(0xFFC0CB), white), text: None }, Some("aaa00005".into())),
@@ -2931,6 +2943,7 @@ mod apply_tests {
                 align: None,
                 font_family: None,
                 wrap_width: None,
+                anchor: None,
                 style: CanvasStyle::default(),
             },
             Some("abcd1234"),

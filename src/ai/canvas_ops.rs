@@ -198,6 +198,8 @@ pub enum CanvasOp {
     },
     /// Standalone text. `text` may contain newlines for multi-line.
     Text {
+        /// Top-left X — or, with `anchor = "center"`, the text's horizontal
+        /// CENTER line (e.g. a page's center line for a centered title).
         x: f64,
         y: f64,
         text: String,
@@ -217,6 +219,11 @@ pub enum CanvasOp {
         /// stay inside their panel. Omit = natural width (no wrapping).
         #[serde(skip_serializing_if = "Option::is_none")]
         wrap_width: Option<f64>,
+        /// Positioning anchor: "center" = X is the text's horizontal center
+        /// line. Use it for page-centered titles instead of computing
+        /// left-edge offsets by character count.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        anchor: Option<String>,
         #[serde(default)]
         style: CanvasStyle,
     },

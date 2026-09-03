@@ -492,6 +492,7 @@ impl BoardView {
                     min_height,
                     container_id,
                     text_align,
+                    ..
                 } => (
                     text.clone(),
                     *font_size,
@@ -1007,6 +1008,7 @@ impl BoardView {
                 align,
                 font_family,
                 wrap_width,
+                anchor,
                 style,
             } => {
                 let Some(id) = pre_assigned_id else {
@@ -1014,6 +1016,7 @@ impl BoardView {
                 };
                 let fs = font_size.unwrap_or(self.text_font_size).max(4.0);
                 let ta = align.map(Into::into).unwrap_or(self.text_align);
+                let anchor = anchor.filter(|a| a == "center");
                 let text = crate::ai::canvas_ops::normalize_text(text);
                 self.history.record(&self.scene);
                 let mut el = Element::new_text(WPoint::new(x, y), text, styled(style));
@@ -1024,11 +1027,13 @@ impl BoardView {
                     text_align: ta2,
                     font_family: family2,
                     wrap_width: wrap2,
+                    anchor: anchor2,
                     ..
                 } = &mut el.kind
                 {
                     *fs2 = fs;
                     *ta2 = ta;
+                    *anchor2 = anchor.clone();
                     // Font alias → concrete family (unknown aliases degrade to
                     // the hand-drawn default instead of tofu).
                     if let Some(family) = font_family {
@@ -1049,6 +1054,12 @@ impl BoardView {
                     .min(wrap_width.unwrap_or(f64::MAX))
                     .max(1.0);
                 el.bounds.h = lines as f64 * fs * LINE_HEIGHT;
+                // Center anchor: x is the horizontal center line — shift left
+                // by half the estimated width now; the render refinement
+                // re-centers with the measured width (see pending_measure).
+                if anchor.is_some() {
+                    el.bounds.x -= el.bounds.w / 2.0;
+                }
                 let added = self.scene.add(el);
                 #[cfg(debug_assertions)]
                 if let Some(f) = self
@@ -4017,9 +4028,19 @@ impl Render for BoardView {
                         }
                     }
                     let cb = cid.and_then(|cid| self.scene.get(cid)).map(|c| c.bounds);
+                    // Center-anchored text keeps its center line when the
+                    // measured width replaces the estimate.
+                    let center = self
+                        .scene
+                        .get(id)
+                        .filter(|el| el.is_center_anchored())
+                        .map(|el| el.bounds.x + el.bounds.w / 2.0);
                     if let Some(el) = self.scene.get_mut(id) {
                         el.bounds.w = w.max(1.0);
                         el.bounds.h = h.max(1.0);
+                        if let Some(c) = center {
+                            el.bounds.x = c - w.max(1.0) / 2.0;
+                        }
                         // A bound label keeps its alignment on the container.
                         if let Some(cb) = cb {
                             let align = el.text_align();

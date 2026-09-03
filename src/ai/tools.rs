@@ -121,6 +121,13 @@ fn validate_text(args: &TextArgs) -> Result<(), ToolError> {
             return Err(ToolError::invalid_args("wrap_width 必须为正数"));
         }
     }
+    if let Some(a) = &args.anchor {
+        if a != "center" {
+            return Err(ToolError::invalid_args(
+                "anchor 只支持 \"center\"（x 为文本水平中心线）；省略 = x 为左上角",
+            ));
+        }
+    }
     args.style.validate().map_err(ToolError::invalid_args)?;
     Ok(())
 }
@@ -283,7 +290,8 @@ pub struct PointsArgs {
 /// Arguments for the text tool.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct TextArgs {
-    /// Top-left X in world coordinates.
+    /// Top-left X in world coordinates — or, with anchor="center", the
+    /// text's horizontal CENTER line (e.g. a page's center line).
     pub x: f64,
     /// Top-left Y in world coordinates.
     pub y: f64,
@@ -303,6 +311,10 @@ pub struct TextArgs {
     /// recommended for body-text blocks. Omit = natural width.
     #[serde(default)]
     pub wrap_width: Option<f64>,
+    /// Positioning anchor: "center" = X is the text's horizontal center line.
+    /// Use for page-centered titles instead of computing offsets by hand.
+    #[serde(default)]
+    pub anchor: Option<String>,
     /// Optional visual style (opacity etc.).
     #[serde(default)]
     pub style: CanvasStyle,
@@ -608,6 +620,7 @@ impl Tool for TextTool {
                 align: args.align,
                 font_family: args.font_family,
                 wrap_width: args.wrap_width,
+                anchor: args.anchor,
                 style: args.style,
             };
             run_canvas_op(&events, id, name, args_json, op, Some(new_element_id())).await

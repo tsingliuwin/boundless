@@ -161,6 +161,7 @@ fn fingerprint_into(h: &mut Fnv, el: &Element) {
             min_height,
             container_id,
             text_align,
+            ..
         } => {
             h.write_u64(7);
             h.write_str(text);

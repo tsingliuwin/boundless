@@ -279,6 +279,12 @@ pub enum ElementKind {
         /// Horizontal alignment within the text box.
         #[serde(default)]
         text_align: TextAlign,
+        /// Positioning anchor. None/"top-left" = x is the box's left edge
+        /// (the default). "center" = x is the box's horizontal CENTER line,
+        /// so centering a title on a page is `x = page center` — no mental
+        /// math, and re-measurement re-centers instead of drifting right.
+        #[serde(default)]
+        anchor: Option<String>,
     },
 }
 
@@ -365,6 +371,7 @@ impl Element {
                 min_height: None,
                 container_id: None,
                 text_align: TextAlign::Left,
+                anchor: None,
             },
             WBounds::new(origin.x, origin.y, 0.0, DEFAULT_FONT_SIZE * LINE_HEIGHT),
             style,
@@ -421,6 +428,14 @@ impl Element {
             ElementKind::Text { wrap_width, .. } => *wrap_width,
             _ => None,
         }
+    }
+
+    /// True when the text is center-anchored: x is the box's horizontal
+    /// center line, so after (re)measurement the box must be re-centered on
+    /// `x + w/2` as measured before the width change.
+    pub fn is_center_anchored(&self) -> bool {
+        matches!(&self.kind,
+            ElementKind::Text { anchor: Some(a), .. } if a == "center")
     }
 
     #[allow(dead_code)]
