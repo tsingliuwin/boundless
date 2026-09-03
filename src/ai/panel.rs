@@ -1647,6 +1647,7 @@ fn tool_label(name: &str) -> &'static str {
         "draw_mindmap" => "思维导图",
         "set_canvas_background" => "底色",
         "use_skill" => "技能",
+        "add_page" => "页面",
         _ => "图形",
     }
 }
@@ -1678,6 +1679,7 @@ fn tool_op(name: &str) -> ToolOp {
         "list_elements" => ToolOp::Query,
         "set_canvas_background" => ToolOp::Config,
         "use_skill" => ToolOp::Skill,
+        "add_page" => ToolOp::Config,
         _ => ToolOp::Other,
     }
 }
@@ -2167,6 +2169,17 @@ fn tool_call_detail(name: &str, args: &serde_json::Value) -> String {
         "use_skill" => {
             let s = obj.get("name").and_then(|v| v.as_str()).unwrap_or("?");
             format!("场景技能「{s}」的构图规范（按需加载，非画布元素）")
+        }
+        "add_page" => {
+            let title = obj
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("未命名");
+            let ratio = obj
+                .get("ratio")
+                .and_then(|v| v.as_str())
+                .unwrap_or("16:9");
+            format!("「{title}」（{ratio}）")
         }
         _ => String::new(),
     };

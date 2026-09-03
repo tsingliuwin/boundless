@@ -2,6 +2,7 @@
 
 pub mod element;
 pub mod mindmap;
+pub mod pages;
 
 pub use element::*;
 
@@ -15,6 +16,10 @@ pub const SCENE_VERSION: u32 = 1;
 pub struct Scene {
     /// z-order: later elements are painted on top.
     pub elements: Vec<Element>,
+    /// Slide pages (scene/pages.rs): world-space rects declaring "this region
+    /// is slide N". Elements stay ordinary elements; pages only drive the
+    /// camera (flip/present) and rendering of the page frames.
+    pub pages: Vec<pages::Page>,
 }
 
 impl Scene {
@@ -183,6 +188,10 @@ pub struct SceneFile {
     /// blackboard theme. None = the default white board.
     #[serde(default)]
     pub background: Option<u32>,
+    /// Slide pages (scene/pages.rs). Empty for older scenes — the field is
+    /// serde-defaulted so pre-pages files load unchanged.
+    #[serde(default)]
+    pub pages: Vec<pages::Page>,
 }
 
 impl SceneFile {
@@ -194,6 +203,7 @@ impl SceneFile {
             elements: scene.elements.clone(),
             show_grid: false,
             background: None,
+            pages: scene.pages.clone(),
         }
     }
 
@@ -233,6 +243,23 @@ mod tests {
 
         assert!(SceneFile::parse(r#"{"type":"other","version":1}"#).is_err());
         assert!(SceneFile::parse(r#"{"type":"boundless-scene","version":99}"#).is_err());
+    }
+
+    #[test]
+    fn legacy_scene_without_pages_loads_and_roundtrips() {
+        // A pre-pages scene file: no `pages` field at all.
+        let legacy = r#"{"type":"boundless-scene","version":1,"elements":[]}"#;
+        let file = SceneFile::parse(legacy).unwrap();
+        assert!(file.pages.is_empty());
+
+        // A pages scene roundtrips its page list.
+        let with_pages = r#"{"type":"boundless-scene","version":1,"elements":[],
+            "pages":[{"title":"封面","x":0.0,"y":0.0,"w":1600.0,"h":900.0}]}"#;
+        let file = SceneFile::parse(with_pages).unwrap();
+        assert_eq!(file.pages.len(), 1);
+        assert_eq!(file.pages[0].title, "封面");
+        let json = serde_json::to_string(&file).unwrap();
+        assert_eq!(SceneFile::parse(&json).unwrap().pages.len(), 1);
     }
 
     #[test]

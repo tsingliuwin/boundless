@@ -10,9 +10,9 @@
 
 use boundless::board::{
     ArrowTool, BoardView, BringForward, BringToFront, CancelOp, CheckForUpdates, DeleteSelection,
-    DiamondTool, EllipseTool, EraserTool, HandTool, LineTool, OpenScene, PenTool, Quit, RectTool,
-    Redo, SaveScene, SelectTool, SendBackward, SendToBack, TextTool, ToggleAi, Undo, ZoomIn,
-    ZoomOut, ZoomReset,
+    DiamondTool, EllipseTool, EraserTool, GotoNextPage, GotoPrevPage, HandTool, LineTool,
+    OpenScene, PenTool, PresentExit, PresentStart, Quit, RectTool, Redo, SaveScene, SelectTool,
+    SendBackward, SendToBack, TextTool, ToggleAi, Undo, ZoomIn, ZoomOut, ZoomReset,
 };
 use gpui::*;
 use gpui_component::Root;
@@ -134,6 +134,17 @@ fn main() {
                 KeyBinding::new("ctrl--", ZoomOut, Some("Board")),
                 KeyBinding::new("ctrl-0", ZoomReset, Some("Board")),
                 KeyBinding::new("ctrl-b", ToggleAi, Some("Board")),
+                // Slide pages: flip while editing; full set while presenting
+                // (direction keys / PageUp-Down / space advance, Esc exits).
+                KeyBinding::new("pagedown", GotoNextPage, Some("Board")),
+                KeyBinding::new("pageup", GotoPrevPage, Some("Board")),
+                KeyBinding::new("f5", PresentStart, Some("Board")),
+                KeyBinding::new("right", GotoNextPage, Some("Presenting")),
+                KeyBinding::new("left", GotoPrevPage, Some("Presenting")),
+                KeyBinding::new("pagedown", GotoNextPage, Some("Presenting")),
+                KeyBinding::new("pageup", GotoPrevPage, Some("Presenting")),
+                KeyBinding::new("space", GotoNextPage, Some("Presenting")),
+                KeyBinding::new("escape", PresentExit, Some("Presenting")),
                 KeyBinding::new("v", SelectTool, Some(CANVAS)),
                 KeyBinding::new("h", HandTool, Some(CANVAS)),
                 KeyBinding::new("r", RectTool, Some(CANVAS)),

@@ -243,6 +243,18 @@ pub enum CanvasOp {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cy: Option<f64>,
     },
+    /// Open a new slide page: a titled world-space rectangle laid out after
+    /// the existing pages. The model then draws this page's content inside
+    /// the returned rect. Flipping/presenting is a viewer concern; pages are
+    /// just regions.
+    AddPage {
+        /// Page title shown on the page frame and the page bar, e.g. "封面".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        /// Aspect preset: "16:9" (default), "4:3", "9:16", "3:4", "1:1".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ratio: Option<String>,
+    },
 }
 
 /// One node of a mind map tree (recursive). Leaves omit `children`.
@@ -286,6 +298,7 @@ impl CanvasOp {
             CanvasOp::Clear => "清空",
             CanvasOp::SetBackground { .. } => "底色",
             CanvasOp::Mindmap { .. } => "思维导图",
+            CanvasOp::AddPage { .. } => "页面",
         }
     }
 }

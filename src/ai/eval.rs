@@ -54,6 +54,8 @@ pub struct VirtualElement {
 pub struct VirtualCanvas {
     pub background: Option<u32>,
     pub elements: Vec<VirtualElement>,
+    /// Slide pages created via `AddPage` (scene/pages.rs rects).
+    pub pages: Vec<crate::scene::pages::Page>,
     pub ops_applied: usize,
     pub ops_failed: usize,
 }
@@ -544,6 +546,27 @@ pub fn apply(
             msg = format!(
                 "已添加思维导图（{} 个节点）id={root8}",
                 layout.nodes.len()
+            );
+        }
+        CanvasOp::AddPage { title, ratio } => {
+            let r = match ratio.as_deref().map(crate::scene::pages::PageRatio::parse) {
+                Some(Some(r)) => r,
+                Some(None) => {
+                    c.ops_failed += 1;
+                    return Err("ratio 只支持 16:9 / 4:3 / 9:16 / 3:4 / 1:1".to_string());
+                }
+                None => crate::scene::pages::PageRatio::default(),
+            };
+            let (page, number) = crate::scene::pages::push_page(&mut c.pages, title.clone(), r);
+            c.ops_applied += 1;
+            msg = format!(
+                "已创建第 {number} 页「{}」（{}），区域 ({},{}) 尺寸 {}×{}。本页所有内容必须画在该矩形内（四周留 ≥30 边距），页面之间的空隙不要放任何元素。",
+                page.title,
+                r.label(),
+                page.x as i32,
+                page.y as i32,
+                page.w as i32,
+                page.h as i32
             );
         }
     }
@@ -1715,6 +1738,353 @@ pub fn evaluate_mindmap(
 
     let passed = checks.iter().all(|c| c.passed);
     EvalReport { passed, checks }
+}
+
+// ---------------------------------------------------------------------------
+// 幻灯片（PPT）rubric
+// ---------------------------------------------------------------------------
+
+/// Tool-call budget per page for a slide-deck run: a rich page (title + body
+/// blocks + decor + page number) costs ~12-18 calls. The ceiling scales with
+/// the actual page count so polished decks pass while a runaway loop
+/// (redrawing the same page over and over without adding pages) still fails.
+const SLIDES_BUDGET_PER_PAGE: usize = 20;
+const SLIDES_BUDGET_BASE: usize = 20;
+/// Elements may poke this far past their page's rect before counting as
+/// out-of-page (matches the board's BOUNDS_TOL spirit).
+const PAGE_CONTENT_TOL: f64 = 40.0;
+
+/// The page whose rect fully contains the element (with tolerance), i.e. the
+/// page the element belongs to. `None` = the element lives in the gap between
+/// pages or spans across two — always a defect.
+fn covering_page<'a>(
+    canvas: &'a VirtualCanvas,
+    e: &VirtualElement,
+    tol: f64,
+) -> Option<&'a crate::scene::pages::Page> {
+    canvas.pages.iter().find(|p| {
+        e.x >= p.x - tol
+            && e.y >= p.y - tol
+            && e.x + e.w <= p.x + p.w + tol
+            && e.y + e.h <= p.y + p.h + tol
+    })
+}
+
+/// Grade a replayed slide-deck run. Structure (page count, expected ratio),
+/// per-page content (each page has text + enough elements), placement
+/// discipline (no element in the gap between pages), per-page text
+/// non-overlap, and the usual hygiene checks.
+pub fn evaluate_slides(
+    canvas: &VirtualCanvas,
+    drew_anything: bool,
+    total_tool_calls: usize,
+    min_pages: usize,
+    expected: crate::scene::pages::PageRatio,
+) -> EvalReport {
+    let mut checks = Vec::new();
+    let texts: Vec<&VirtualElement> = canvas.texts().collect();
+
+    // -- 结构 --
+    checks.push(check(
+        "确实画了东西",
+        drew_anything,
+        if drew_anything {
+            "有绘制".to_string()
+        } else {
+            "未调用绘图工具".to_string()
+        },
+    ));
+    checks.push(check(
+        format!("页数 ≥ {min_pages}"),
+        canvas.pages.len() >= min_pages,
+        format!("共 {} 页", canvas.pages.len()),
+    ));
+
+    // -- 比例 --
+    let (ew, eh) = expected.size();
+    let expected_ar = ew / eh;
+    let wrong_ratio: Vec<String> = canvas
+        .pages
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| {
+            let ar = p.w / p.h;
+            (ar - expected_ar).abs() / expected_ar > 0.02
+        })
+        .map(|(i, p)| format!("第{}页 {:.2}:{}.expected {}", i + 1, p.w, p.h, expected.label()))
+        .collect();
+    checks.push(check(
+        format!("页面比例 = {}", expected.label()),
+        wrong_ratio.is_empty(),
+        if wrong_ratio.is_empty() {
+            format!("全部 {} 页比例正确", canvas.pages.len())
+        } else {
+            wrong_ratio.join("；")
+        },
+    ));
+
+    // -- 每页内容 --
+    let center = |e: &VirtualElement| (e.x + e.w / 2.0, e.y + e.h / 2.0);
+    let mut empty_pages: Vec<String> = Vec::new();
+    let mut textless_pages: Vec<String> = Vec::new();
+    for (i, p) in canvas.pages.iter().enumerate() {
+        let inside: Vec<&VirtualElement> = canvas
+            .elements
+            .iter()
+            .filter(|e| {
+                let (cx, cy) = center(e);
+                cx >= p.x && cx <= p.x + p.w && cy >= p.y && cy <= p.y + p.h
+            })
+            .collect();
+        if inside.len() < 2 {
+            empty_pages.push(format!("第{}页({}元素)", i + 1, inside.len()));
+        }
+        let has_text = inside
+            .iter()
+            .any(|e| matches!(e.kind, "text" | "label"));
+        if !has_text {
+            textless_pages.push(format!("第{}页", i + 1));
+        }
+    }
+    checks.push(check(
+        "每页都有内容（≥2 个元素）",
+        empty_pages.is_empty(),
+        if empty_pages.is_empty() {
+            "全部页面有内容".to_string()
+        } else {
+            empty_pages.join("；")
+        },
+    ));
+    checks.push(check(
+        "每页都有文字",
+        textless_pages.is_empty(),
+        if textless_pages.is_empty() {
+            "全部页面有文字".to_string()
+        } else {
+            format!("无文字: {}", textless_pages.join("、"))
+        },
+    ));
+
+    // -- 位置纪律：元素必须归属某页，不许落在页面之间的空隙 --
+    let strays: Vec<String> = canvas
+        .elements
+        .iter()
+        .filter(|e| covering_page(canvas, e, PAGE_CONTENT_TOL).is_none())
+        .map(|e| format!("{}({:.0},{:.0})", e.kind, e.x, e.y))
+        .collect();
+    checks.push(check(
+        "全部元素都在页面矩形内（无元素落在页间空隙）",
+        strays.is_empty(),
+        if strays.is_empty() {
+            "无越页元素".to_string()
+        } else {
+            format!("越页: {}", strays.join("、"))
+        },
+    ));
+
+    // -- 每页文本不重叠 --
+    let is_deco_glyph = |t: &VirtualElement| {
+        t.text
+            .as_deref()
+            .map(|s| {
+                s.chars()
+                    .filter(|c| !matches!(c, ' ' | '★' | '☆' | '●' | '◆' | '·'))
+                    .count()
+                    <= 2
+            })
+            .unwrap_or(false)
+    };
+    let mut overlaps: Vec<String> = Vec::new();
+    for (i, p) in canvas.pages.iter().enumerate() {
+        let page_texts: Vec<&&VirtualElement> = texts
+            .iter()
+            .filter(|t| {
+                let (cx, cy) = center(t);
+                cx >= p.x && cx <= p.x + p.w && cy >= p.y && cy <= p.y + p.h
+            })
+            .collect();
+        for a in 0..page_texts.len() {
+            for b in a + 1..page_texts.len() {
+                let (t1, t2) = (page_texts[a], page_texts[b]);
+                if is_deco_glyph(t1) || is_deco_glyph(t2) {
+                    continue;
+                }
+                if rects_overlap(t1, t2, 2.0) {
+                    overlaps.push(format!(
+                        "第{}页「{}」×「{}」",
+                        i + 1,
+                        t1.text.as_deref().unwrap_or("?").chars().take(5).collect::<String>(),
+                        t2.text.as_deref().unwrap_or("?").chars().take(5).collect::<String>(),
+                    ));
+                }
+            }
+        }
+    }
+    checks.push(check(
+        "页内文字两两不重叠",
+        overlaps.is_empty(),
+        if overlaps.is_empty() {
+            "无重叠".to_string()
+        } else {
+            overlaps.join("；")
+        },
+    ));
+
+    // -- 字面换行残留 --
+    const LITERAL_LF: &str = "\\n";
+    let literal_n: Vec<String> = texts
+        .iter()
+        .filter(|t| {
+            t.text
+                .as_deref()
+                .map(|s| s.contains(LITERAL_LF))
+                .unwrap_or(false)
+        })
+        .map(|t| {
+            format!(
+                "「{}…」",
+                t.text
+                    .as_deref()
+                    .unwrap_or("")
+                    .chars()
+                    .take(8)
+                    .collect::<String>()
+            )
+        })
+        .collect();
+    checks.push(check(
+        "无字面换行符残留",
+        literal_n.is_empty(),
+        if literal_n.is_empty() {
+            "无".to_string()
+        } else {
+            format!("含字面 \\n 的文本: {}", literal_n.join("、"))
+        },
+    ));
+
+    // -- 纪律 --
+    checks.push(check(
+        "无失败工具调用",
+        canvas.ops_failed == 0,
+        format!("失败 {} 次", canvas.ops_failed),
+    ));
+    let budget = SLIDES_BUDGET_BASE
+        + SLIDES_BUDGET_PER_PAGE * canvas.pages.len().max(min_pages);
+    let total = total_tool_calls.max(canvas.ops_applied + canvas.ops_failed);
+    checks.push(check(
+        format!("工具调用 ≤ {budget}（按页数缩放）"),
+        total <= budget,
+        format!("共 {total} 次"),
+    ));
+
+    let passed = checks.iter().all(|c| c.passed);
+    EvalReport { passed, checks }
+}
+
+#[cfg(test)]
+mod slides_tests {
+    use super::*;
+    use crate::ai::canvas_ops::CanvasStyle;
+    use crate::scene::pages::PageRatio;
+
+    fn page_op(title: &str, ratio: &str) -> (CanvasOp, Option<String>) {
+        (
+            CanvasOp::AddPage {
+                title: Some(title.into()),
+                ratio: Some(ratio.into()),
+            },
+            None,
+        )
+    }
+
+    fn text_op(page: &crate::scene::pages::Page, dy: f64, text: &str) -> (CanvasOp, Option<String>)
+    {
+        (
+            CanvasOp::Text {
+                x: page.x + 100.0,
+                y: page.y + 100.0 + dy,
+                text: text.into(),
+                font_size: Some(24.0),
+                align: None,
+                font_family: None,
+                wrap_width: None,
+                style: CanvasStyle::default(),
+            },
+            None,
+        )
+    }
+
+    fn sample_deck(pages: usize, ratio: &str) -> Vec<(CanvasOp, Option<String>)> {
+        let mut ops: Vec<(CanvasOp, Option<String>)> = Vec::new();
+        for i in 0..pages {
+            ops.push(page_op(&format!("第{}页", i + 1), ratio));
+            // Derive this page's rect from the ops so far (mirrors the board
+            // layout: each new page sits after the previous ones).
+            let canvas = replay(&ops);
+            let p = canvas.pages.last().unwrap().clone();
+            ops.push(text_op(&p, 0.0, "页标题"));
+            ops.push(text_op(&p, 60.0, "正文要点一二三"));
+        }
+        ops
+    }
+
+    #[test]
+    fn well_formed_deck_passes() {
+        let ops = sample_deck(5, "16:9");
+        let canvas = replay(&ops);
+        let report = evaluate_slides(&canvas, true, ops.len(), 5, PageRatio::Ratio16_9);
+        assert!(
+            report.passed,
+            "deck must pass:\n{}",
+            report.to_text()
+        );
+    }
+
+    #[test]
+    fn too_few_pages_fail() {
+        let ops = sample_deck(3, "16:9");
+        let canvas = replay(&ops);
+        let report = evaluate_slides(&canvas, true, ops.len(), 5, PageRatio::Ratio16_9);
+        assert!(report.checks.iter().any(|c| c.name.contains("页数") && !c.passed));
+    }
+
+    #[test]
+    fn wrong_ratio_fails() {
+        let ops = sample_deck(5, "9:16");
+        let canvas = replay(&ops);
+        let report = evaluate_slides(&canvas, true, ops.len(), 5, PageRatio::Ratio16_9);
+        assert!(report
+            .checks
+            .iter()
+            .any(|c| c.name.contains("比例") && !c.passed));
+    }
+
+    #[test]
+    fn element_in_gap_fails() {
+        let ops = sample_deck(2, "16:9");
+        // An element stranded in the gap between page 1 and page 2.
+        let gap_x = 1600.0 + crate::scene::pages::PAGE_GAP / 2.0;
+        let mut ops = ops;
+        ops.push((
+            CanvasOp::Text {
+                x: gap_x,
+                y: 100.0,
+                text: "漂在缝隙里".into(),
+                font_size: Some(24.0),
+                align: None,
+                font_family: None,
+                wrap_width: None,
+                style: CanvasStyle::default(),
+            },
+            None,
+        ));
+        let canvas = replay(&ops);
+        let report = evaluate_slides(&canvas, true, ops.len(), 2, PageRatio::Ratio16_9);
+        assert!(report
+            .checks
+            .iter()
+            .any(|c| c.name.contains("页间空隙") && !c.passed));
+    }
 }
 
 #[cfg(test)]

@@ -14,6 +14,7 @@ use crate::history::History;
 use crate::render::rough::{color_u32, paths_for_element, ReadyPath};
 use crate::render::{dot_grid, handle_rects, measure_text, point_handle_rects, ShapedTextLine};
 use crate::scene::{
+    pages::PageRatio,
     Element, ElementId, ElementKind, ElementStyle, LineType, Scene, SceneFile, StrokeStyle,
     TextAlign, WBounds, WPoint, DEFAULT_FONT_SIZE, LINE_HEIGHT,
 };
@@ -50,6 +51,10 @@ actions!(
         SendBackward,
         Quit,
         CheckForUpdates,
+        GotoPrevPage,
+        GotoNextPage,
+        PresentStart,
+        PresentExit,
     ]
 );
 
@@ -159,6 +164,10 @@ pub struct BoardView {
     /// default white board. Switchable from the zoom-bar swatches and by the
     /// AI (`set_canvas_background`); persisted in the scene file.
     canvas_background: Option<u32>,
+    /// Slide-presentation mode: Some(page index) while presenting. The camera
+    /// fits exactly to that page's rect, all floating chrome hides, and
+    /// PageUp/PageDown/Escape flip or exit. None = normal editing view.
+    presenting: Option<usize>,
     /// Index of the currently open top-level menu in the Windows in-app menu
     /// bar (None = all collapsed). Unused on macOS, which uses the native
     /// `set_menus` bar; the field compiles everywhere because the menu-bar
@@ -214,6 +223,7 @@ impl BoardView {
             context_menu: None,
             show_grid: false,
             canvas_background: None,
+            presenting: None,
             menubar_open: None,
             update_state: crate::updater::UpdateState::default(),
             render_cache: crate::render::cache::RenderCache::new(),
@@ -1130,6 +1140,32 @@ impl BoardView {
                     &root_id.to_string()[..8]
                 ))
             }
+            CanvasOp::AddPage { title, ratio } => {
+                let r = match ratio.as_deref().map(PageRatio::parse) {
+                    Some(Some(r)) => r,
+                    Some(None) => {
+                        return Err(CanvasOpError::invalid_args(
+                            "ratio 只支持 16:9 / 4:3 / 9:16 / 3:4 / 1:1",
+                        ));
+                    }
+                    None => PageRatio::default(),
+                };
+                let (rect, title, number) = {
+                    let (p, n) =
+                        crate::scene::pages::push_page(&mut self.scene.pages, title, r);
+                    (p.bounds(), p.title.clone(), n)
+                };
+                self.mark_dirty();
+                cx.notify();
+                Ok(format!(
+                    "已创建第 {number} 页「{title}」（{}），区域 ({},{}) 尺寸 {}×{}。本页所有内容必须画在该矩形内（四周留 ≥30 边距），页面之间的空隙不要放任何元素。",
+                    r.label(),
+                    rect.x as i32,
+                    rect.y as i32,
+                    rect.w as i32,
+                    rect.h as i32
+                ))
+            }
             CanvasOp::UpdateElement {
                 id,
                 x,
@@ -1395,6 +1431,26 @@ impl BoardView {
             }
         }
 
+        // Slide pages: the model must know which page rects exist so new
+        // content lands inside a page (never in the gap between pages).
+        if !self.scene.pages.is_empty() {
+            body.push_str(&format!(
+                "幻灯片页面：共 {} 页（内容须画在对应页面矩形内）\n",
+                self.scene.pages.len()
+            ));
+            for (i, p) in self.scene.pages.iter().enumerate() {
+                body.push_str(&format!(
+                    "第 {} 页「{}」：({:.0},{:.0}) {}×{}\n",
+                    i + 1,
+                    p.title,
+                    p.x,
+                    p.y,
+                    p.w,
+                    p.h
+                ));
+            }
+        }
+
         body.push_str(&self.style_summary());
         body
     }
@@ -1421,9 +1477,7 @@ impl BoardView {
         )
     }
 
-    /// World-space point at the center of the visible canvas. Kept for future
-    /// auto-layout use; box/text ops currently carry absolute coordinates.
-    #[allow(dead_code)]
+    /// World-space point at the center of the visible canvas.
     fn viewport_center_world(&self) -> WPoint {
         let center_screen = point(
             self.canvas_bounds.origin.x + self.canvas_bounds.size.width * 0.5,
@@ -1801,6 +1855,7 @@ impl BoardView {
         let file = SceneFile {
             show_grid: self.show_grid,
             background: self.canvas_background,
+            pages: self.scene.pages.clone(),
             ..file
         };
         let result = serde_json::to_string_pretty(&file)
@@ -1830,6 +1885,7 @@ impl BoardView {
         match result {
             Ok(file) => {
                 self.scene.restore(file.elements);
+                self.scene.pages = file.pages;
                 self.camera = file.camera;
                 self.show_grid = file.show_grid;
                 self.canvas_background = file.background;
@@ -1854,6 +1910,97 @@ impl BoardView {
     pub fn set_canvas_background(&mut self, color: Option<u32>, cx: &mut Context<Self>) {
         self.canvas_background = color;
         self.mark_dirty();
+        cx.notify();
+    }
+
+    // ------------------------------------------------------------------
+    // slide pages: flip / present / add
+
+    /// The page the camera is currently looking at (whose rect contains the
+    /// viewport center), if the board has pages.
+    fn current_page_index(&self) -> Option<usize> {
+        if self.scene.pages.is_empty() {
+            return None;
+        }
+        let c = self.viewport_center_world();
+        crate::scene::pages::page_at(&self.scene.pages, c.x, c.y)
+    }
+
+    /// Camera-fit exactly to a page's rect (no margin) — the flip/present view.
+    fn fit_to_page(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(p) = self.scene.pages.get(index) else {
+            return;
+        };
+        let vp = self.viewport_bounds(cx);
+        self.camera.zoom_to_rect_exact(p.bounds(), vp.size);
+        cx.notify();
+    }
+
+    /// Flip to a page by index (clamped). Enters presentation mode if
+    /// presenting, otherwise just moves the camera.
+    fn goto_page(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.scene.pages.is_empty() {
+            return;
+        }
+        let i = index.min(self.scene.pages.len() - 1);
+        if self.presenting.is_some() {
+            self.presenting = Some(i);
+        }
+        self.fit_to_page(i, cx);
+    }
+
+    fn goto_prev_page(&mut self, cx: &mut Context<Self>) {
+        let cur = self.current_page_index().unwrap_or(0);
+        self.goto_page(cur.saturating_sub(1), cx);
+    }
+
+    fn goto_next_page(&mut self, cx: &mut Context<Self>) {
+        let cur = self.current_page_index().unwrap_or(0);
+        self.goto_page(cur + 1, cx);
+    }
+
+    /// Enter presentation mode from the current page (or page 1).
+    fn start_presenting(&mut self, cx: &mut Context<Self>) {
+        if self.scene.pages.is_empty() {
+            self.set_notice("画布上还没有幻灯片页面", cx);
+            return;
+        }
+        let start = self.current_page_index().unwrap_or(0);
+        self.presenting = Some(start);
+        self.fit_to_page(start, cx);
+    }
+
+    /// Leave presentation mode; keep the camera on the last page (with the
+    /// regular fit margin so editing can resume comfortably).
+    fn exit_presenting(&mut self, cx: &mut Context<Self>) {
+        let last = self.presenting.take();
+        if let Some(i) = last {
+            if let Some(p) = self.scene.pages.get(i) {
+                let vp = self.viewport_bounds(cx);
+                let mut cam = self.camera;
+                cam.zoom_to_fit(p.bounds(), vp.size);
+                self.camera = cam;
+            }
+        }
+        cx.notify();
+    }
+
+    /// Manually add a page (zoom-bar button). The AI creates pages via the
+    /// `add_page` tool with an explicit ratio; manual pages use the default
+    /// 16:9 and land after the current last page.
+    fn add_page_manual(&mut self, cx: &mut Context<Self>) {
+        let (rect, title, number) = {
+            let (page, number) = crate::scene::pages::push_page(
+                &mut self.scene.pages,
+                None,
+                PageRatio::default(),
+            );
+            (page.bounds(), page.title.clone(), number)
+        };
+        self.mark_dirty();
+        let vp = self.viewport_bounds(cx);
+        self.camera.zoom_to_fit(rect, vp.size);
+        self.set_notice(format!("已添加第 {number} 页「{title}」"), cx);
         cx.notify();
     }
 
@@ -3309,6 +3456,10 @@ struct BoardPaint {
     /// Canvas surface color (blackboard theme); painted before everything.
     background: Option<PaintQuad>,
     grid: Vec<PaintQuad>,
+    /// Slide-page frames (scene/pages.rs): border strips + the page-title
+    /// label, painted under the elements.
+    page_frames: Vec<PaintQuad>,
+    page_labels: Vec<TextPaintItem>,
     paths: Vec<ReadyPath>,
     texts: Vec<TextPaintItem>,
     editing: Option<EditingPaint>,
@@ -3347,6 +3498,63 @@ impl BoardView {
         } else {
             Vec::new()
         };
+
+        // Slide-page frames: a thin border around each page rect plus the
+        // "N. 标题" label at its top-left, so pages read as pages. Painted
+        // under the elements (a dark page fill later can sit on top).
+        let mut page_frames = Vec::new();
+        let mut page_labels = Vec::new();
+        for (i, p) in self.scene.pages.iter().enumerate() {
+            if !p.bounds().inflate(80.0, 80.0).intersects(&view_world) {
+                continue;
+            }
+            // Border strips in world units so the frame zooms with content.
+            const T: f64 = 2.5;
+            let strips = [
+                WBounds::new(p.x, p.y, p.w, T),                     // top
+                WBounds::new(p.x, p.y + p.h - T, p.w, T),           // bottom
+                WBounds::new(p.x, p.y, T, p.h),                     // left
+                WBounds::new(p.x + p.w - T, p.y, T, p.h),           // right
+            ];
+            for s in strips {
+                page_frames.push(gpui::fill(
+                    self.world_bounds_to_screen(s),
+                    color_u32(0x9aa0a6, 0.9),
+                ));
+            }
+            let label = format!("{}. {}", i + 1, p.title);
+            let shaped = self.text_cache.shaped(
+                &label,
+                16.0,
+                crate::render::HANDWRITTEN_FONT,
+                None,
+                color_u32(0x6b7280, 1.0),
+                &self.camera,
+                window,
+            );
+            let label_w = shaped
+                .lines
+                .iter()
+                .map(|l| l.width)
+                .fold(px(1.0), |a: Pixels, b| a.max(b));
+            let label_h = shaped.line_height * shaped.lines.len().max(1) as f32;
+            let screen_origin = self
+                .camera
+                .world_to_screen(WPoint::new(p.x, p.y - 30.0), origin);
+            let label_bounds = Bounds {
+                origin: screen_origin,
+                size: size(self.camera.scale(200.0).max(label_w), label_h),
+            };
+            let offs = line_offsets(&shaped.lines, label_bounds.size.width, TextAlign::Left);
+            page_labels.push(TextPaintItem {
+                lines: shaped.lines,
+                line_offsets: offs,
+                origin: screen_origin,
+                line_height: shaped.line_height,
+                bounds: label_bounds,
+                background: None,
+            });
+        }
 
         let editing_id = self.editing.as_ref().map(|e| e.element_id);
         let mut paths = Vec::new();
@@ -3547,6 +3755,8 @@ impl BoardView {
         BoardPaint {
             background,
             grid,
+            page_frames,
+            page_labels,
             paths,
             texts,
             editing,
@@ -3796,6 +4006,12 @@ impl Render for BoardView {
                     for q in paint.grid {
                         window.paint_quad(q);
                     }
+                    for q in paint.page_frames {
+                        window.paint_quad(q);
+                    }
+                    for item in &paint.page_labels {
+                        paint_text_item(item, window, cx);
+                    }
                     for rp in paint.paths {
                         window.paint_path(rp.path, rp.color);
                     }
@@ -3841,19 +4057,27 @@ impl Render for BoardView {
         // Windows-only in-app menu bar (None on macOS, which uses the native
         // `set_menus` bar). Computed before the chain so the builder doesn't
         // hold a borrow of `self`/`cx` alongside the chain's own use.
-        let menubar = if cfg!(target_os = "windows") {
+        // Hidden while presenting.
+        let presenting = self.presenting.is_some();
+        let menubar = if cfg!(target_os = "windows") && !presenting {
             Some(self.render_menu_bar(window, cx))
         } else {
             None
         };
-        let menubar_dropdown = if cfg!(target_os = "windows") {
+        let menubar_dropdown = if cfg!(target_os = "windows") && !presenting {
             self.render_menu_dropdown(cx)
         } else {
             None
         };
 
         div()
-            .key_context(if editing { "Editor" } else { "Board" })
+            .key_context(if presenting {
+                "Presenting"
+            } else if editing {
+                "Editor"
+            } else {
+                "Board"
+            })
             .track_focus(&self.focus_handle)
             .size_full()
             .flex()
@@ -3923,6 +4147,18 @@ impl Render for BoardView {
             .on_action(cx.listener(|this, _: &CheckForUpdates, _window, cx| {
                 this.check_for_updates(cx, false)
             }))
+            .on_action(
+                cx.listener(|this, _: &GotoPrevPage, _window, cx| this.goto_prev_page(cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &GotoNextPage, _window, cx| this.goto_next_page(cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &PresentStart, _window, cx| this.start_presenting(cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &PresentExit, _window, cx| this.exit_presenting(cx)),
+            )
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_left_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_down))
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_down))
@@ -3939,20 +4175,25 @@ impl Render for BoardView {
                 // absolute-positioned chrome (toolbar `top_3`, zoom bar
                 // `bottom_3`, AI panel `right_0/top_0`) anchored here, and
                 // `flex_1().min_h_0()` makes it fill the remaining height.
+                // Presentation mode renders canvas + overlay only.
                 div()
                     .relative()
                     .flex_1()
                     .min_h_0()
                     .overflow_hidden()
                     .child(canvas_el)
-                    .child(self.render_toolbar(cx))
-                    .child(self.render_style_bar(cx))
-                    .child(self.render_element_info(cx))
-                    .child(self.render_zoom_bar(cx))
-                    .child(self.render_notice_bar())
-                    .children(self.render_update_banner(cx))
-                    .children(self.render_context_menu(cx))
-                    .children(self.ai_panel.clone()),
+                    .when(presenting, |d| d.child(self.render_present_overlay()))
+                    .when(!presenting, |d| {
+                        d.child(self.render_toolbar(cx))
+                            .child(self.render_style_bar(cx))
+                            .child(self.render_element_info(cx))
+                            .child(self.render_zoom_bar(cx))
+                            .child(self.render_page_bar(cx))
+                            .child(self.render_notice_bar())
+                            .children(self.render_update_banner(cx))
+                            .children(self.render_context_menu(cx))
+                            .children(self.ai_panel.clone())
+                    })
             )
             // Dropdown overlay rendered last so it paints above the canvas.
             .when_some(menubar_dropdown, |d, dd| d.child(dd))
@@ -5565,8 +5806,76 @@ impl BoardView {
             )
     }
 
-    fn render_notice_bar(&self) -> impl IntoElement {
-        let mut text = String::new();
+    /// Bottom-left slide page bar: prev/next, page indicator, present, add.
+    /// Shown whenever the board is in editing mode (always, so a deck can be
+    /// started before any page exists).
+    fn render_page_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let weak = cx.weak_entity();
+        let (weak_prev, weak_next, weak_present, weak_add) =
+            (weak.clone(), weak.clone(), weak.clone(), weak.clone());
+        let total = self.scene.pages.len();
+        let current = self
+            .current_page_index()
+            .map(|i| i + 1)
+            .unwrap_or(if total > 0 { 1 } else { 0 });
+        let indicator = if total > 0 {
+            format!("{current}/{total}")
+        } else {
+            "–".to_string()
+        };
+        bar_container()
+            .absolute()
+            .bottom_3()
+            .left_3()
+            .child(bar_button("‹", false).on_click(move |_, _, cx| {
+                weak_prev.update(cx, |this, cx| this.goto_prev_page(cx)).ok();
+            }))
+            .child(
+                div()
+                    .id("page-indicator")
+                    .w_10()
+                    .text_center()
+                    .text_sm()
+                    .child(indicator),
+            )
+            .child(bar_button("›", false).on_click(move |_, _, cx| {
+                weak_next.update(cx, |this, cx| this.goto_next_page(cx)).ok();
+            }))
+            .child(bar_button("▶", false).on_click(move |_, _, cx| {
+                weak_present.update(cx, |this, cx| this.start_presenting(cx)).ok();
+            }))
+            .child(bar_button("＋页", false).on_click(move |_, _, cx| {
+                weak_add.update(cx, |this, cx| this.add_page_manual(cx)).ok();
+            }))
+    }
+
+    /// Full-screen presentation overlay: the current page number and the
+    /// flip/exit hints, painted as floating chrome over the canvas.
+    fn render_present_overlay(&self) -> impl IntoElement {
+        let total = self.scene.pages.len();
+        let current = self.presenting.map(|i| i + 1).unwrap_or(1);
+        div()
+            .absolute()
+            .bottom_4()
+            .left_0()
+            .right_0()
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .bg(gpui::black().opacity(0.55))
+                    .text_color(gpui::white())
+                    .text_sm()
+                    .child(format!(
+                        "{current}/{total}　·　PageUp/PageDown 翻页　·　Esc 退出"
+                    )),
+            )
+    }
+
+    fn render_notice_bar(&self) -> impl IntoElement {        let mut text = String::new();
         if let Some(path) = &self.file_path {
             text.push_str(
                 path.file_name()

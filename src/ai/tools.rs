@@ -1187,6 +1187,86 @@ impl Tool for UseSkillTool {
     }
 }
 
+// --- Add Page ----------------------------------------------------------------
+
+/// Arguments for `add_page`.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct AddPageArgs {
+    /// 页标题（显示在页面框上方和页面栏），如 "封面"、"目录"。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// 页面比例预设："16:9"（默认）、"4:3"、"9:16"（竖屏）、"3:4"、"1:1"。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ratio: Option<String>,
+}
+
+/// Opens a new slide page: a titled world-space rect laid out after the
+/// existing pages. The tool result reports the page rect; the model draws
+/// that page's content inside it. Flip/present is a viewer concern handled
+/// by the page bar (PageUp/PageDown / F5).
+pub struct AddPageTool {
+    pub events: UnboundedSender<AgentEvent>,
+}
+
+impl Tool for AddPageTool {
+    const NAME: &'static str = "add_page";
+    type Error = ToolError;
+    type Args = AddPageArgs;
+    type Output = String;
+
+    fn definition(
+        &self,
+        _prompt: String,
+    ) -> impl std::future::Future<Output = ToolDefinition> + Send {
+        let def = tool_def::<AddPageArgs>(
+            Self::NAME,
+            "新建一张幻灯片页面（PPT 翻页用）。返回页面矩形；本页的所有内容必须画在该矩形内。制作 PPT/演示文稿时，每页先调用本工具（可带 title 和 ratio），再绘制页面内容。",
+        );
+        async move { def }
+    }
+
+    fn call(
+        &self,
+        args: Self::Args,
+    ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
+        let events = self.events.clone();
+        let name = Self::NAME;
+        async move {
+            if let Some(t) = &args.title {
+                if t.trim().chars().count() > 30 {
+                    return fail_tool(
+                        &events,
+                        next_tool_id(name),
+                        name,
+                        serde_json::to_value(&args).unwrap_or(Value::Null),
+                        ToolError::invalid_args("页面标题不要超过 30 字"),
+                    )
+                    .await;
+                }
+            }
+            if let Some(r) = &args.ratio {
+                if crate::scene::pages::PageRatio::parse(r).is_none() {
+                    return fail_tool(
+                        &events,
+                        next_tool_id(name),
+                        name,
+                        serde_json::to_value(&args).unwrap_or(Value::Null),
+                        ToolError::invalid_args("ratio 只支持 16:9 / 4:3 / 9:16 / 3:4 / 1:1"),
+                    )
+                    .await;
+                }
+            }
+            let id = next_tool_id(name);
+            let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
+            let op = CanvasOp::AddPage {
+                title: args.title,
+                ratio: args.ratio,
+            };
+            run_canvas_op(&events, id, name, args_json, op, None).await
+        }
+    }
+}
+
 // --- List Elements ---------------------------------------------------------
 
 /// A lightweight summary of one canvas element, for the `list_elements` tool.
@@ -1316,6 +1396,9 @@ pub fn all_tools(
         Box::new(UseSkillTool {
             events: events.clone(),
             active: active_skill,
+        }),
+        Box::new(AddPageTool {
+            events: events.clone(),
         }),
         Box::new(ListElementsTool { snapshot }),
     ]

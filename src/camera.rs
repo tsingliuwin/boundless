@@ -81,6 +81,20 @@ impl Camera {
         self.x = bounds.x + bounds.w / 2.0 - viewport.width.to_f64() / self.zoom / 2.0;
         self.y = bounds.y + bounds.h / 2.0 - viewport.height.to_f64() / self.zoom / 2.0;
     }
+
+    /// Fit the world rect exactly (no margin): the rect fills the viewport
+    /// edge to edge. The presentation view for one slide page — neighbors sit
+    /// beyond the page gap, so nothing else leaks into the frame.
+    pub fn zoom_to_rect_exact(&mut self, bounds: crate::scene::WBounds, viewport: gpui::Size<Pixels>) {
+        if bounds.w <= 0.0 || bounds.h <= 0.0 {
+            return;
+        }
+        let zx = viewport.width.to_f64() / bounds.w;
+        let zy = viewport.height.to_f64() / bounds.h;
+        self.zoom = zx.min(zy).clamp(MIN_ZOOM, MAX_ZOOM);
+        self.x = bounds.x + bounds.w / 2.0 - viewport.width.to_f64() / self.zoom / 2.0;
+        self.y = bounds.y + bounds.h / 2.0 - viewport.height.to_f64() / self.zoom / 2.0;
+    }
 }
 
 #[cfg(test)]
