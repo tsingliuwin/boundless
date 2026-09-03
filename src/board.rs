@@ -1155,6 +1155,13 @@ impl BoardView {
                         crate::scene::pages::push_page(&mut self.scene.pages, title, r);
                     (p.bounds(), p.title.clone(), n)
                 };
+                // Bring the camera to the new page: the user watches the model
+                // compose each slide in turn. Without this, a page opened off-
+                // screen draws invisibly and the canvas looks frozen.
+                let vp = self.viewport_bounds(cx);
+                let mut cam = self.camera;
+                cam.zoom_to_fit(rect, vp.size);
+                self.camera = cam;
                 self.mark_dirty();
                 cx.notify();
                 Ok(format!(
