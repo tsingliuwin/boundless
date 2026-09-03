@@ -1,6 +1,7 @@
 //! The scene: an ordered collection of elements plus file (de)serialization.
 
 pub mod element;
+pub mod mindmap;
 
 pub use element::*;
 

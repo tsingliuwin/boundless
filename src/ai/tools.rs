@@ -22,7 +22,8 @@ use serde_json::Value;
 
 use super::agent::{next_tool_id, AgentEvent};
 use super::canvas_ops::{
-    CanvasOp, CanvasOpError, CanvasOpErrorCode, CanvasOpOutcome, CanvasStyle, OpPoint, OpTextAlign,
+    CanvasOp, CanvasOpError, CanvasOpErrorCode, CanvasOpOutcome, CanvasStyle, OpMindmapNode,
+    OpPoint, OpTextAlign,
 };
 use super::client::ChatMessage;
 
@@ -984,6 +985,124 @@ impl Tool for PolygonTool {
     }
 }
 
+// --- Mind Map --------------------------------------------------------------
+
+/// Arguments for `draw_mindmap`.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct MindmapArgs {
+    /// The root of the mind map tree, e.g.
+    /// `{"text":"中心主题","children":[{"text":"分支","children":[{"text":"要点"}]}]}`.
+    /// Layout (positions, colors, links) is computed automatically — supply
+    /// only the texts. Keep node text a ≤ 20-char single-line keyword;
+    /// whole tree ≤ 40 nodes and ≤ 5 levels.
+    pub root: OpMindmapNode,
+    /// Root center X in world coordinates. Omit = canvas center (800).
+    #[serde(default)]
+    pub cx: Option<f64>,
+    /// Root center Y in world coordinates. Omit = canvas center (500).
+    #[serde(default)]
+    pub cy: Option<f64>,
+}
+
+/// Tree limits mirroring the system prompt's guidance; keeps the auto-fit
+/// layout inside readable font sizes.
+const MINDMAP_MAX_NODES: usize = 40;
+const MINDMAP_MAX_DEPTH: usize = 5;
+const MINDMAP_MAX_TEXT: usize = 20;
+
+fn validate_mindmap_text(node: &OpMindmapNode) -> Result<(), ToolError> {
+    let t = node.text.trim();
+    if t.is_empty() {
+        return Err(ToolError::invalid_args("节点文字不能为空"));
+    }
+    if t.contains('\n') {
+        return Err(ToolError::invalid_args(
+            "节点文字必须是单行（不能含换行）",
+        ));
+    }
+    if t.chars().count() > MINDMAP_MAX_TEXT {
+        return Err(ToolError::invalid_args(format!(
+            "节点文字「{}…」超过 {MINDMAP_MAX_TEXT} 字上限，请精炼成关键词短语",
+            t.chars().take(12).collect::<String>()
+        )));
+    }
+    for c in &node.children {
+        validate_mindmap_text(c)?;
+    }
+    Ok(())
+}
+
+fn validate_mindmap(args: &MindmapArgs) -> Result<(), ToolError> {
+    if let Some(cx) = args.cx {
+        if !cx.is_finite() {
+            return Err(ToolError::invalid_args("cx 必须是有限数值"));
+        }
+    }
+    if let Some(cy) = args.cy {
+        if !cy.is_finite() {
+            return Err(ToolError::invalid_args("cy 必须是有限数值"));
+        }
+    }
+    validate_mindmap_text(&args.root)?;
+    let input = crate::scene::mindmap::MindmapNodeInput::from(&args.root);
+    let n = crate::scene::mindmap::count_nodes(&input);
+    if n > MINDMAP_MAX_NODES {
+        return Err(ToolError::invalid_args(format!(
+            "思维导图共 {n} 个节点，超过 {MINDMAP_MAX_NODES} 上限——请删减要点或拆成两张图"
+        )));
+    }
+    let d = crate::scene::mindmap::max_depth(&input);
+    if d > MINDMAP_MAX_DEPTH {
+        return Err(ToolError::invalid_args(format!(
+            "思维导图深度 {d} 层，超过 {MINDMAP_MAX_DEPTH} 层上限"
+        )));
+    }
+    Ok(())
+}
+
+pub struct MindmapTool {
+    pub events: UnboundedSender<AgentEvent>,
+}
+
+impl Tool for MindmapTool {
+    const NAME: &'static str = "draw_mindmap";
+    type Error = ToolError;
+    type Args = MindmapArgs;
+    type Output = String;
+
+    fn definition(
+        &self,
+        _prompt: String,
+    ) -> impl std::future::Future<Output = ToolDefinition> + Send {
+        let def = tool_def::<MindmapArgs>(
+            Self::NAME,
+            "画一张完整的思维导图。root 是嵌套树（text + children），只需给出文字内容：布局（左右均衡、节点位置、曲线连线、分支配色）全部自动计算，禁止自己用矩形+连线拼导图。中心主题 1 个，一级分支 3~6 个，每个分支 2~5 个要点；节点文字为 ≤20 字的单行关键词。",
+        );
+        async move { def }
+    }
+
+    fn call(
+        &self,
+        args: Self::Args,
+    ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
+        let events = self.events.clone();
+        let name = Self::NAME;
+        async move {
+            let id = next_tool_id(name);
+            let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
+            if let Err(e) = validate_mindmap(&args) {
+                return fail_tool(&events, id, name, args_json, e).await;
+            }
+            let op = CanvasOp::Mindmap {
+                root: args.root,
+                cx: args.cx,
+                cy: args.cy,
+            };
+            run_canvas_op(&events, id, name, args_json, op, Some(new_element_id())).await
+        }
+    }
+}
+
 // --- List Elements ---------------------------------------------------------
 
 /// A lightweight summary of one canvas element, for the `list_elements` tool.
@@ -1106,6 +1225,9 @@ pub fn all_tools(
         Box::new(PolygonTool {
             events: events.clone(),
         }),
+        Box::new(MindmapTool {
+            events: events.clone(),
+        }),
         Box::new(ListElementsTool { snapshot }),
     ]
 }
@@ -1172,6 +1294,106 @@ mod tests {
         assert!(snapshot_has_id(&s, "a1b2c3d4"));
         assert!(snapshot_has_id(&s, "a1b2"));
         assert!(!snapshot_has_id(&s, "deadbeef"));
+    }
+
+    fn mindmap_args(root: OpMindmapNode) -> MindmapArgs {
+        MindmapArgs {
+            root,
+            cx: None,
+            cy: None,
+        }
+    }
+
+    #[test]
+    fn validate_mindmap_accepts_reasonable_tree() {
+        let tree = OpMindmapNode {
+            text: "高效学习方法".into(),
+            children: vec![OpMindmapNode {
+                text: "主动回忆".into(),
+                children: vec![
+                    OpMindmapNode {
+                        text: "自测".into(),
+                        children: vec![],
+                    },
+                    OpMindmapNode {
+                        text: "闪卡".into(),
+                        children: vec![],
+                    },
+                ],
+            }],
+        };
+        assert!(validate_mindmap(&mindmap_args(tree)).is_ok());
+    }
+
+    #[test]
+    fn validate_mindmap_rejects_bad_text() {
+        let mk = |t: &str| OpMindmapNode {
+            text: t.into(),
+            children: vec![],
+        };
+        for bad in ["", "  ", "一\n二"] {
+            assert!(validate_mindmap(&mindmap_args(mk(bad))).is_err(), "{bad}");
+        }
+        let long = "这个词组远远超过了二十个字的节点上限确实太长了";
+        assert_eq!(long.chars().count(), 23);
+        assert!(validate_mindmap(&mindmap_args(mk(long))).is_err());
+        // A deep node's bad text is caught too.
+        let tree = OpMindmapNode {
+            text: "根".into(),
+            children: vec![OpMindmapNode {
+                text: "枝".into(),
+                children: vec![mk("一\n二")],
+            }],
+        };
+        assert!(validate_mindmap(&mindmap_args(tree)).is_err());
+    }
+
+    #[test]
+    fn validate_mindmap_rejects_oversize_tree() {
+        // 41 nodes > 40 cap.
+        let mut root = OpMindmapNode {
+            text: "根".into(),
+            children: vec![],
+        };
+        for i in 0..40 {
+            root.children.push(OpMindmapNode {
+                text: format!("叶{i}"),
+                children: vec![],
+            });
+        }
+        assert_eq!(crate::scene::mindmap::count_nodes(
+            &crate::scene::mindmap::MindmapNodeInput::from(&root)
+        ), 41);
+        assert!(validate_mindmap(&mindmap_args(root)).is_err());
+    }
+
+    #[test]
+    fn validate_mindmap_rejects_too_deep() {
+        let mut n = OpMindmapNode {
+            text: "第六层".into(),
+            children: vec![],
+        };
+        for t in ["第五层", "第四层", "第三层", "第二层", "根"] {
+            n = OpMindmapNode {
+                text: t.into(),
+                children: vec![n],
+            };
+        }
+        assert!(validate_mindmap(&mindmap_args(n)).is_err());
+    }
+
+    #[test]
+    fn validate_mindmap_rejects_non_finite_center() {
+        let tree = OpMindmapNode {
+            text: "根".into(),
+            children: vec![],
+        };
+        let args = MindmapArgs {
+            root: tree,
+            cx: Some(f64::NAN),
+            cy: None,
+        };
+        assert!(validate_mindmap(&args).is_err());
     }
 
     #[test]

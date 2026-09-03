@@ -42,6 +42,11 @@ pub struct VirtualElement {
     pub fill: Option<u32>,
     /// Element opacity (0..1) — the ink-wash rubric grades ink density.
     pub opacity: f64,
+    /// Real polyline geometry for point-based elements (lines/arrows and
+    /// mind-map links), `None` for boxes. The mind-map rubric checks link
+    /// crossings and node intrusions against actual segments, not bboxes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub points: Option<Vec<[f64; 2]>>,
 }
 
 /// The virtual canvas state after replaying a run's ops.
@@ -327,6 +332,12 @@ pub fn apply(
                 stroke: style.stroke.unwrap_or(0x1e1e1e),
                 fill: style.fill,
                 opacity: f64::from(style.opacity.unwrap_or(1.0)),
+                points: Some(
+                    points
+                        .iter()
+                        .map(|p| [p.x, p.y])
+                        .collect(),
+                ),
             });
             c.ops_applied += 1;
             msg = format!("已添加多边形 id={id8}");
@@ -391,6 +402,7 @@ pub fn apply(
                 stroke: style.stroke.unwrap_or(0x1e1e1e),
                 fill: style.fill,
                 opacity: f64::from(style.opacity.unwrap_or(1.0)),
+                points: Some(points.iter().map(|p| [p.x, p.y]).collect()),
             });
             if let Some(t) = text {
                 if !t.is_empty() {
@@ -407,6 +419,7 @@ pub fn apply(
                         stroke: style.stroke.unwrap_or(0x1e1e1e),
                         fill: None,
                         opacity: f64::from(style.opacity.unwrap_or(1.0)),
+                        points: None,
                     });
                 }
             }
@@ -447,9 +460,89 @@ pub fn apply(
                 stroke: style.stroke.unwrap_or(0x1e1e1e),
                 fill: style.fill,
                 opacity: f64::from(style.opacity.unwrap_or(1.0)),
+                points: None,
             });
             c.ops_applied += 1;
             msg = format!("已添加文本 id={id8}");
+        }
+        CanvasOp::Mindmap { root, cx, cy } => {
+            let input = crate::scene::mindmap::MindmapNodeInput::from(root);
+            let center =
+                crate::scene::WPoint::new(cx.unwrap_or(800.0), cy.unwrap_or(500.0));
+            let layout = crate::scene::mindmap::layout(&input, center);
+            let root_id = assigned_id
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("m{}", c.elements.len()));
+            let root8 = root_id[..root_id.len().min(8)].to_string();
+            // Links first (z-order mirrors the board: nodes paint on top).
+            for link in &layout.links {
+                let min_x = link.points.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
+                let min_y = link.points.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
+                let max_x = link.points.iter().map(|p| p.x).fold(f64::NEG_INFINITY, f64::max);
+                let max_y = link.points.iter().map(|p| p.y).fold(f64::NEG_INFINITY, f64::max);
+                c.elements.push(VirtualElement {
+                    id: format!("l{}", c.elements.len()),
+                    kind: "line",
+                    x: min_x,
+                    y: min_y,
+                    w: (max_x - min_x).max(1.0),
+                    h: (max_y - min_y).max(1.0),
+                    text: None,
+                    font_size: 0.0,
+                    stroke: link.stroke,
+                    fill: None,
+                    opacity: 1.0,
+                    points: Some(link.points.iter().map(|p| [p.x, p.y]).collect()),
+                });
+            }
+            for (i, spec) in layout.nodes.iter().enumerate() {
+                let id = if i == 0 {
+                    root_id.clone()
+                } else {
+                    format!("s{}", c.elements.len())
+                };
+                c.elements.push(VirtualElement {
+                    id: id.clone(),
+                    kind: "rectangle",
+                    x: spec.bounds.x,
+                    y: spec.bounds.y,
+                    w: spec.bounds.w,
+                    h: spec.bounds.h,
+                    text: None,
+                    font_size: 0.0,
+                    stroke: spec.stroke,
+                    fill: Some(spec.fill),
+                    opacity: 1.0,
+                    points: None,
+                });
+                // Bound label centered in the node (matches add_bound_label).
+                let (_, _, tw, th) = text_bbox(
+                    spec.bounds.x,
+                    spec.bounds.y,
+                    &spec.text,
+                    spec.font_size,
+                    Some((spec.bounds.w - 20.0).max(10.0)),
+                );
+                c.elements.push(VirtualElement {
+                    id: format!("{id}-label"),
+                    kind: "label",
+                    x: spec.bounds.x + (spec.bounds.w - tw.max(1.0)) / 2.0,
+                    y: spec.bounds.y + spec.bounds.h / 2.0 - th / 2.0,
+                    w: tw.max(1.0),
+                    h: th,
+                    text: Some(spec.text.clone()),
+                    font_size: spec.font_size,
+                    stroke: 0x1e1e1e,
+                    fill: None,
+                    opacity: 1.0,
+                    points: None,
+                });
+            }
+            c.ops_applied += 1;
+            msg = format!(
+                "已添加思维导图（{} 个节点）id={root8}",
+                layout.nodes.len()
+            );
         }
     }
     Ok(msg)
@@ -487,6 +580,7 @@ fn push_shape(
         stroke: style.stroke.unwrap_or(0x1e1e1e),
         fill: style.fill,
         opacity: f64::from(style.opacity.unwrap_or(1.0)),
+        points: None,
     });
     if let Some(t) = label {
         if !t.is_empty() {
@@ -505,6 +599,7 @@ fn push_shape(
                 stroke: style.stroke.unwrap_or(0x1e1e1e),
                 fill: None,
                 opacity: f64::from(style.opacity.unwrap_or(1.0)),
+                points: None,
             });
         }
     }
@@ -1293,6 +1388,339 @@ fn texts_of(canvas: &VirtualCanvas) -> Vec<&VirtualElement> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// 思维导图 rubric
+// ---------------------------------------------------------------------------
+
+/// Tool-call budget for a mind map run: the whole point of `draw_mindmap` is
+/// that ONE call lays out the entire tree, so a run beyond a handful of calls
+/// means the model fell back to hand-placing rectangles (which cannot hit the
+/// no-overlap/no-crossing bar) — the budget steers it back to the tool.
+const MINDMAP_MAX_TOOL_CALLS: usize = 20;
+/// Minimum node count the exam demands (根 + ≥4 一级分支 + 每分支 ≥2 要点 = 13).
+const MINDMAP_MIN_NODES: usize = 13;
+/// Node label length cap, matching the draw_mindmap tool's validation.
+const MINDMAP_MAX_TEXT: usize = 24;
+
+/// Labeled node shapes: container shapes paired with their bound label
+/// element (`<shape id>-label`, the same convention the replay uses).
+fn mindmap_nodes(canvas: &VirtualCanvas) -> Vec<(&VirtualElement, &VirtualElement)> {
+    canvas
+        .elements
+        .iter()
+        .filter(|e| matches!(e.kind, "rectangle" | "ellipse" | "diamond"))
+        .filter_map(|shape| {
+            let label_id = format!("{}-label", shape.id);
+            canvas
+                .elements
+                .iter()
+                .find(|l| l.id == label_id)
+                .map(|label| (shape, label))
+        })
+        .collect()
+}
+
+/// Points strictly inside a rectangle shrunk by `shrink` (edge contact is
+/// allowed — links legitimately end ON node edges).
+fn strictly_inside(px: f64, py: f64, e: &VirtualElement, shrink: f64) -> bool {
+    px > e.x + shrink && px < e.x + e.w - shrink && py > e.y + shrink && py < e.y + e.h - shrink
+}
+
+/// Strict segment-segment crossing (collinear overlaps and endpoint touches
+/// are not crossings).
+fn segments_cross(p1: (f64, f64), p2: (f64, f64), p3: (f64, f64), p4: (f64, f64)) -> bool {
+    fn ccw(a: (f64, f64), b: (f64, f64), c: (f64, f64)) -> f64 {
+        (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
+    }
+    let d1 = ccw(p3, p4, p1);
+    let d2 = ccw(p3, p4, p2);
+    let d3 = ccw(p1, p2, p3);
+    let d4 = ccw(p1, p2, p4);
+    ((d1 > 0.0) != (d2 > 0.0)) && ((d3 > 0.0) != (d4 > 0.0))
+}
+
+/// Grade a replayed mind map run. Structure (enough labeled nodes), layout
+/// (no overlaps / link intrusions / link crossings), text discipline
+/// (keyword-length single-line labels), bounds and the tool budget.
+pub fn evaluate_mindmap(
+    canvas: &VirtualCanvas,
+    drew_anything: bool,
+    total_tool_calls: usize,
+) -> EvalReport {
+    let mut checks = Vec::new();
+    let nodes = mindmap_nodes(canvas);
+    let links: Vec<&VirtualElement> = canvas
+        .elements
+        .iter()
+        .filter(|e| matches!(e.kind, "line" | "arrow") && e.points.is_some())
+        .collect();
+    let all_texts = texts_of(canvas);
+
+    // -- 结构 --
+    checks.push(check(
+        "确实画了东西",
+        drew_anything,
+        if drew_anything {
+            "有绘制".to_string()
+        } else {
+            "未调用绘图工具".to_string()
+        },
+    ));
+    checks.push(check(
+        format!("节点（带文字的形状）≥ {MINDMAP_MIN_NODES}"),
+        nodes.len() >= MINDMAP_MIN_NODES,
+        format!("共 {} 个节点", nodes.len()),
+    ));
+
+    // -- 根节点居中 + 分支左右分布 --
+    // 根 = 面积最大的节点（draw_mindmap 的根字号最大；手绘路径通常也是如此）。
+    let root = nodes
+        .iter()
+        .max_by(|a, b| (a.0.w * a.0.h).total_cmp(&(b.0.w * b.0.h)))
+        .map(|(s, _)| *s);
+    if let Some(root) = root {
+        let rcx = root.x + root.w / 2.0;
+        let rcy = root.y + root.h / 2.0;
+        let centered = (500.0..=1100.0).contains(&rcx) && (300.0..=700.0).contains(&rcy);
+        checks.push(check(
+            "中心主题靠近画布中部",
+            centered,
+            format!("中心主题位于 ({rcx:.0}, {rcy:.0})"),
+        ));
+        let left = nodes
+            .iter()
+            .filter(|(s, _)| s.x + s.w / 2.0 < rcx - 1.0)
+            .count();
+        let right = nodes
+            .iter()
+            .filter(|(s, _)| s.x + s.w / 2.0 > rcx + 1.0)
+            .count();
+        checks.push(check(
+            "分支左右两侧都有分布（各 ≥ 2）",
+            left >= 2 && right >= 2,
+            format!("左 {left} 个，右 {right} 个"),
+        ));
+    } else {
+        checks.push(check("中心主题靠近画布中部", false, "没有节点".to_string()));
+        checks.push(check(
+            "分支左右两侧都有分布（各 ≥ 2）",
+            false,
+            "没有节点".to_string(),
+        ));
+    }
+
+    // -- 布局：节点不重叠 --
+    let mut overlaps: Vec<String> = Vec::new();
+    for i in 0..nodes.len() {
+        for j in i + 1..nodes.len() {
+            if rects_overlap(nodes[i].0, nodes[j].0, 4.0) {
+                overlaps.push(format!(
+                    "「{}」×「{}」",
+                    nodes[i].1.text.as_deref().unwrap_or("?"),
+                    nodes[j].1.text.as_deref().unwrap_or("?")
+                ));
+            }
+        }
+    }
+    checks.push(check(
+        "节点两两不重叠",
+        overlaps.is_empty(),
+        if overlaps.is_empty() {
+            "无重叠".to_string()
+        } else {
+            format!("重叠: {}", overlaps.join("、"))
+        },
+    ));
+
+    // -- 布局：连线不穿节点内部 --
+    // 采样每段折线；节点矩形向内收缩 3px（连线贴边属正常）。
+    let mut intrusions: Vec<String> = Vec::new();
+    for link in &links {
+        let pts = link.points.as_deref().unwrap_or(&[]);
+        let mut offender: Option<usize> = None;
+        'outer: for (ni, (shape, _)) in nodes.iter().enumerate() {
+            for w in pts.windows(2) {
+                let (ax, ay) = (w[0][0], w[0][1]);
+                let (bx, by) = (w[1][0], w[1][1]);
+                for k in 0..=24 {
+                    let t = k as f64 / 24.0;
+                    let px = ax + (bx - ax) * t;
+                    let py = ay + (by - ay) * t;
+                    if strictly_inside(px, py, shape, 3.0) {
+                        offender = Some(ni);
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        if let Some(ni) = offender {
+            intrusions.push(format!(
+                "连线进入节点{ni}「{}」",
+                nodes[ni].1.text.as_deref().unwrap_or("?")
+            ));
+        }
+    }
+    checks.push(check(
+        "连线不穿过节点内部",
+        intrusions.is_empty(),
+        if intrusions.is_empty() {
+            "无穿越".to_string()
+        } else {
+            format!("{} 处", intrusions.len())
+        },
+    ));
+
+    // -- 布局：连线互不交叉（共享端点不算）--
+    let mut crossings = 0usize;
+    for i in 0..links.len() {
+        for j in i + 1..links.len() {
+            let a = links[i].points.as_deref().unwrap_or(&[]);
+            let b = links[j].points.as_deref().unwrap_or(&[]);
+            for wa in a.windows(2) {
+                for wb in b.windows(2) {
+                    let p1 = (wa[0][0], wa[0][1]);
+                    let p2 = (wa[1][0], wa[1][1]);
+                    let p3 = (wb[0][0], wb[0][1]);
+                    let p4 = (wb[1][0], wb[1][1]);
+                    // Shared endpoint (within 2px) — branches off one parent —
+                    // is legitimate.
+                    let shared = [(p1, p3), (p1, p4), (p2, p3), (p2, p4)].iter().any(
+                        |(u, v)| {
+                            (u.0 - v.0) * (u.0 - v.0) + (u.1 - v.1) * (u.1 - v.1) < 4.0
+                        },
+                    );
+                    if shared {
+                        continue;
+                    }
+                    if segments_cross(p1, p2, p3, p4) {
+                        crossings += 1;
+                    }
+                }
+            }
+        }
+    }
+    checks.push(check(
+        "连线互不交叉",
+        crossings == 0,
+        if crossings == 0 {
+            "无交叉".to_string()
+        } else {
+            format!("{crossings} 处交叉")
+        },
+    ));
+
+    // -- 文字纪律 --
+    let too_long: Vec<String> = all_texts
+        .iter()
+        .filter(|t| {
+            t.text
+                .as_deref()
+                .map(|s| s.chars().count() > MINDMAP_MAX_TEXT)
+                .unwrap_or(false)
+        })
+        .map(|t| {
+            format!(
+                "「{}…」{}字",
+                t.text
+                    .as_deref()
+                    .unwrap_or("")
+                    .chars()
+                    .take(10)
+                    .collect::<String>(),
+                t.text.as_deref().unwrap_or("").chars().count()
+            )
+        })
+        .collect();
+    checks.push(check(
+        format!("节点文字精炼（≤ {MINDMAP_MAX_TEXT} 字）"),
+        too_long.is_empty(),
+        if too_long.is_empty() {
+            "全部精炼".to_string()
+        } else {
+            format!("过长: {}", too_long.join("、"))
+        },
+    ));
+
+    const LITERAL_LF: &str = "\\n";
+    let literal_n: Vec<String> = all_texts
+        .iter()
+        .filter(|t| {
+            t.text
+                .as_deref()
+                .map(|s| s.contains(LITERAL_LF))
+                .unwrap_or(false)
+        })
+        .map(|t| {
+            format!(
+                "「{}…」",
+                t.text
+                    .as_deref()
+                    .unwrap_or("")
+                    .chars()
+                    .take(8)
+                    .collect::<String>()
+            )
+        })
+        .collect();
+    checks.push(check(
+        "无字面换行符残留",
+        literal_n.is_empty(),
+        if literal_n.is_empty() {
+            "无".to_string()
+        } else {
+            format!("含字面 \\n 的文本: {}", literal_n.join("、"))
+        },
+    ));
+
+    // -- 纪律 --
+    let out_of_bounds: Vec<String> = canvas
+        .elements
+        .iter()
+        .filter(|e| {
+            e.x < -BOUNDS_TOL
+                || e.y < -BOUNDS_TOL
+                || e.x + e.w > CANVAS_W + BOUNDS_TOL
+                || e.y + e.h > CANVAS_H + BOUNDS_TOL
+        })
+        .map(|e| format!("{}({:.0},{:.0})", e.kind, e.x, e.y))
+        .collect();
+    checks.push(check(
+        "全部元素在可见范围内",
+        out_of_bounds.is_empty(),
+        if out_of_bounds.is_empty() {
+            "无越界".to_string()
+        } else {
+            format!("越界: {}", out_of_bounds.join("、"))
+        },
+    ));
+    let surface_ok = canvas
+        .background
+        .map(|c| luminance(c) >= 0.55)
+        .unwrap_or(true);
+    checks.push(check(
+        "画布保持浅色底（导图配色为深字浅底设计）",
+        surface_ok,
+        match canvas.background {
+            Some(c) => format!("背景 #{c:06x}，亮度 {:.2}", luminance(c)),
+            None => "默认白板".to_string(),
+        },
+    ));
+    checks.push(check(
+        "无失败工具调用",
+        canvas.ops_failed == 0,
+        format!("失败 {} 次", canvas.ops_failed),
+    ));
+    let total = total_tool_calls.max(canvas.ops_applied + canvas.ops_failed);
+    checks.push(check(
+        format!("工具调用 ≤ {MINDMAP_MAX_TOOL_CALLS}"),
+        total <= MINDMAP_MAX_TOOL_CALLS,
+        format!("共 {total} 次"),
+    ));
+
+    let passed = checks.iter().all(|c| c.passed);
+    EvalReport { passed, checks }
+}
+
 #[cfg(test)]
 mod ink_tests {
     use super::*;
@@ -1444,6 +1872,290 @@ mod ink_tests {
         let report = evaluate_ink(&canvas, true, ops.len());
         let col = report.checks.iter().find(|c| c.name == "竖排题跋").unwrap();
         assert!(!col.passed, "detail: {}", col.detail);
+    }
+}
+
+#[cfg(test)]
+mod mindmap_tests {
+    use super::*;
+    use crate::ai::canvas_ops::OpMindmapNode;
+
+    /// Root + 4 branches × 3 keyword leaves — the exam's minimum shape.
+    fn sample_tree() -> OpMindmapNode {
+        let leaf = |t: &str| OpMindmapNode {
+            text: t.into(),
+            children: vec![],
+        };
+        let branch = |t: &str, leaves: &[&str]| OpMindmapNode {
+            text: t.into(),
+            children: leaves.iter().map(|t| leaf(t)).collect(),
+        };
+        OpMindmapNode {
+            text: "高效学习方法".into(),
+            children: vec![
+                branch("主动回忆", &["自测", "闪卡", "费曼技巧"]),
+                branch("间隔重复", &["艾宾浩斯", "Anki", "周期复习"]),
+                branch("深度加工", &["类比", "举例", "跨学科联系"]),
+                branch("专注环境", &["番茄钟", "远离手机", "固定时段"]),
+            ],
+        }
+    }
+
+    fn mindmap_op(root: OpMindmapNode) -> (CanvasOp, Option<String>) {
+        (CanvasOp::Mindmap { root, cx: None, cy: None }, Some("aaa00001".into()))
+    }
+
+    #[test]
+    fn replayed_sample_mindmap_passes_rubric() {
+        let ops = vec![mindmap_op(sample_tree())];
+        let canvas = replay(&ops);
+        assert_eq!(canvas.ops_applied, 1);
+        // 17 nodes + 17 labels + 16 links.
+        assert_eq!(canvas.elements.len(), 17 + 17 + 16);
+        let report = evaluate_mindmap(&canvas, true, 1);
+        assert!(
+            report.passed,
+            "sample mind map must pass:\n{}",
+            report.to_text()
+        );
+    }
+
+    #[test]
+    fn narrating_without_drawing_fails() {
+        let canvas = VirtualCanvas::default();
+        let report = evaluate_mindmap(&canvas, false, 0);
+        assert!(!report.passed);
+        assert!(
+            !report
+                .checks
+                .iter()
+                .find(|c| c.name.contains("确实画了东西"))
+                .unwrap()
+                .passed
+        );
+    }
+
+    #[test]
+    fn too_few_nodes_fail() {
+        let small = OpMindmapNode {
+            text: "根".into(),
+            children: vec![
+                OpMindmapNode {
+                    text: "枝一".into(),
+                    children: vec![],
+                },
+                OpMindmapNode {
+                    text: "枝二".into(),
+                    children: vec![],
+                },
+            ],
+        };
+        let canvas = replay(&vec![mindmap_op(small)]);
+        let report = evaluate_mindmap(&canvas, true, 1);
+        assert!(
+            !report
+                .checks
+                .iter()
+                .find(|c| c.name.contains("节点"))
+                .unwrap()
+                .passed
+        );
+    }
+
+    #[test]
+    fn hand_drawn_overlapping_nodes_fail() {
+        let mut canvas = VirtualCanvas::default();
+        for (i, id) in ["aaa00001", "aaa00002"].iter().enumerate() {
+            let x = 400.0 + i as f64 * 40.0; // boxes overlap by design
+            canvas.elements.push(VirtualElement {
+                id: id.to_string(),
+                kind: "rectangle",
+                x,
+                y: 400.0,
+                w: 120.0,
+                h: 50.0,
+                text: None,
+                font_size: 0.0,
+                stroke: 0x1e1e1e,
+                fill: Some(0xFFE8D9),
+                opacity: 1.0,
+                points: None,
+            });
+            canvas.elements.push(VirtualElement {
+                id: format!("{id}-label"),
+                kind: "label",
+                x,
+                y: 415.0,
+                w: 60.0,
+                h: 20.0,
+                text: Some(format!("节点{i}")),
+                font_size: 16.0,
+                stroke: 0x1e1e1e,
+                fill: None,
+                opacity: 1.0,
+                points: None,
+            });
+        }
+        let report = evaluate_mindmap(&canvas, true, 2);
+        assert!(
+            !report
+                .checks
+                .iter()
+                .find(|c| c.name.contains("不重叠"))
+                .unwrap()
+                .passed
+        );
+    }
+
+    #[test]
+    fn link_through_node_interior_fails() {
+        let mut canvas = VirtualCanvas::default();
+        // A node at (600,300)-(760,360) and a link crossing its middle.
+        canvas.elements.push(VirtualElement {
+            id: "aaa00001".into(),
+            kind: "rectangle",
+            x: 600.0,
+            y: 300.0,
+            w: 160.0,
+            h: 60.0,
+            text: None,
+            font_size: 0.0,
+            stroke: 0x1e1e1e,
+            fill: Some(0xFFE8D9),
+            opacity: 1.0,
+            points: None,
+        });
+        canvas.elements.push(VirtualElement {
+            id: "aaa00001-label".into(),
+            kind: "label",
+            x: 640.0,
+            y: 320.0,
+            w: 80.0,
+            h: 20.0,
+            text: Some("挡路节点".into()),
+            font_size: 16.0,
+            stroke: 0x1e1e1e,
+            fill: None,
+            opacity: 1.0,
+            points: None,
+        });
+        canvas.elements.push(VirtualElement {
+            id: "l1".into(),
+            kind: "line",
+            x: 400.0,
+            y: 330.0,
+            w: 400.0,
+            h: 0.0,
+            text: None,
+            font_size: 0.0,
+            stroke: 0x1e1e1e,
+            fill: None,
+            opacity: 1.0,
+            points: Some(vec![[400.0, 330.0], [800.0, 330.0]]),
+        });
+        let report = evaluate_mindmap(&canvas, true, 2);
+        assert!(
+            !report
+                .checks
+                .iter()
+                .find(|c| c.name.contains("不穿过节点"))
+                .unwrap()
+                .passed,
+            "detail: {}",
+            report
+                .checks
+                .iter()
+                .find(|c| c.name.contains("不穿过节点"))
+                .unwrap()
+                .detail
+        );
+    }
+
+    #[test]
+    fn crossing_links_fail() {
+        let mut canvas = VirtualCanvas::default();
+        for (id, pts) in [
+            ("l1", vec![[100.0, 100.0], [300.0, 300.0]]),
+            ("l2", vec![[100.0, 300.0], [300.0, 100.0]]),
+        ] {
+            canvas.elements.push(VirtualElement {
+                id: id.into(),
+                kind: "line",
+                x: 100.0,
+                y: 100.0,
+                w: 200.0,
+                h: 200.0,
+                text: None,
+                font_size: 0.0,
+                stroke: 0x1e1e1e,
+                fill: None,
+                opacity: 1.0,
+                points: Some(pts),
+            });
+        }
+        let report = evaluate_mindmap(&canvas, true, 2);
+        assert!(
+            !report
+                .checks
+                .iter()
+                .find(|c| c.name.contains("互不交叉"))
+                .unwrap()
+                .passed
+        );
+    }
+
+    #[test]
+    fn overlong_label_fails_text_discipline() {
+        // Same tree but one node label is a whole sentence (> 24 chars).
+        let mut tree = sample_tree();
+        tree.children[0].children[0].text = "这是一个远远超过二十四个字的啰里啰嗦的要点描述它应当被判定为不合格".into();
+        let canvas = replay(&vec![mindmap_op(tree)]);
+        let report = evaluate_mindmap(&canvas, true, 1);
+        assert!(
+            !report
+                .checks
+                .iter()
+                .find(|c| c.name.contains("精炼"))
+                .unwrap()
+                .passed
+        );
+    }
+
+    #[test]
+    fn exceeded_tool_budget_fails() {
+        let ops = vec![mindmap_op(sample_tree())];
+        let canvas = replay(&ops);
+        let report = evaluate_mindmap(&canvas, true, 30);
+        // Name must not collide with "无失败工具调用".
+        assert!(
+            !report
+                .checks
+                .iter()
+                .find(|c| c.name.starts_with("工具调用"))
+                .unwrap()
+                .passed
+        );
+    }
+
+    #[test]
+    fn mindmap_on_dark_surface_fails() {
+        let mut ops = vec![(
+            CanvasOp::SetBackground {
+                color: Some(0x2A5240),
+            },
+            None,
+        )];
+        ops.push(mindmap_op(sample_tree()));
+        let canvas = replay(&ops);
+        let report = evaluate_mindmap(&canvas, true, 2);
+        assert!(
+            !report
+                .checks
+                .iter()
+                .find(|c| c.name.contains("浅色底"))
+                .unwrap()
+                .passed
+        );
     }
 }
 
@@ -1624,6 +2336,7 @@ mod tests {
             stroke: 0xFFFFFF,
             fill: None,
             opacity: 1.0,
+            points: None,
         });
         let report = evaluate(&canvas, true, 0);
         let check = report

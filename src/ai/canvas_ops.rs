@@ -228,6 +228,40 @@ pub enum CanvasOp {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         color: Option<u32>,
     },
+    /// A whole mind map from one nested tree. The model supplies only the
+    /// texts; every coordinate comes from the deterministic layout in
+    /// [`crate::scene::mindmap`] (balanced two-sided tidy tree), so nodes
+    /// never overlap and links never cross — the model cannot get the
+    /// geometry wrong because it never places anything.
+    Mindmap {
+        /// The root node of the tree (its children recursively).
+        root: OpMindmapNode,
+        /// Root center X. Omit = canvas center (800).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cx: Option<f64>,
+        /// Root center Y. Omit = canvas center (500).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cy: Option<f64>,
+    },
+}
+
+/// One node of a mind map tree (recursive). Leaves omit `children`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct OpMindmapNode {
+    /// Node label: a short keyword phrase (≤ 20 chars, single line).
+    pub text: String,
+    /// Child branches/leaves. Omit for a leaf node.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<OpMindmapNode>,
+}
+
+impl From<&OpMindmapNode> for crate::scene::mindmap::MindmapNodeInput {
+    fn from(n: &OpMindmapNode) -> Self {
+        crate::scene::mindmap::MindmapNodeInput {
+            text: n.text.clone(),
+            children: n.children.iter().map(Into::into).collect(),
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -251,6 +285,7 @@ impl CanvasOp {
             CanvasOp::DeleteElement { .. } => "删除",
             CanvasOp::Clear => "清空",
             CanvasOp::SetBackground { .. } => "底色",
+            CanvasOp::Mindmap { .. } => "思维导图",
         }
     }
 }
@@ -429,5 +464,50 @@ mod tests {
         let json = r#"{"shape":"text","x":5.0,"y":5.0,"text":"你好","style":{}}"#;
         let op: CanvasOp = serde_json::from_str(json).unwrap();
         assert_eq!(op.status_label(), "文本");
+    }
+
+    #[test]
+    fn mindmap_op_roundtrips() {
+        let op = CanvasOp::Mindmap {
+            root: OpMindmapNode {
+                text: "根".into(),
+                children: vec![OpMindmapNode {
+                    text: "叶".into(),
+                    children: vec![],
+                }],
+            },
+            cx: None,
+            cy: Some(500.0),
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: CanvasOp = serde_json::from_str(&json).unwrap();
+        assert_eq!(op, back);
+        assert_eq!(op.status_label(), "思维导图");
+        // Leaf nodes omit `children` on the wire.
+        let minimal =
+            r#"{"shape":"mindmap","root":{"text":"根","children":[{"text":"叶"}]},"cy":500.0}"#;
+        let parsed: CanvasOp = serde_json::from_str(minimal).unwrap();
+        assert_eq!(parsed, op);
+    }
+
+    #[test]
+    fn mindmap_op_converts_to_layout_input() {
+        let op = CanvasOp::Mindmap {
+            root: OpMindmapNode {
+                text: "根".into(),
+                children: vec![OpMindmapNode {
+                    text: "叶".into(),
+                    children: vec![],
+                }],
+            },
+            cx: None,
+            cy: None,
+        };
+        let CanvasOp::Mindmap { root, .. } = &op else {
+            panic!()
+        };
+        let input = crate::scene::mindmap::MindmapNodeInput::from(root);
+        assert_eq!(crate::scene::mindmap::count_nodes(&input), 2);
+        assert_eq!(input.text, "根");
     }
 }

@@ -1065,6 +1065,62 @@ impl BoardView {
                 };
                 Ok(label)
             }
+            CanvasOp::Mindmap { root, cx, cy } => {
+                let Some(root_id) = pre_assigned_id else {
+                    return Err(CanvasOpError::internal("内部错误：缺少元素 ID"));
+                };
+                let input = crate::scene::mindmap::MindmapNodeInput::from(&root);
+                let center = WPoint::new(cx.unwrap_or(800.0), cy.unwrap_or(500.0));
+                let layout = crate::scene::mindmap::layout(&input, center);
+                let node_count = layout.nodes.len();
+                self.history.record(&self.scene);
+                // Links first so node boxes (and labels) paint on top of them.
+                for link in &layout.links {
+                    let mut style = ElementStyle {
+                        stroke: link.stroke,
+                        stroke_width: 2.0,
+                        roughness: 1.0,
+                        ..ElementStyle::default()
+                    };
+                    style.line_type = LineType::Curved;
+                    let el = Element::from_absolute_points(
+                        |p| ElementKind::Line { points: p },
+                        link.points.clone(),
+                        style,
+                    );
+                    self.scene.add(el);
+                }
+                for (i, spec) in layout.nodes.iter().enumerate() {
+                    let mut style = ElementStyle {
+                        stroke: spec.stroke,
+                        background: Some(spec.fill),
+                        stroke_width: match spec.level {
+                            0 => 2.5,
+                            1 => 2.0,
+                            _ => 1.5,
+                        },
+                        roughness: 1.0,
+                        ..ElementStyle::default()
+                    };
+                    style.fill_style = crate::scene::FillStyle::Solid;
+                    let el = if i == 0 {
+                        Element::new_with_id(
+                            root_id,
+                            ElementKind::Rectangle,
+                            spec.bounds,
+                            style,
+                        )
+                    } else {
+                        Element::new(ElementKind::Rectangle, spec.bounds, style)
+                    };
+                    let added = self.scene.add(el);
+                    self.add_bound_label(added, spec.bounds, spec.text.clone());
+                }
+                Ok(format!(
+                    "已添加思维导图（{node_count} 个节点）id={}",
+                    &root_id.to_string()[..8]
+                ))
+            }
             CanvasOp::UpdateElement {
                 id,
                 x,
