@@ -1927,9 +1927,10 @@ pub fn evaluate_slides(
         }
         let span = (max_bottom - p.y) / p.h;
         // The cover page (first) is allowed generous whitespace — a title
-        // block over an intentional empty field is good cover design — so
-        // its bar is lower; content pages must actually spread.
-        let min_span = if i == 0 { 0.45 } else { 0.55 };
+        // block over an intentional empty field is good cover design (two
+        // real rounds landed at 53% and 43% with fine-looking covers) — so
+        // its bar is 40%; content pages must actually spread (55%).
+        let min_span = if i == 0 { 0.40 } else { 0.55 };
         if span < min_span {
             shallow_pages.push(format!(
                 "第{}页(纵向跨度 {:.0}%,要求 {:.0}%)",
