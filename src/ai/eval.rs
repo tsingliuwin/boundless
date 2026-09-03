@@ -307,7 +307,9 @@ pub fn apply(
                 c.ops_failed += 1;
                 return Err("多边形至少需要三个有限坐标点".to_string());
             }
-            let id = assigned_id.map(str::to_string).unwrap_or_else(|| format!("p{}", c.elements.len()));
+            let id = assigned_id
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("p{}", c.elements.len()));
             let min_x = points.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
             let min_y = points.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
             let max_x = points.iter().map(|p| p.x).fold(f64::NEG_INFINITY, f64::max);
@@ -1127,6 +1129,28 @@ pub fn evaluate_ink(
         "浓墨近景 ≥ 1（近实远虚）",
         dark_near >= 1,
         format!("共 {dark_near} 处"),
+    ));
+
+    // 浓墨克制：近岸/浓墨大块面积 ≤ 画布 1/4——过重会压满画面下部，
+    // 挤掉留白与呼吸空间（实测教训）。
+    let dark_area: f64 = canvas
+        .elements
+        .iter()
+        .filter(|e| {
+            matches!(e.kind, "rectangle" | "ellipse" | "polygon")
+                && e.fill.is_some()
+                && (e.opacity >= 0.55 || luminance(e.fill.unwrap_or(0xFFFFFF)) <= 0.35)
+                && (e.w * e.h) >= 40_000.0
+        })
+        .map(|e| e.w * e.h)
+        .sum();
+    checks.push(check(
+        "浓墨面积克制（≤ 画布 1/4）",
+        dark_area <= 0.25 * CANVAS_W * CANVAS_H,
+        format!(
+            "浓墨大块合计约 {:.0}%",
+            dark_area / (CANVAS_W * CANVAS_H) * 100.0
+        ),
     ));
 
     // -- 竖排题跋：一列单字（≥3 字、横向聚拢）或窄高文本块 --
