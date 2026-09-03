@@ -1646,6 +1646,7 @@ fn tool_label(name: &str) -> &'static str {
         "draw_polygon" => "多边形",
         "draw_mindmap" => "思维导图",
         "set_canvas_background" => "底色",
+        "use_skill" => "技能",
         _ => "图形",
     }
 }
@@ -1662,6 +1663,8 @@ enum ToolOp {
     Query,
     /// Canvas-level configuration (e.g. set_canvas_background).
     Config,
+    /// Scenario-skill spec loading (use_skill).
+    Skill,
     Other,
 }
 
@@ -1674,6 +1677,7 @@ fn tool_op(name: &str) -> ToolOp {
         "clear_canvas" => ToolOp::Clear,
         "list_elements" => ToolOp::Query,
         "set_canvas_background" => ToolOp::Config,
+        "use_skill" => ToolOp::Skill,
         _ => ToolOp::Other,
     }
 }
@@ -1687,6 +1691,7 @@ impl ToolOp {
             ToolOp::Clear => "🧹",
             ToolOp::Query => "📋",
             ToolOp::Config => "🎨",
+            ToolOp::Skill => "📖",
             ToolOp::Other => "🔧",
         }
     }
@@ -1698,6 +1703,7 @@ impl ToolOp {
             ToolOp::Clear => "清空",
             ToolOp::Query => "查询",
             ToolOp::Config => "设置",
+            ToolOp::Skill => "加载",
             ToolOp::Other => "操作",
         }
     }
@@ -1709,6 +1715,7 @@ impl ToolOp {
             ToolOp::Clear => rgb(0xc92a2a),  // red
             ToolOp::Query => rgb(0x888888),  // gray
             ToolOp::Config => rgb(0x1a5fd7),
+            ToolOp::Skill => rgb(0x7048e8),  // violet: scenario-skill loading
             ToolOp::Other => rgb(0x1a5fd7),
         }
     }
@@ -1741,6 +1748,10 @@ fn tool_header(name: &str, args: &serde_json::Value) -> (String, Rgba) {
         ToolOp::Delete => format!("{} {} #{}", op.icon(), op.verb(), short_id(args)),
         ToolOp::Clear => format!("{} {}画布", op.icon(), op.verb()),
         ToolOp::Query => format!("{} {}元素", op.icon(), op.verb()),
+        ToolOp::Skill => {
+            let skill = args.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("{} 加载技能 {skill}", op.icon())
+        }
         ToolOp::Config | ToolOp::Other => {
             format!("{} {}{}", op.icon(), op.verb(), tool_label(name))
         }
@@ -2153,6 +2164,10 @@ fn tool_call_detail(name: &str, args: &serde_json::Value) -> String {
         "delete_element" => format!("元素 #{}", short_id(args)),
         "clear_canvas" => "清空画布上的所有元素".to_string(),
         "list_elements" => "查询画布上的所有元素".to_string(),
+        "use_skill" => {
+            let s = obj.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("场景技能「{s}」的构图规范（按需加载，非画布元素）")
+        }
         _ => String::new(),
     };
     if out.trim().is_empty() {
@@ -2188,6 +2203,15 @@ mod tests {
     use super::{
         tool_body_text, tool_call_detail, tool_chip_preview, tool_header, tool_op, ToolOp,
     };
+
+    #[test]
+    fn use_skill_step_shows_skill_name() {
+        let args: serde_json::Value = serde_json::from_str(r#"{"name":"mindmap"}"#).unwrap();
+        let (title, _) = tool_header("use_skill", &args);
+        assert_eq!(title, "📖 加载技能 mindmap");
+        let detail = tool_call_detail("use_skill", &args);
+        assert!(detail.contains("mindmap"));
+    }
 
     #[test]
     fn tool_detail_describes_rectangle_with_coords_and_size() {
