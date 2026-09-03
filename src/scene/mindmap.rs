@@ -40,6 +40,8 @@ const VGAP: f64 = 28.0;
 const PAD_X: f64 = 14.0;
 /// Vertical padding inside a node box, total (above + below the text).
 const PAD_Y: f64 = 12.0;
+/// Inset of link exit points from a node's top/bottom edge.
+const LINK_PAD: f64 = 3.0;
 /// Readability floor for the auto-fit shrink factor.
 const MIN_SCALE: f64 = 0.55;
 
@@ -239,23 +241,37 @@ fn layout_at(root: &MindmapNodeInput, center: WPoint, scale: f64) -> MindmapLayo
         &mut nodes, &mut links, &mut left_bounds,
     );
 
-    // Root links: root box side midpoint → each level-1 node's facing edge,
-    // colored by that branch.
+    // Root links: exits track each branch's height along the root's side
+    // edge, colored by that branch.
+    let right_ys = exit_ys(
+        &root_bounds,
+        &right_bounds
+            .iter()
+            .map(|b| b.y + b.h / 2.0)
+            .collect::<Vec<_>>(),
+    );
     for (i, (_, branch)) in right.iter().enumerate() {
         let b = right_bounds[i];
         links.push(LinkSpec {
             points: s_curve(
-                WPoint::new(root_bounds.right(), center.y),
+                WPoint::new(root_bounds.right(), right_ys[i]),
                 WPoint::new(b.x, b.y + b.h / 2.0),
             ),
             stroke: palette_stroke(*branch),
         });
     }
+    let left_ys = exit_ys(
+        &root_bounds,
+        &left_bounds
+            .iter()
+            .map(|b| b.y + b.h / 2.0)
+            .collect::<Vec<_>>(),
+    );
     for (i, (_, branch)) in left.iter().enumerate() {
         let b = left_bounds[i];
         links.push(LinkSpec {
             points: s_curve(
-                WPoint::new(root_bounds.x, center.y),
+                WPoint::new(root_bounds.x, left_ys[i]),
                 WPoint::new(b.right(), b.y + b.h / 2.0),
             ),
             stroke: palette_stroke(*branch),
@@ -312,15 +328,64 @@ fn layout_at(root: &MindmapNodeInput, center: WPoint, scale: f64) -> MindmapLayo
 }
 
 /// 4-point S-curve from a parent edge to a child edge: horizontal stub out of
-/// the parent, vertical rise at the mid x, horizontal into the child.
+/// the parent, vertical rise at the mid x, horizontal into the child. When
+/// both endpoints share a height (exit tracks the child), the middle
+/// collapses to one collinear point — a straight link, no duplicate points
+/// for the spline renderer to choke on.
 fn s_curve(start: WPoint, end: WPoint) -> Vec<WPoint> {
     let mx = (start.x + end.x) / 2.0;
+    if (start.y - end.y).abs() < 1e-9 {
+        return vec![
+            start,
+            WPoint::new(mx, start.y),
+            end,
+        ];
+    }
     vec![
         start,
         WPoint::new(mx, start.y),
         WPoint::new(mx, end.y),
         end,
     ]
+}
+
+/// Link exit points along a node's vertical edge: each exit tracks its
+/// child's height (clamped into the node's extent, inset by [`LINK_PAD`]),
+/// then a two-pass compaction forces strictly increasing exits — curves
+/// leaving one exact point tangle into a knot under jitter. When children
+/// bunch beyond the node's extent the exits bundle at the edge corners and
+/// fan out together — the classic branch-trunk look, no crossing: an
+/// in-range child gets a perfectly horizontal link (no transition to cut
+/// through), and bundled transitions run parallel. `child_cys` must be
+/// ordered top→bottom, as placement guarantees.
+fn exit_ys(edge: &WBounds, child_cys: &[f64]) -> Vec<f64> {
+    let n = child_cys.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let top = edge.y + LINK_PAD;
+    let bottom = (edge.y + edge.h - LINK_PAD).max(top);
+    const MAX_GAP: f64 = 0.75;
+    // Shrink the gap if the exits can't all fit inside the edge.
+    let gap = if n > 1 {
+        MAX_GAP.min((bottom - top) / (n - 1) as f64)
+    } else {
+        MAX_GAP
+    };
+    let mut out: Vec<f64> = child_cys.iter().map(|&cy| cy.clamp(top, bottom)).collect();
+    // Pass 1: crowd spreads downward from each clamped target.
+    for i in 1..n {
+        out[i] = out[i].max(out[i - 1] + gap);
+    }
+    // Pass 2: if the tail ran past the bottom edge, re-pin from the bottom
+    // upward so everything fits back inside.
+    if out[n - 1] > bottom {
+        out[n - 1] = bottom;
+        for i in (0..n - 1).rev() {
+            out[i] = out[i].min(out[i + 1] - gap);
+        }
+    }
+    out
 }
 
 fn palette_stroke(branch: usize) -> u32 {
@@ -488,12 +553,17 @@ fn place_subtree(
     let last = child_bounds.last().unwrap();
     let cy = (first.y + first.h / 2.0 + last.y + last.h / 2.0) / 2.0;
     let bounds = WBounds::new(x.min(x + dir * w), cy - h / 2.0, w, h);
-    for cb in &child_bounds {
-        let child_cy = cb.y + cb.h / 2.0;
+    // One exit per child, tracking its height along this node's edge.
+    let child_cys: Vec<f64> = child_bounds
+        .iter()
+        .map(|cb| cb.y + cb.h / 2.0)
+        .collect();
+    let ys = exit_ys(&bounds, &child_cys);
+    for (i, cb) in child_bounds.iter().enumerate() {
         let (start, end) = if dir > 0.0 {
-            (WPoint::new(bounds.right(), cy), WPoint::new(cb.x, child_cy))
+            (WPoint::new(bounds.right(), ys[i]), WPoint::new(cb.x, child_cys[i]))
         } else {
-            (WPoint::new(bounds.x, cy), WPoint::new(cb.right(), child_cy))
+            (WPoint::new(bounds.x, ys[i]), WPoint::new(cb.right(), child_cys[i]))
         };
         links.push(LinkSpec {
             points: s_curve(start, end),
@@ -603,8 +673,10 @@ mod tests {
         let l = layout(&sample_tree(), WPoint::new(800.0, 500.0));
         assert_eq!(l.links.len(), l.nodes.len() - 1);
         for link in &l.links {
-            assert_eq!(link.points.len(), 4);
-            let (a, b) = (link.points[0], link.points[3]);
+            // 4-point S-curve, or 3 collinear points when the exit tracks an
+            // in-range child (horizontal link).
+            assert!(link.points.len() == 4 || link.points.len() == 3);
+            let (a, b) = (link.points[0], *link.points.last().unwrap());
             assert!((a.x - b.x).abs() >= HGAP - 1.0, "link too short: {a:?}→{b:?}");
         }
     }
@@ -614,16 +686,10 @@ mod tests {
         let l = layout(&sample_tree(), WPoint::new(800.0, 500.0));
         for i in 0..l.links.len() {
             for j in i + 1..l.links.len() {
-                let a = (&l.links[i].points[0], &l.links[i].points[3]);
-                let b = (&l.links[j].points[0], &l.links[j].points[3]);
-                // Links from the same parent share an endpoint — allowed.
-                if close(*a.0, *b.0)
-                    || close(*a.0, *b.1)
-                    || close(*a.1, *b.0)
-                    || close(*a.1, *b.1)
-                {
-                    continue;
-                }
+                let a = (&l.links[i].points[0], &l.links[i].points[l.links[i].points.len() - 1]);
+                let b = (&l.links[j].points[0], &l.links[j].points[l.links[j].points.len() - 1]);
+                // T-junctions and shared endpoints are legitimate (bundled
+                // trunks); only interior×interior passages count.
                 assert!(
                     !segments_cross(*a.0, *a.1, *b.0, *b.1),
                     "links {i} and {j} cross: {a:?}→{:?} vs {b:?}→{:?}",
@@ -712,10 +778,42 @@ mod tests {
         assert!(fits(&l.extent));
     }
 
-    fn close(a: WPoint, b: WPoint) -> bool {
-        (a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y) < 1.0
+    #[test]
+    fn same_parent_links_have_distinct_exit_points() {
+        // The knot bug: n links leaving the exact same coordinate tangle
+        // under roughness jitter. Every exit must be unique, inset from the
+        // node edges, and ordered like the children (top→bottom).
+        for tree in [sample_tree(), big_tree()] {
+            let l = layout(&tree, WPoint::new(800.0, 500.0));
+            let starts: Vec<WPoint> = l.links.iter().map(|l| l.points[0]).collect();
+            for i in 0..starts.len() {
+                for j in i + 1..starts.len() {
+                    assert!(
+                        starts[i] != starts[j],
+                        "links {i} and {j} share an exit point"
+                    );
+                }
+            }
+        }
     }
 
+    fn big_tree() -> MindmapNodeInput {
+        let mut big = MindmapNodeInput::new("中心主题", vec![]);
+        for i in 0..6 {
+            let mut b = MindmapNodeInput::new(format!("分支主题{i}"), vec![]);
+            for j in 0..4 {
+                b.children.push(leaf(&format!("要点{i}-{j}")));
+            }
+            big.children.push(b);
+        }
+        big
+    }
+
+    /// Interior×interior crossing: both segments must straddle each other
+    /// strictly (any endpoint touch / T-junction / collinear overlap yields a
+    /// zero product → not a crossing). Same-parent links legitimately
+    /// T-join into a bundled trunk; a visual crossing is two lines passing
+    /// through each other.
     fn segments_cross(p1: WPoint, p2: WPoint, p3: WPoint, p4: WPoint) -> bool {
         fn ccw(a: WPoint, b: WPoint, c: WPoint) -> f64 {
             (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
@@ -724,6 +822,6 @@ mod tests {
         let d2 = ccw(p3, p4, p2);
         let d3 = ccw(p1, p2, p3);
         let d4 = ccw(p1, p2, p4);
-        ((d1 > 0.0) != (d2 > 0.0)) && ((d3 > 0.0) != (d4 > 0.0))
+        (d1 * d2 < 0.0) && (d3 * d4 < 0.0)
     }
 }

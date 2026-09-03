@@ -1426,8 +1426,11 @@ fn strictly_inside(px: f64, py: f64, e: &VirtualElement, shrink: f64) -> bool {
     px > e.x + shrink && px < e.x + e.w - shrink && py > e.y + shrink && py < e.y + e.h - shrink
 }
 
-/// Strict segment-segment crossing (collinear overlaps and endpoint touches
-/// are not crossings).
+/// Strict interior×interior segment crossing: both segments must straddle
+/// each other (endpoint touches, T-junctions and collinear overlaps give a
+/// zero side product → not a crossing). Same-parent mind-map links
+/// legitimately T-join into a bundled trunk; a visual crossing is two lines
+/// passing through each other's interiors.
 fn segments_cross(p1: (f64, f64), p2: (f64, f64), p3: (f64, f64), p4: (f64, f64)) -> bool {
     fn ccw(a: (f64, f64), b: (f64, f64), c: (f64, f64)) -> f64 {
         (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
@@ -1436,7 +1439,7 @@ fn segments_cross(p1: (f64, f64), p2: (f64, f64), p3: (f64, f64), p4: (f64, f64)
     let d2 = ccw(p3, p4, p2);
     let d3 = ccw(p1, p2, p3);
     let d4 = ccw(p1, p2, p4);
-    ((d1 > 0.0) != (d2 > 0.0)) && ((d3 > 0.0) != (d4 > 0.0))
+    (d1 * d2 < 0.0) && (d3 * d4 < 0.0)
 }
 
 /// Grade a replayed mind map run. Structure (enough labeled nodes), layout
@@ -1570,7 +1573,7 @@ pub fn evaluate_mindmap(
         },
     ));
 
-    // -- 布局：连线互不交叉（共享端点不算）--
+    // -- 布局：连线互不交叉（T 形汇入不算，见 segments_cross）--
     let mut crossings = 0usize;
     for i in 0..links.len() {
         for j in i + 1..links.len() {
@@ -1582,16 +1585,6 @@ pub fn evaluate_mindmap(
                     let p2 = (wa[1][0], wa[1][1]);
                     let p3 = (wb[0][0], wb[0][1]);
                     let p4 = (wb[1][0], wb[1][1]);
-                    // Shared endpoint (within 2px) — branches off one parent —
-                    // is legitimate.
-                    let shared = [(p1, p3), (p1, p4), (p2, p3), (p2, p4)].iter().any(
-                        |(u, v)| {
-                            (u.0 - v.0) * (u.0 - v.0) + (u.1 - v.1) * (u.1 - v.1) < 4.0
-                        },
-                    );
-                    if shared {
-                        continue;
-                    }
                     if segments_cross(p1, p2, p3, p4) {
                         crossings += 1;
                     }

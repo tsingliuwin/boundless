@@ -1075,11 +1075,13 @@ impl BoardView {
                 let node_count = layout.nodes.len();
                 self.history.record(&self.scene);
                 // Links first so node boxes (and labels) paint on top of them.
+                // Roughness 0.5: curves stay hand-drawn but n curves fanning
+                // out of one node edge don't fray into a knot.
                 for link in &layout.links {
                     let mut style = ElementStyle {
                         stroke: link.stroke,
                         stroke_width: 2.0,
-                        roughness: 1.0,
+                        roughness: 0.5,
                         ..ElementStyle::default()
                     };
                     style.line_type = LineType::Curved;

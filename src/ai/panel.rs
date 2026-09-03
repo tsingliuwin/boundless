@@ -1617,6 +1617,9 @@ fn tool_label(name: &str) -> &'static str {
         "draw_line" => "直线",
         "draw_arrow" => "箭头",
         "draw_text" => "文本",
+        "draw_polygon" => "多边形",
+        "draw_mindmap" => "思维导图",
+        "set_canvas_background" => "底色",
         _ => "图形",
     }
 }
@@ -1631,17 +1634,20 @@ enum ToolOp {
     Delete,
     Clear,
     Query,
+    /// Canvas-level configuration (e.g. set_canvas_background).
+    Config,
     Other,
 }
 
 fn tool_op(name: &str) -> ToolOp {
     match name {
         "draw_rectangle" | "draw_ellipse" | "draw_diamond" | "draw_line" | "draw_arrow"
-        | "draw_text" => ToolOp::Add,
+        | "draw_text" | "draw_polygon" | "draw_mindmap" => ToolOp::Add,
         "update_element" => ToolOp::Update,
         "delete_element" => ToolOp::Delete,
         "clear_canvas" => ToolOp::Clear,
         "list_elements" => ToolOp::Query,
+        "set_canvas_background" => ToolOp::Config,
         _ => ToolOp::Other,
     }
 }
@@ -1654,6 +1660,7 @@ impl ToolOp {
             ToolOp::Delete => "🗑",
             ToolOp::Clear => "🧹",
             ToolOp::Query => "📋",
+            ToolOp::Config => "🎨",
             ToolOp::Other => "🔧",
         }
     }
@@ -1664,6 +1671,7 @@ impl ToolOp {
             ToolOp::Delete => "删除",
             ToolOp::Clear => "清空",
             ToolOp::Query => "查询",
+            ToolOp::Config => "设置",
             ToolOp::Other => "操作",
         }
     }
@@ -1674,6 +1682,7 @@ impl ToolOp {
             ToolOp::Delete => rgb(0xc92a2a), // red
             ToolOp::Clear => rgb(0xc92a2a),  // red
             ToolOp::Query => rgb(0x888888),  // gray
+            ToolOp::Config => rgb(0x1a5fd7),
             ToolOp::Other => rgb(0x1a5fd7),
         }
     }
@@ -1706,7 +1715,9 @@ fn tool_header(name: &str, args: &serde_json::Value) -> (String, Rgba) {
         ToolOp::Delete => format!("{} {} #{}", op.icon(), op.verb(), short_id(args)),
         ToolOp::Clear => format!("{} {}画布", op.icon(), op.verb()),
         ToolOp::Query => format!("{} {}元素", op.icon(), op.verb()),
-        ToolOp::Other => format!("{} {}{}", op.icon(), op.verb(), tool_label(name)),
+        ToolOp::Config | ToolOp::Other => {
+            format!("{} {}{}", op.icon(), op.verb(), tool_label(name))
+        }
     };
     (title, op.color())
 }
@@ -2015,8 +2026,30 @@ fn tool_chip_preview(name: &str, args: &serde_json::Value) -> String {
                 String::new()
             }
         }
+        "draw_mindmap" => {
+            let nodes = json_tree_nodes(obj.get("root"));
+            if nodes > 0 {
+                format!("{nodes} 节点")
+            } else {
+                String::new()
+            }
+        }
         _ => String::new(),
     }
+}
+
+/// Count nodes in a nested mind map tree from its raw JSON form
+/// (`{"text":..., "children":[...]}`).
+fn json_tree_nodes(v: Option<&serde_json::Value>) -> usize {
+    let Some(v) = v else {
+        return 0;
+    };
+    let children = v
+        .get("children")
+        .and_then(|c| c.as_array())
+        .map(|a| a.iter().map(|c| json_tree_nodes(Some(c))).sum::<usize>())
+        .unwrap_or(0);
+    1 + children
 }
 
 /// Build the full expanded-body text for a tool step: the friendly parameter
