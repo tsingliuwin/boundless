@@ -168,6 +168,11 @@ pub struct BoardView {
     /// fits exactly to that page's rect, all floating chrome hides, and
     /// PageUp/PageDown/Escape flip or exit. None = normal editing view.
     presenting: Option<usize>,
+    /// Page index to bring the camera to on the next render frame. Set by the
+    /// AI's `add_page` op, which is applied *inside* the AiPanel's update —
+    /// reading the panel (for its docked width) there would panic, so the
+    /// camera move is deferred to render, outside any update stack.
+    pending_page_focus: Option<usize>,
     /// Index of the currently open top-level menu in the Windows in-app menu
     /// bar (None = all collapsed). Unused on macOS, which uses the native
     /// `set_menus` bar; the field compiles everywhere because the menu-bar
@@ -224,6 +229,7 @@ impl BoardView {
             show_grid: false,
             canvas_background: None,
             presenting: None,
+            pending_page_focus: None,
             menubar_open: None,
             update_state: crate::updater::UpdateState::default(),
             render_cache: crate::render::cache::RenderCache::new(),
@@ -1155,13 +1161,11 @@ impl BoardView {
                         crate::scene::pages::push_page(&mut self.scene.pages, title, r);
                     (p.bounds(), p.title.clone(), n)
                 };
-                // Bring the camera to the new page: the user watches the model
-                // compose each slide in turn. Without this, a page opened off-
-                // screen draws invisibly and the canvas looks frozen.
-                let vp = self.viewport_bounds(cx);
-                let mut cam = self.camera;
-                cam.zoom_to_fit(rect, vp.size);
-                self.camera = cam;
+                // Bring the camera to the new page so the user watches the
+                // model compose each slide in turn. Deferred to the next
+                // render frame: this op is applied inside the AiPanel's
+                // update, where reading the panel (viewport width) panics.
+                self.pending_page_focus = Some(number - 1);
                 self.mark_dirty();
                 cx.notify();
                 Ok(format!(
@@ -3932,6 +3936,23 @@ impl BoardView {
 
 impl Render for BoardView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Bring the camera to a freshly AI-created page. Deferred from
+        // apply_canvas_op (which runs inside the AiPanel's update, where
+        // reading the panel's width would panic); render runs outside any
+        // update stack. Skipped while presenting so the deck view isn't
+        // hijacked mid-presentation.
+        if let Some(i) = self.pending_page_focus.take() {
+            if self.presenting.is_none() {
+                if let Some(p) = self.scene.pages.get(i) {
+                    let bounds = p.bounds();
+                    let vp = self.viewport_bounds(cx);
+                    let mut cam = self.camera;
+                    cam.zoom_to_fit(bounds, vp.size);
+                    self.camera = cam;
+                }
+            }
+        }
+
         // Refine bounds of freshly-inserted text elements now that we have
         // access to the text system.
         if !self.pending_measure.is_empty() {
