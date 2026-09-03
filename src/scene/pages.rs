@@ -63,6 +63,25 @@ impl PageRatio {
             PageRatio::Ratio1_1 => "1:1",
         }
     }
+
+    /// The preset matching the given page size (2% aspect tolerance), so a
+    /// manual "+ page" extends the deck in its existing ratio. Falls back to
+    /// the 16:9 default when nothing matches (e.g. a resized page).
+    pub fn from_size(w: f64, h: f64) -> PageRatio {
+        let presets = [
+            (PageRatio::Ratio16_9, 16.0 / 9.0),
+            (PageRatio::Ratio4_3, 4.0 / 3.0),
+            (PageRatio::Ratio9_16, 9.0 / 16.0),
+            (PageRatio::Ratio3_4, 3.0 / 4.0),
+            (PageRatio::Ratio1_1, 1.0),
+        ];
+        let ar = w / h;
+        presets
+            .into_iter()
+            .find(|(_, r)| (ar - r).abs() / r <= 0.02)
+            .map(|(p, _)| p)
+            .unwrap_or_default()
+    }
 }
 
 impl Default for PageRatio {
@@ -179,6 +198,18 @@ mod tests {
         let (p, n) = push_page(&mut pages, Some("  ".into()), PageRatio::Ratio16_9);
         assert_eq!(p.title, "第 2 页");
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn from_size_matches_presets_with_tolerance() {
+        assert_eq!(PageRatio::from_size(1600.0, 900.0), PageRatio::Ratio16_9);
+        assert_eq!(PageRatio::from_size(900.0, 1600.0), PageRatio::Ratio9_16);
+        assert_eq!(PageRatio::from_size(1440.0, 1080.0), PageRatio::Ratio4_3);
+        assert_eq!(PageRatio::from_size(1280.0, 1280.0), PageRatio::Ratio1_1);
+        // ~1% off still matches; a genuinely different ratio falls back to 16:9.
+        assert_eq!(PageRatio::from_size(1600.0, 910.0), PageRatio::Ratio16_9);
+        assert_eq!(PageRatio::from_size(800.0, 600.0), PageRatio::Ratio4_3);
+        assert_eq!(PageRatio::from_size(1234.0, 777.0), PageRatio::Ratio16_9);
     }
 
     #[test]

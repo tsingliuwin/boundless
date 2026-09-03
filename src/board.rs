@@ -1996,22 +1996,27 @@ impl BoardView {
         cx.notify();
     }
 
-    /// Manually add a page (zoom-bar button). The AI creates pages via the
-    /// `add_page` tool with an explicit ratio; manual pages use the default
-    /// 16:9 and land after the current last page.
+    /// Manually add a page (page-bar button). The AI creates pages via the
+    /// `add_page` tool with an explicit ratio; a manual page extends the
+    /// current deck in its existing ratio (a stray 16:9 page in the middle
+    /// of a 9:16 deck both looks broken and trips the ratio rubric), or
+    /// defaults to 16:9 when the board has no pages yet.
     fn add_page_manual(&mut self, cx: &mut Context<Self>) {
+        let ratio = self
+            .scene
+            .pages
+            .last()
+            .map(|p| PageRatio::from_size(p.w, p.h))
+            .unwrap_or_default();
         let (rect, title, number) = {
-            let (page, number) = crate::scene::pages::push_page(
-                &mut self.scene.pages,
-                None,
-                PageRatio::default(),
-            );
+            let (page, number) =
+                crate::scene::pages::push_page(&mut self.scene.pages, None, ratio);
             (page.bounds(), page.title.clone(), number)
         };
         self.mark_dirty();
         let vp = self.viewport_bounds(cx);
         self.camera.zoom_to_fit(rect, vp.size);
-        self.set_notice(format!("已添加第 {number} 页「{title}」"), cx);
+        self.set_notice(format!("已添加第 {number} 页「{title}」（{}）", ratio.label()), cx);
         cx.notify();
     }
 
