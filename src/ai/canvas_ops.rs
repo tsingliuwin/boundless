@@ -262,6 +262,14 @@ pub enum CanvasOp {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ratio: Option<String>,
     },
+    /// Delete a slide page frame. Elements on that page stay on the canvas
+    /// (the model can redraw or the user can clean up) — same semantics as
+    /// the page bar's manual delete.
+    DeletePage {
+        /// 1-based page number to delete. Omit = the last page.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        number: Option<usize>,
+    },
 }
 
 /// One node of a mind map tree (recursive). Leaves omit `children`.
@@ -325,6 +333,7 @@ impl CanvasOp {
             CanvasOp::SetBackground { .. } => "底色",
             CanvasOp::Mindmap { .. } => "思维导图",
             CanvasOp::AddPage { .. } => "页面",
+            CanvasOp::DeletePage { .. } => "删页",
         }
     }
 }

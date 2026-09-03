@@ -1280,6 +1280,54 @@ impl Tool for AddPageTool {
     }
 }
 
+// --- Delete Page -------------------------------------------------------------
+
+/// Arguments for `delete_page`.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct DeletePageArgs {
+    /// 要删除的页码（1 起）。省略 = 删除最后一页。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number: Option<usize>,
+}
+
+/// Deletes a slide page frame. Elements on that page stay on the canvas —
+/// the model should redraw replacements or tell the user about leftovers.
+pub struct DeletePageTool {
+    pub events: UnboundedSender<AgentEvent>,
+}
+
+impl Tool for DeletePageTool {
+    const NAME: &'static str = "delete_page";
+    type Error = ToolError;
+    type Args = DeletePageArgs;
+    type Output = String;
+
+    fn definition(
+        &self,
+        _prompt: String,
+    ) -> impl std::future::Future<Output = ToolDefinition> + Send {
+        let def = tool_def::<DeletePageArgs>(
+            Self::NAME,
+            "删除一张幻灯片页面（页面框；页内元素保留在画布上，如需清理可再用 delete_element 删除具体元素）。用户要求删掉某页/减少页数时使用。",
+        );
+        async move { def }
+    }
+
+    fn call(
+        &self,
+        args: Self::Args,
+    ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
+        let events = self.events.clone();
+        let name = Self::NAME;
+        async move {
+            let id = next_tool_id(name);
+            let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
+            let op = CanvasOp::DeletePage { number: args.number };
+            run_canvas_op(&events, id, name, args_json, op, None).await
+        }
+    }
+}
+
 // --- List Elements ---------------------------------------------------------
 
 /// A lightweight summary of one canvas element, for the `list_elements` tool.
@@ -1411,6 +1459,9 @@ pub fn all_tools(
             active: active_skill,
         }),
         Box::new(AddPageTool {
+            events: events.clone(),
+        }),
+        Box::new(DeletePageTool {
             events: events.clone(),
         }),
         Box::new(ListElementsTool { snapshot }),

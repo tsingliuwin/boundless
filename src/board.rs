@@ -168,11 +168,17 @@ pub struct BoardView {
     /// fits exactly to that page's rect, all floating chrome hides, and
     /// PageUp/PageDown/Escape flip or exit. None = normal editing view.
     presenting: Option<usize>,
-    /// Page index to bring the camera to on the next render frame. Set by the
-    /// AI's `add_page` op, which is applied *inside* the AiPanel's update —
-    /// reading the panel (for its docked width) there would panic, so the
-    /// camera move is deferred to render, outside any update stack.
+    /// Page index to bring the camera to on the next render frame. Set when
+    /// the AI **switches pages**: an op landing on a different page than the
+    /// AI's previous one moves the camera there (watching each slide being
+    /// composed in turn), while same-page ops never steal the camera — the
+    /// user can flip to earlier pages and browse while the AI keeps filling
+    /// the current one. Consumed by render, outside any update stack
+    /// (reading the panel's width inside AiPanel's update panics).
     pending_page_focus: Option<usize>,
+    /// The page the AI last operated on — the stickiness reference for the
+    /// follow rule above. Manual page flips don't touch it.
+    ai_focus_page: Option<usize>,
     /// Index of the currently open top-level menu in the Windows in-app menu
     /// bar (None = all collapsed). Unused on macOS, which uses the native
     /// `set_menus` bar; the field compiles everywhere because the menu-bar
@@ -230,6 +236,7 @@ impl BoardView {
             canvas_background: None,
             presenting: None,
             pending_page_focus: None,
+            ai_focus_page: None,
             menubar_open: None,
             update_state: crate::updater::UpdateState::default(),
             render_cache: crate::render::cache::RenderCache::new(),
@@ -748,6 +755,9 @@ impl BoardView {
         // hand-drawn shape.
         let style = self.style.clone();
         let styled = |s: CanvasStyle| CanvasStyle::merge_into(s, style);
+        // Which page this op's content lands on (the follow-camera target).
+        // AddPage/DeletePage manage their own focus inside their arms.
+        let mut follow = self.page_of_op(&op);
 
         let outcome: CanvasOpOutcome = match op {
             CanvasOp::Rectangle {
@@ -1172,20 +1182,56 @@ impl BoardView {
                         crate::scene::pages::push_page(&mut self.scene.pages, title, r);
                     (p.bounds(), p.title.clone(), n)
                 };
-                // Bring the camera to the new page so the user watches the
-                // model compose each slide in turn. Deferred to the next
-                // render frame: this op is applied inside the AiPanel's
-                // update, where reading the panel (viewport width) panics.
-                self.pending_page_focus = Some(number - 1);
+                // Follow camera: the AI switched to the new page. Deferred to
+                // the next render frame (this op runs inside the AiPanel's
+                // update, where reading the panel's width panics).
+                follow = Some(number - 1);
                 self.mark_dirty();
                 cx.notify();
                 Ok(format!(
-                    "已创建第 {number} 页「{title}」（{}），区域 ({},{}) 尺寸 {}×{}。本页所有内容必须画在该矩形内（四周留 ≥30 边距），页面之间的空隙不要放任何元素。",
+                    "已创建第 {number} 页「{title}」（{}），区域 ({},{}) 尺寸 {}×{}。立即绘制本页的全部内容，画完再开下一页；不要先把所有页面都开完再回头填内容。",
                     r.label(),
                     rect.x as i32,
                     rect.y as i32,
                     rect.w as i32,
                     rect.h as i32
+                ))
+            }
+            CanvasOp::DeletePage { number } => {
+                if self.scene.pages.is_empty() {
+                    return Err(CanvasOpError::not_found("画布上没有页面"));
+                }
+                let idx = match number {
+                    Some(n) if n >= 1 => {
+                        if n > self.scene.pages.len() {
+                            return Err(CanvasOpError::not_found(format!(
+                                "第 {n} 页不存在（共 {} 页）",
+                                self.scene.pages.len()
+                            )));
+                        }
+                        n - 1
+                    }
+                    _ => self.scene.pages.len() - 1,
+                };
+                let title = self.scene.pages[idx].title.clone();
+                self.scene.pages.remove(idx);
+                // Keep the presenting index valid (flip clamps on next use).
+                if let Some(p) = self.presenting {
+                    self.presenting = Some(if idx < p {
+                        p.saturating_sub(1)
+                    } else {
+                        p.min(self.scene.pages.len().saturating_sub(1))
+                    });
+                }
+                if self.ai_focus_page == Some(idx) {
+                    self.ai_focus_page = None;
+                }
+                self.mark_dirty();
+                cx.notify();
+                Ok(format!(
+                    "已删除第 {} 页「{title}」（页内元素保留在画布上）。剩余 {} 页。",
+                    idx + 1,
+                    self.scene.pages.len()
                 ))
             }
             CanvasOp::UpdateElement {
@@ -1321,11 +1367,61 @@ impl BoardView {
                 Ok("已清空画布".to_string())
             }
         };
+        // Follow camera: when the AI switches to a different page, bring the
+        // view along (deferred to render). Same-page ops never move the
+        // camera, so the user can browse other pages while the AI keeps
+        // filling the one it's on.
+        if outcome.is_ok() {
+            if let Some(p) = follow {
+                if self.ai_focus_page != Some(p) {
+                    self.ai_focus_page = Some(p);
+                    if self.presenting.is_none() {
+                        self.pending_page_focus = Some(p);
+                    }
+                }
+            }
+        }
         if outcome.is_ok() {
             self.mark_dirty();
             cx.notify();
         }
         outcome
+    }
+
+    /// The page an op's content lands on (its anchor point's containing
+    /// page) — the follow-camera target. `None` = not page-bound (background,
+    /// clear, page ops) or landing in the gap between pages.
+    fn page_of_op(&self, op: &CanvasOp) -> Option<usize> {
+        let (x, y) = match op {
+            CanvasOp::Rectangle { x, y, w, h, .. }
+            | CanvasOp::Ellipse { x, y, w, h, .. }
+            | CanvasOp::Diamond { x, y, w, h, .. } => (x + w / 2.0, y + h / 2.0),
+            // Text: x is the top-left corner — or the center line when
+            // center-anchored; both land inside the target page.
+            CanvasOp::Text { x, y, .. } => (*x, *y),
+            CanvasOp::Line { points, .. } | CanvasOp::Arrow { points, .. } => {
+                let p = points.get(points.len() / 2)?;
+                (p.x, p.y)
+            }
+            CanvasOp::Polygon { points, .. } => {
+                let p = points.first()?;
+                (p.x, p.y)
+            }
+            CanvasOp::Mindmap { cx, cy, .. } => (cx.unwrap_or(800.0), cy.unwrap_or(500.0)),
+            CanvasOp::UpdateElement { id, x, y, .. } => {
+                let uuid = self.scene.find_by_id_prefix(id)?;
+                let el = self.scene.get(uuid)?;
+                match (x, y) {
+                    (Some(nx), Some(ny)) => (*nx, *ny),
+                    _ => (
+                        el.bounds.x + el.bounds.w / 2.0,
+                        el.bounds.y + el.bounds.h / 2.0,
+                    ),
+                }
+            }
+            _ => return None,
+        };
+        crate::scene::pages::page_at(&self.scene.pages, x, y)
     }
 
     /// Create a bound text label centered inside a container shape. Mirrors
@@ -2080,6 +2176,11 @@ impl BoardView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Presentation mode is view-only: no drawing, selecting or panning.
+        // Flipping is keyboard-driven (PageUp/PageDown/arrows), Esc exits.
+        if self.presenting.is_some() {
+            return;
+        }
         // Windows: the in-app menu bar spans the top MENU_BAR_HEIGHT px. Clicks
         // there belong to the menu bar (labels / drag spacer / caption buttons),
         // not the canvas, so don't start a canvas action. The caption buttons
@@ -2973,6 +3074,11 @@ impl BoardView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Presentation mode locks the camera: one page fills the view
+        // exactly, and a wheel zoom would let the neighbors leak in.
+        if self.presenting.is_some() {
+            return;
+        }
         // Let the AI panel's messages area handle its own scroll; don't zoom/pan
         // the canvas when the wheel turns over the panel.
         if self.over_ai_panel(event.position, window, cx) {

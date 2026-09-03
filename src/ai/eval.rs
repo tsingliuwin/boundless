@@ -573,13 +573,36 @@ pub fn apply(
             let (page, number) = crate::scene::pages::push_page(&mut c.pages, title.clone(), r);
             c.ops_applied += 1;
             msg = format!(
-                "已创建第 {number} 页「{}」（{}），区域 ({},{}) 尺寸 {}×{}。本页所有内容必须画在该矩形内（四周留 ≥30 边距），页面之间的空隙不要放任何元素。",
+                "已创建第 {number} 页「{}」（{}），区域 ({},{}) 尺寸 {}×{}。立即绘制本页的全部内容，画完再开下一页；不要先把所有页面都开完再回头填内容。",
                 page.title,
                 r.label(),
                 page.x as i32,
                 page.y as i32,
                 page.w as i32,
                 page.h as i32
+            );
+        }
+        CanvasOp::DeletePage { number } => {
+            if c.pages.is_empty() {
+                c.ops_failed += 1;
+                return Err("画布上没有页面".to_string());
+            }
+            let idx = match number {
+                Some(n) if *n >= 1 => {
+                    if *n > c.pages.len() {
+                        c.ops_failed += 1;
+                        return Err(format!("第 {n} 页不存在（共 {} 页）", c.pages.len()));
+                    }
+                    *n - 1
+                }
+                _ => c.pages.len() - 1,
+            };
+            c.pages.remove(idx);
+            c.ops_applied += 1;
+            msg = format!(
+                "已删除第 {} 页（页内元素保留在画布上）。剩余 {} 页。",
+                idx + 1,
+                c.pages.len()
             );
         }
     }

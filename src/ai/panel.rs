@@ -1648,6 +1648,7 @@ fn tool_label(name: &str) -> &'static str {
         "set_canvas_background" => "底色",
         "use_skill" => "技能",
         "add_page" => "页面",
+        "delete_page" => "页面",
         _ => "图形",
     }
 }
@@ -1680,6 +1681,7 @@ fn tool_op(name: &str) -> ToolOp {
         "set_canvas_background" => ToolOp::Config,
         "use_skill" => ToolOp::Skill,
         "add_page" => ToolOp::Config,
+        "delete_page" => ToolOp::Delete,
         _ => ToolOp::Other,
     }
 }
@@ -1746,6 +1748,14 @@ fn tool_header(name: &str, args: &serde_json::Value) -> (String, Rgba) {
             } else {
                 format!("{} {} #{} {}", op.icon(), op.verb(), id, change)
             }
+        }
+        ToolOp::Delete if name == "delete_page" => {
+            let n = args
+                .get("number")
+                .and_then(|v| v.as_u64())
+                .map(|n| format!("第 {n} 页"))
+                .unwrap_or_else(|| "最后一页".to_string());
+            format!("{} {}{}", op.icon(), op.verb(), n)
         }
         ToolOp::Delete => format!("{} {} #{}", op.icon(), op.verb(), short_id(args)),
         ToolOp::Clear => format!("{} {}画布", op.icon(), op.verb()),
@@ -2169,6 +2179,14 @@ fn tool_call_detail(name: &str, args: &serde_json::Value) -> String {
         "use_skill" => {
             let s = obj.get("name").and_then(|v| v.as_str()).unwrap_or("?");
             format!("场景技能「{s}」的构图规范（按需加载，非画布元素）")
+        }
+        "delete_page" => {
+            let n = args
+                .get("number")
+                .and_then(|v| v.as_u64())
+                .map(|n| format!("第 {n} 页"))
+                .unwrap_or_else(|| "最后一页".to_string());
+            format!("{n}（页框；页内元素保留在画布上）")
         }
         "add_page" => {
             let title = obj
