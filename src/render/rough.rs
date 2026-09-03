@@ -126,10 +126,12 @@ fn options_for(style: &ElementStyle, seed: u64, is_freedraw: bool) -> Options {
         // - solid：密排线（间距 = 线宽），线宽 ≥ 间距 → 视觉实心色块，
         //   且细纹理恰好契合粉笔/水墨质感。
         options.fill_style = Some(match style.fill_style {
+            // 线宽 ≥ 2× 间距：相邻排线重叠过半 → 视觉实心、无条纹
+            // （半透明叠色的重叠处会有轻微加深，恰似墨色堆积）。
             SceneFillStyle::Solid => {
-                let weight = (style.stroke_width as f32 * 0.75).max(0.75);
-                options.fill_weight = Some(weight);
-                options.hachure_gap = Some(weight);
+                let gap = (style.stroke_width * 0.75).max(0.6) as f32;
+                options.fill_weight = Some(gap * 2.2);
+                options.hachure_gap = Some(gap);
                 FillStyle::Hachure
             }
             SceneFillStyle::Hachure => {

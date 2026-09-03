@@ -27,48 +27,41 @@ impl gpui::Render for FillRepro {
                     let rx = w * 0.28;
                     let ry = h * 0.22;
 
-                    // 1. ellipse via LINE segments, alpha 0.5 (the exact
-                    //    mechanics of paint_world_geom's fill: flatten → fill).
-                    let mut b = PathBuilder::fill();
+                    // 1. ellipse via LINE segments, alpha 1.0 — drawn TWICE:
+                    //    left = clockwise, right = REVERSED. If the GPU culls
+                    //    one winding, only one will show.
                     let n = 64;
-                    for i in 0..=n {
-                        let t = i as f32 / n as f32 * std::f32::consts::TAU;
-                        let p: Point<Pixels> =
-                            point(px(cx0 + rx * t.cos()), px(cy0 + ry * t.sin()));
-                        if i == 0 {
-                            b.move_to(p);
-                        } else {
-                            b.line_to(p);
+                    for (half, reverse) in [(0.0, false), (0.55, true)] {
+                        let cc = ox + w * (0.25 + half);
+                        let ccy = oy + h * 0.4;
+                        let rrx = rx * 0.6;
+                        let rry = ry * 0.6;
+                        let mut pts: Vec<Point<Pixels>> = Vec::new();
+                        for i in 0..=n {
+                            let t = i as f32 / n as f32 * std::f32::consts::TAU;
+                            pts.push(point(
+                                px(cc + rrx * t.cos()),
+                                px(ccy + rry * t.sin()),
+                            ));
                         }
-                    }
-                    b.close();
-                    match b.build() {
-                        Ok(path) => {
-                            window.paint_path(path, gpui::hsla(0.35, 0.2, 0.35, 0.5));
+                        if reverse {
+                            pts.reverse();
                         }
-                        Err(e) => eprintln!("line-seg ellipse build failed: {e}"),
-                    }
-
-                    // 2. ellipse via CURVE segments, alpha 0.8.
-                    let cy1 = oy + h * 0.72;
-                    let mut b = PathBuilder::fill();
-                    b.move_to(point(px(cx0 - rx), px(cy1)));
-                    let n = 8;
-                    for i in 1..=n {
-                        let t0 = (i - 1) as f32 / n as f32 * std::f32::consts::TAU;
-                        let t1 = i as f32 / n as f32 * std::f32::consts::TAU;
-                        let tm = (t0 + t1) / 2.0;
-                        b.curve_to(
-                            point(px(cx0 + rx * tm.cos()), px(cy1 + ry * tm.sin())),
-                            point(px(cx0 + rx * t1.cos()), px(cy1 + ry * t1.sin())),
-                        );
-                    }
-                    b.close();
-                    match b.build() {
-                        Ok(path) => {
-                            window.paint_path(path, gpui::hsla(0.0, 0.6, 0.45, 0.8));
+                        let mut b = PathBuilder::fill();
+                        for (i, p) in pts.iter().enumerate() {
+                            if i == 0 {
+                                b.move_to(*p);
+                            } else {
+                                b.line_to(*p);
+                            }
                         }
-                        Err(e) => eprintln!("curve ellipse build failed: {e}"),
+                        b.close();
+                        match b.build() {
+                            Ok(path) => {
+                                window.paint_path(path, gpui::hsla(0.35, 0.2, 0.35, 1.0));
+                            }
+                            Err(e) => eprintln!("fill build failed: {e}"),
+                        }
                     }
 
                     // 3. quad reference (known-good rendering path).
