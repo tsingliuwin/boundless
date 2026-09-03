@@ -72,6 +72,8 @@ pub struct AiPanel {
     /// set_value needs a Window, which is only available in render / event
     /// handlers that receive one).
     pending_clear_input: bool,
+    /// 本条用户消息是否已做过「只说不画」的自动重试（每条消息最多一次）。
+    narration_retried: bool,
     /// Indices of steps the user has manually expanded/collapsed in the live
     /// streaming bubble. A step present here is force-toggled from its default
     /// (reasoning steps default open while streaming, closed after; tool steps
@@ -186,6 +188,7 @@ impl AiPanel {
             model_input,
             notice: None,
             pending_clear_input: false,
+            narration_retried: false,
             open_stream_steps: HashSet::new(),
             open_done_steps: HashSet::new(),
             messages_scroll: ScrollHandle::new(),
@@ -254,6 +257,7 @@ impl AiPanel {
         // Defer clearing the input: InputState::set_value needs a Window,
         // which subscribe callbacks don't have. The flag is consumed in render.
         self.pending_clear_input = true;
+        self.narration_retried = false;
         self.error = None;
         let msg = ChatMessage::user(text);
         self.persist(&msg);
@@ -633,6 +637,15 @@ impl AiPanel {
                 drew_anything,
             } => {
                 super::log::end_run(drew_anything, &text);
+                // 兜底：模型只输出文字没调用任何绘图工具（flash 级模型的
+                // 偶发行为）→ 带着原考题自动重试一次，防止用户白等。
+                if !drew_anything && !panel.narration_retried {
+                    panel.narration_retried = true;
+                    panel.streaming = None;
+                    cx.notify();
+                    panel.start_agent(cx);
+                    return false;
+                }
                 panel.finish_streaming(text, drew_anything, cx);
                 false
             }
