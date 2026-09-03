@@ -1744,11 +1744,11 @@ pub fn evaluate_mindmap(
 // 幻灯片（PPT）rubric
 // ---------------------------------------------------------------------------
 
-/// Tool-call budget per page for a slide-deck run: a rich page (title + body
-/// blocks + decor + page number) costs ~12-18 calls. The ceiling scales with
-/// the actual page count so polished decks pass while a runaway loop
-/// (redrawing the same page over and over without adding pages) still fails.
-const SLIDES_BUDGET_PER_PAGE: usize = 20;
+/// Tool-call budget per page for a slide-deck run. Measured across two real
+/// runs: lean 16:9 decks cost ~13/page, card-rich 9:16 decks ~25/page — 26
+/// covers both while a runaway loop (redrawing pages without adding new ones)
+/// still fails. The ceiling scales with the actual page count.
+const SLIDES_BUDGET_PER_PAGE: usize = 26;
 const SLIDES_BUDGET_BASE: usize = 20;
 /// Elements may poke this far past their page's rect before counting as
 /// out-of-page (matches the board's BOUNDS_TOL spirit).
@@ -1862,6 +1862,41 @@ pub fn evaluate_slides(
             "全部页面有文字".to_string()
         } else {
             format!("无文字: {}", textless_pages.join("、"))
+        },
+    ));
+
+    // -- 垂直构图：内容纵向铺开，不许堆在页面上部 --
+    // 竖屏首秀的实测缺陷：横版公式套竖屏，内容挤在上面 40%，下半整段空白。
+    // 页码（右下角小字）不计入跨度，否则它会伪装成“沉底”的内容。
+    let mut shallow_pages: Vec<String> = Vec::new();
+    for (i, p) in canvas.pages.iter().enumerate() {
+        let mut max_bottom = p.y;
+        for e in canvas.elements.iter() {
+            let (cx, cy) = center(e);
+            if cx < p.x || cx > p.x + p.w || cy < p.y || cy > p.y + p.h {
+                continue;
+            }
+            let is_page_number = matches!(e.kind, "text" | "label")
+                && e.font_size <= 18.0
+                && e.w <= 220.0
+                && cy > p.y + 0.88 * p.h;
+            if is_page_number {
+                continue;
+            }
+            max_bottom = max_bottom.max(e.y + e.h);
+        }
+        let span = (max_bottom - p.y) / p.h;
+        if span < 0.55 {
+            shallow_pages.push(format!("第{}页(纵向跨度 {:.0}%)", i + 1, span * 100.0));
+        }
+    }
+    checks.push(check(
+        "每页内容纵向铺开（跨度 ≥ 55% 页高）",
+        shallow_pages.is_empty(),
+        if shallow_pages.is_empty() {
+            "全部页面纵向铺满".to_string()
+        } else {
+            format!("内容堆上部: {}", shallow_pages.join("；"))
         },
     ));
 
@@ -2022,8 +2057,9 @@ mod slides_tests {
             // layout: each new page sits after the previous ones).
             let canvas = replay(&ops);
             let p = canvas.pages.last().unwrap().clone();
-            ops.push(text_op(&p, 0.0, "页标题"));
-            ops.push(text_op(&p, 60.0, "正文要点一二三"));
+            // Title + body spread down the page (the vertical-composition rule).
+            ops.push(text_op(&p, 0.22 * p.h, "页标题"));
+            ops.push(text_op(&p, 0.60 * p.h, "正文要点一二三"));
         }
         ops
     }
@@ -2057,6 +2093,29 @@ mod slides_tests {
             .checks
             .iter()
             .any(|c| c.name.contains("比例") && !c.passed));
+    }
+
+    #[test]
+    fn content_crammed_at_top_fails() {
+        // The 9:16 debut defect: everything packed into the top of the page
+        // while the bottom half stays empty. The page-number exemption must
+        // not mask it (these are body-size texts anyway).
+        let ops = vec![page_op("封面", "16:9")];
+        let canvas = replay(&ops);
+        let p = canvas.pages.last().unwrap().clone();
+        let mut ops = ops;
+        ops.push(text_op(&p, 100.0, "标题"));
+        ops.push(text_op(&p, 160.0, "正文"));
+        let canvas = replay(&ops);
+        let report = evaluate_slides(&canvas, true, ops.len(), 1, PageRatio::Ratio16_9);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.name.contains("纵向铺开") && !c.passed),
+            "crammed page must fail:\n{}",
+            report.to_text()
+        );
     }
 
     #[test]

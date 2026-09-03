@@ -3,10 +3,10 @@
 //! Runs the drawing agent against the fixed exam prompt (5 页 PPT) without
 //! any GPUI/UI, replays the emitted CanvasOps into a virtual canvas, and
 //! scores the result against `eval::evaluate_slides` (page count, ratio,
-//! per-page content, in-page placement, text overlap). The tool-call JSONL
-//! log and the report land in `~/.boundless/agent-logs/`.
+//! per-page content, in-page placement, vertical composition, text overlap).
+//! The tool-call JSONL log and the report land in `~/.boundless/agent-logs/`.
 //!
-//! Usage: `cargo run --example slides_eval`
+//! Usage: `cargo run --example slides_eval [-- 16:9|4:3|9:16|3:4|1:1]`
 //! Exit code: 0 = 达标, 1 = 未达标, 2 = 运行失败（配置/网络等）。
 
 use boundless::ai::agent::{AgentEvent, BoundlessAgent};
@@ -16,9 +16,14 @@ use boundless::scene::pages::PageRatio;
 use futures::StreamExt;
 use std::sync::{Arc, Mutex};
 
-/// The fixed exam prompt — identical across runs so rounds are comparable.
-/// Ratio is 16:9 (the default); a ratio variant can probe add_page args.
-const EXAM_PROMPT: &str = "请做一份关于「高效学习方法」的 PPT：5 页（封面、目录、三张内容页），比例 16:9，版式清晰、每页要点精炼。";
+/// The fixed exam shape — identical across runs so rounds are comparable.
+/// The ratio comes from the CLI (default 16:9).
+fn exam_prompt(ratio: &PageRatio) -> String {
+    format!(
+        "请做一份关于「高效学习方法」的 PPT：5 页（封面、目录、三张内容页），比例 {}，版式清晰、要点精炼，内容要铺满页面版心。",
+        ratio.label()
+    )
+}
 
 fn main() {
     if let Err(e) = run() {
@@ -28,6 +33,14 @@ fn main() {
 }
 
 fn run() -> anyhow::Result<()> {
+    let ratio = match std::env::args().nth(1) {
+        Some(s) => PageRatio::parse(&s).unwrap_or_else(|| {
+            eprintln!("未知比例 {s}（支持 16:9 / 4:3 / 9:16 / 3:4 / 1:1）");
+            std::process::exit(2);
+        }),
+        None => PageRatio::default(),
+    };
+    let prompt = exam_prompt(&ratio);
     let settings = AiSettings::load();
     if settings.api_key.trim().is_empty() {
         anyhow::bail!("未配置 API Key（~/.boundless/config.json 或环境变量 OPENAI_API_KEY）");
@@ -36,15 +49,15 @@ fn run() -> anyhow::Result<()> {
     let snapshot = Arc::new(Mutex::new(Vec::new()));
     let request = BoundlessAgent::stream(
         &settings,
-        EXAM_PROMPT.to_string(),
+        prompt.clone(),
         Vec::new(),
         snapshot.clone(),
         String::new(),
         boundless::ai::skills::ActiveSkill::new(),
     )?;
-    println!("模型: {} — 考题[PPT]: {EXAM_PROMPT}", settings.model);
+    println!("模型: {} — 考题[PPT {}]: {prompt}", settings.model, ratio.label());
 
-    let log_path = boundless::ai::log::begin_run(EXAM_PROMPT, &settings.model);
+    let log_path = boundless::ai::log::begin_run(&prompt, &settings.model);
 
     // The virtual board: CanvasOps are applied here live (mirroring the
     // board's semantics via eval::apply) and the tool's oneshot reply is
@@ -115,7 +128,7 @@ fn run() -> anyhow::Result<()> {
         anyhow::bail!("agent 运行出错: {e}");
     }
 
-    let report = eval::evaluate_slides(&canvas, drew, total_calls, 5, PageRatio::Ratio16_9);
+    let report = eval::evaluate_slides(&canvas, drew, total_calls, 5, ratio);
     let report_text = report.to_text();
     println!("{report_text}");
 
