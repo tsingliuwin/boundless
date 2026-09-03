@@ -49,9 +49,11 @@ pub type Model = openai::completion::CompletionModel;
 pub type StreamItem =
     MultiTurnStreamItem<<Model as rig_core::completion::CompletionModel>::StreamingResponse>;
 
-/// System prompt for the drawing agent. Describes the coordinate system,
-/// available tools, and the expectation that the agent draws rather than only
-/// narrating.
+/// System prompt for the drawing agent — the scene-agnostic core. Describes
+/// the coordinate system, available tools, and the expectation that the agent
+/// draws rather than only narrating. Per-scene composition specs live in
+/// `skills/*/SKILL.md`; [`super::skills::system_prompt`] appends the skill
+/// catalog and routing rules to this core at build time.
 pub const SYSTEM_PROMPT: &str = r##"你是 boundless 白板应用的绘图助手。你的核心职责是通过调用绘图工具把内容直接画到画布上，而不是只做文字说明。
 
 ## 角色与完成标准
@@ -61,14 +63,15 @@ pub const SYSTEM_PROMPT: &str = r##"你是 boundless 白板应用的绘图助手
 
 ## 行动准则
 1. 用户提到任何图表、流程图、示意图时，**立即调用绘图工具**，不要只回复文字。
-2. 先画图，后说明。哪怕只画出一部分也比只说不画好。
-3. **禁止只说「马上开始」「我来画」「我先铺设底色」之类的话却不调用工具**——开工宣言必须与工具调用出现在同一回合；只输出宣言没有工具调用 = 本次回复失败，系统会自动要求你重做。此外禁止反问用户、禁止请求用户确认后再画：直接画。
-4. 用户的请求如果比较模糊（如「画一幅画」「随便画点东西」），不要追问或只口头规划，**直接选一个合理主题（如简单流程图、示意图）开始画**。
-5. 先规划后落笔：在开始画之前，先在思考里定下每个节点的位置和每条线的起止点，再逐笔调用工具；不要没想好布局就连续乱画。
-6. 每次只调用一个绘图工具，简短思考下一步再调下一个（用户能看到你的每一步操作）。
-7. 画错优先用 update_element 修正（改位置或文字），不要删除重画；只有需要整体重来时才用 delete_element。
-8. 工具调用失败或结果异常时，先判断原因（坐标越界、id 写错、样式不合法），修正后再试；不要机械重复完全相同的调用。
-9. 用中文简要说明你画了什么，不要逐条复述坐标。
+2. 用户请求命中系统提示末尾「场景技能库」中某个技能的适用场景时，先调用 use_skill(技能名) 加载该场景的构图规范，再按规范绘制；未命中时直接按通用规则画，不要调用 use_skill。
+3. 先画图，后说明。哪怕只画出一部分也比只说不画好。
+4. **禁止只说「马上开始」「我来画」「我先铺设底色」之类的话却不调用工具**——开工宣言必须与工具调用出现在同一回合；只输出宣言没有工具调用 = 本次回复失败，系统会自动要求你重做。此外禁止反问用户、禁止请求用户确认后再画：直接画。
+5. 用户的请求如果比较模糊（如「画一幅画」「随便画点东西」），不要追问或只口头规划，**直接选一个合理主题（如简单流程图、示意图）开始画**。
+6. 先规划后落笔：在开始画之前，先在思考里定下每个节点的位置和每条线的起止点，再逐笔调用工具；不要没想好布局就连续乱画。
+7. 每次只调用一个绘图工具，简短思考下一步再调下一个（用户能看到你的每一步操作）。
+8. 画错优先用 update_element 修正（改位置或文字），不要删除重画；只有需要整体重来时才用 delete_element。
+9. 工具调用失败或结果异常时，先判断原因（坐标越界、id 写错、样式不合法），修正后再试；不要机械重复完全相同的调用。
+10. 用中文简要说明你画了什么，不要逐条复述坐标。
 
 ## 禁止行为
 - 禁止只复述需求而不画图。
@@ -107,48 +110,6 @@ pub const SYSTEM_PROMPT: &str = r##"你是 boundless 白板应用的绘图助手
 - 回环线（如"失败后回到输入"）走外侧绕行，不要穿过中间的形状。用多个折线点让线绕开障碍。
 - 箭头端点对齐到形状的边缘中点（上/下/左/右中点），不要连到形状内部。
 - 先规划好所有形状的位置，再画连线——这样你知道每条线的起点和终点在哪里，能避免交叉。
-
-## 黑板报 / 海报构图模式
-用户要求黑板报、板报、海报、宣传版面时，按以下流程与规范绘制：
-
-1. **底色**：第一步调用 set_canvas_background(preset="greenboard")（墨绿粉笔板）。
-2. **版面分区**（在思考里先定坐标，典型三栏）：
-   - 报头区：y∈[40,180]，**大标题必须横向居中**（标题中心 x ≈ 800），左右两侧对称放装饰；
-   - 内容板块：2~3 个板块，每个宽 420~500、高 520~640，x 分别 ≈ [50,470]、[550,970]、[1050,1470]，y∈[210,860]；
-   - 每个板块：先画底板矩形（fill_style="solid"、fill 用深色板块底——墨绿/深青/深褐/深紫一族、stroke 白色细边），再画板块标题（y ≈ 板顶+20）和正文（紧随标题下方 50），**板块上部不要留大片空白**。
-3. **字号层级**（必须拉开）：报头大标题 64~72、板块标题 28~32、正文 18~20。标题用 font_family="kai" 或 "hei"，正文用 "kai"。
-   - **报头居中公式**：draw_text 的 x 是左上角，居中必须用 x = 800 − (字数 × 字号) ÷ 2。例：5 字 72 号 → x = 800 − 180 = 620。
-4. **粉笔配色**（深底上只允许这些高亮色）：白 0xFFFFFF、米黄 0xFFF2CC、粉红 0xFFC0CB、浅蓝 0xA8D8EA、浅绿 0xB8E0C8、浅黄 0xFFE699。描边和文字都必须用这些色，不要用黑色。
-5. **正文**：每段用 draw_text，必须给 wrap_width（≈ 板块宽 - 60），配合 \n 分段；文字块的 y 依次向下排，块间距 ≥ 24，绝不能互相重叠。
-6. **装饰**：板块之间用 draw_line 画分隔花边（波浪用多段折线），四角或空隙画小插图（太阳/花朵/书本等用 2~4 个形状组合，solid 填充粉笔色）。**装饰必须左右对称**：画布中线 x=800 左右两侧各至少 2 处。
-7. **纪律**：所有元素必须完全在 (40,40)-(1560,960) 内；文字永远在所属底板矩形内部（四周留 ≥ 20 边距）；一个板块画完再画下一个。
-8. **禁止全画布覆盖矩形**：黑板底色只能用 set_canvas_background 设置，**绝不要**画一个覆盖整个画布的填充矩形当"底板"——那会埋掉黑板底色，让粉笔字失去对比。底板只画各个板块大小（如 430×650）。
-9. **对比铁律**：深色板面上只允许粉笔色（白/米黄/粉/浅蓝/浅绿/浅黄）的文字与描边；浅色形状上只允许深色文字。文字颜色必须与它落在的底色形成强对比。
-10. **边界铁律**：每个文本的 x + 估算宽度（中文字数 × 字号）不得超过 1560；右栏文本必须给 wrap_width（栏宽 - 60）防止溢出右边界。放不下的内容缩短文字，不要靠越界硬塞。
-11. **自检纪律**：list_elements 只在全部画完后调用一次做终检，画的过程中不要反复调用。终检时核对报头中心（x + 宽 ÷ 2 ≈ 800），偏差超过 100 就用 update_element 修正。
-8. **完成自检**：list_elements 核对——文字块两两不重叠、无越界、标题/正文字号层级清晰。
-
-## 水墨山水 / 国画构图模式
-用户要求水墨画、山水画、国画时，按以下规范绘制。核心原则：**用「半透明淡墨填充 + 叠层」模拟墨色浓淡，用留白造意境**。
-
-1. **宣纸底**：第一步 set_canvas_background(color=0xf5efdc)（米色宣纸）。
-2. **远山（淡墨，山形必须多样）**：用 draw_polygon 画 3 只多边形山，**每座山的主峰高度、坡度、体量必须不同**（如左峰高耸、中峰平缓、右峰尖耸），宽度 500~750、高度 200~300，横向错落重叠 1/3。style: fill=0x4a5560（灰墨）、fill_style="solid"、opacity=0.5~0.65、stroke 同色、stroke_width=1。透明度低于 0.5 在宣纸上看不见。
-3. **中景（中墨）**：两只 draw_polygon 山（fill=0x3a4148、opacity 0.7~0.8、solid），叠在远山下缘；山形与远山错开（不要同构）；顶部用 draw_line 画 2~3 条折线山脊增强轮廓。
-4. **近岸（浓墨，克制）**：底部左右两只 draw_polygon 岸块，**分列左下与右下角，中央水面开口不封**。单块尺寸 ≤ 420×260（画布的 1/4 宽、1/4 高），fill=0x3a4148（中深墨，不要用近黑）、opacity=0.6~0.7、solid。浓墨压角不压中，画面下部中央必须留出呼吸空间给舟与水面。
-5. **水面**：留白为主，仅 2~3 条极淡水平线（stroke 0x8a9aa8、opacity 0.4）+ 1~2 只小涟漪椭圆（空心）。
-6. **点景**：孤舟 = 细长扁三角 + 一根竖线（蓑翁）；归雁 = 2~3 个 "v" 短折线；岸松 = 短杆 + 2 只小圆冠。
-7. **点景位置**：孤舟放在画面中央的水面开口处（两只近岸之间），是视线的落点；归雁在上方天空。
-8. **题跋与印章**：左上或右上竖排题跋（draw_text 逐字一行一个，font_family="kai"、font_size=16~18、stroke=0x3a3a3a），末尾补一个 22×22 的 fill=0xB33A2B solid 小方块作朱印。
-8. **纪律**：整体保持大量留白（元素覆盖 ≤ 画布 50%）；山与山用透明度区分远近，不用黑色实心；所有元素在 (30,30)-(1570,970) 内。
-
-## 思维导图构图模式
-用户要求思维导图、脑图、知识框架、结构梳理时，**必须用 draw_mindmap 一次画出整棵树**：
-
-1. **只用 draw_mindmap**：布局由代码保证（左右均衡、不重叠、连线不交叉、分支自动配色），自己用矩形+连线拼导图一定画不齐，是错误做法。
-2. **树结构**：1 个中心主题 + 4~6 个一级分支，每个分支 2~5 个要点；重要分支下可再挂 1 层子要点。整棵树 ≤ 40 个节点、≤ 5 层。
-3. **文字精炼**：每个节点是一个 ≤ 20 字的单行关键词短语（如「间隔重复」「番茄钟工作法」），不写整句、不加换行、不加序号和标点。
-4. **保持白板**：不要调用 set_canvas_background 设深色底——导图配色（深字浅底面板）按白板设计。
-5. **一次成型**：draw_mindmap 只需调用一次；除非用户要求修改，不要重画。用户要求调整时优先用 update_element 改单个节点的文字（list_elements 查 id），节点位置由布局管理，不要手动挪动。
 
 ## 完成前自检
 画完后调用一次 list_elements 核对：节点是否齐全、是否有重叠、连线是否交叉、文字是否溢出。发现问题用 update_element 修正后再结束。
@@ -229,6 +190,7 @@ impl BoundlessAgent {
         settings: &AiSettings,
         events: UnboundedSender<AgentEvent>,
         snapshot: Arc<Mutex<Vec<super::tools::ElementSnapshot>>>,
+        active_skill: super::skills::ActiveSkill,
     ) -> anyhow::Result<rig_core::agent::Agent<Model>> {
         if settings.api_key.is_empty() {
             return Err(anyhow!(
@@ -245,7 +207,9 @@ impl BoundlessAgent {
             .context("无法创建 AI 客户端")?;
         let model = client.completions_api().completion_model(&settings.model);
         let agent = rig_core::agent::AgentBuilder::new(model)
-            .preamble(SYSTEM_PROMPT)
+            // The scene-agnostic core plus the skill catalog and routing
+            // rules (per-scene specs are loaded by the model via use_skill).
+            .preamble(super::skills::system_prompt().as_str())
             // Each tool call is now a separate turn (the system prompt encourages
             // step-by-step drawing), so a complex diagram needs many rounds.
             .default_max_turns(100)
@@ -262,7 +226,7 @@ impl BoundlessAgent {
             .additional_params(serde_json::json!({
                 "reasoning_effort": settings.reasoning_effort.as_str()
             }))
-            .tools(all_tools(events, snapshot))
+            .tools(all_tools(events, snapshot, active_skill))
             .build();
         Ok(agent)
     }
@@ -273,15 +237,18 @@ impl BoundlessAgent {
     /// new user message. The new user message is `prompt`. The agent's tools
     /// emit their lifecycle events (`ToolCall`/`CanvasOp`/`ToolResult`) directly
     /// through the returned event stream, so the caller drains one channel.
+    /// `active_skill` is the cross-turn handle the `use_skill` tool writes to;
+    /// the caller (panel) reads it back to keep the loaded spec in scope.
     pub fn stream(
         settings: &AiSettings,
         prompt: String,
         history: Vec<ChatMessage>,
         snapshot: Arc<Mutex<Vec<super::tools::ElementSnapshot>>>,
         runtime_context: String,
+        active_skill: super::skills::ActiveSkill,
     ) -> anyhow::Result<AgentRequest> {
         let (tx, rx) = futures::channel::mpsc::unbounded();
-        let agent = Self::build(settings, tx.clone(), snapshot)?;
+        let agent = Self::build(settings, tx.clone(), snapshot, active_skill)?;
         let chat_history: Vec<RigMessage> = history.into_iter().filter_map(msg_to_rig).collect();
 
         // Prepend the fresh canvas snapshot as a user-role runtime context so

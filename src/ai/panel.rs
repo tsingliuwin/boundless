@@ -90,6 +90,11 @@ pub struct AiPanel {
     live_reasoning_scroll: ScrollHandle,
     /// Current panel width in px. User-resizable via the left edge handle.
     width: f32,
+    /// The currently active scenario skill, written by the `use_skill` tool
+    /// when the model loads a spec. Its body is prepended to the next turn's
+    /// runtime context so the spec stays in scope (chat history carries no
+    /// tool results). Cleared on new session.
+    active_skill: super::skills::ActiveSkill,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -194,6 +199,7 @@ impl AiPanel {
             messages_scroll: ScrollHandle::new(),
             live_reasoning_scroll: ScrollHandle::new(),
             width: DEFAULT_WIDTH,
+            active_skill: super::skills::ActiveSkill::new(),
             _subscriptions: subscriptions,
         }
     }
@@ -287,6 +293,7 @@ impl AiPanel {
         self.error = None;
         self.session_id = create_session();
         self.messages.clear();
+        self.active_skill.clear();
         self.show_sessions = false;
         cx.notify();
     }
@@ -301,6 +308,7 @@ impl AiPanel {
         self.stop_streaming(cx);
         self.streaming = None;
         self.error = None;
+        self.active_skill.clear();
         match load_messages(&id) {
             Ok(msgs) => {
                 self.session_id = id;
@@ -369,12 +377,30 @@ impl AiPanel {
         // lands in ~/.boundless/agent-logs/run-<ts>.jsonl for later analysis.
         super::log::begin_run(&prompt, &self.settings.model);
 
+        // Prepend the active skill's spec to the runtime context: a skill
+        // loaded via use_skill in an earlier turn is not in the chat history
+        // (tool results aren't stored), so the spec rides along with the
+        // fresh snapshot each turn.
+        let mut runtime_context = runtime_context;
+        if let Some(name) = self.active_skill.get() {
+            match super::skills::find(&name) {
+                Some(skill) => {
+                    runtime_context = format!(
+                        "当前活动技能规范（{}）：\n\n{}\n\n{runtime_context}",
+                        skill.name, skill.body
+                    );
+                }
+                None => self.active_skill.clear(),
+            }
+        }
+
         match BoundlessAgent::stream(
             &self.settings,
             prompt,
             history,
             snapshot.clone(),
             runtime_context,
+            self.active_skill.clone(),
         ) {
             Ok(request) => self.start_stream_task(request, snapshot, cx),
             Err(e) => {

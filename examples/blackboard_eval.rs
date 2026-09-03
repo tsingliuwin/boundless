@@ -71,6 +71,7 @@ fn run() -> anyhow::Result<()> {
         Vec::new(),
         snapshot.clone(),
         String::new(),
+        boundless::ai::skills::ActiveSkill::new(),
     )?;
     println!("模型: {} — 考题[{}]: {prompt}", settings.model, exam.name());
 

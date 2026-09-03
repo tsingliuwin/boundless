@@ -1103,6 +1103,90 @@ impl Tool for MindmapTool {
     }
 }
 
+// --- Use Skill --------------------------------------------------------------
+
+/// Arguments for `use_skill`.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct UseSkillArgs {
+    /// 技能名，取自系统提示「场景技能库」清单中的加粗名称，如 "mindmap"。
+    pub name: String,
+}
+
+/// Loads a scenario skill's composition spec (skills/*/SKILL.md). The system
+/// prompt carries only the one-line catalog; this tool hands the model the
+/// full per-scene spec on demand and records the activation so the panel can
+/// keep the spec in the runtime context across turns.
+pub struct UseSkillTool {
+    pub events: UnboundedSender<AgentEvent>,
+    pub active: super::skills::ActiveSkill,
+}
+
+impl Tool for UseSkillTool {
+    const NAME: &'static str = "use_skill";
+    type Error = ToolError;
+    type Args = UseSkillArgs;
+    type Output = String;
+
+    fn definition(
+        &self,
+        _prompt: String,
+    ) -> impl std::future::Future<Output = ToolDefinition> + Send {
+        let def = tool_def::<UseSkillArgs>(
+            Self::NAME,
+            "加载一个场景技能的完整构图规范。用户请求命中系统提示「场景技能库」中的某个技能时，第一步先调用本工具（传技能名 name），返回的规范必须严格遵循后再开始绘制。",
+        );
+        async move { def }
+    }
+
+    fn call(
+        &self,
+        args: Self::Args,
+    ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
+        let events = self.events.clone();
+        let active = self.active.clone();
+        let name = Self::NAME;
+        async move {
+            let id = next_tool_id(name);
+            let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
+            let _ = events.unbounded_send(AgentEvent::ToolCall {
+                id: id.clone(),
+                name: name.to_string(),
+                args: args_json,
+            });
+            match super::skills::find(args.name.trim()) {
+                Some(skill) => {
+                    active.set(&skill.name);
+                    let title = if skill.display_name.is_empty() {
+                        skill.name.clone()
+                    } else {
+                        format!("{}（{}）", skill.name, skill.display_name)
+                    };
+                    let result =
+                        format!("已加载技能「{title}」v{}的构图规范，后续绘制必须严格遵循：\n\n{}", skill.version, skill.body);
+                    let _ = events.unbounded_send(AgentEvent::ToolResult {
+                        id,
+                        result: result.clone(),
+                        is_error: false,
+                    });
+                    Ok(result)
+                }
+                None => {
+                    let msg = format!(
+                        "找不到技能 name={}。请核对系统提示「场景技能库」清单中的技能名。",
+                        args.name
+                    );
+                    let _ = events.unbounded_send(AgentEvent::ToolResult {
+                        id,
+                        result: msg.clone(),
+                        is_error: true,
+                    });
+                    Err(ToolError::not_found(msg))
+                }
+            }
+        }
+    }
+}
+
 // --- List Elements ---------------------------------------------------------
 
 /// A lightweight summary of one canvas element, for the `list_elements` tool.
@@ -1188,6 +1272,7 @@ pub struct NoArgs {}
 pub fn all_tools(
     events: UnboundedSender<AgentEvent>,
     snapshot: Arc<Mutex<Vec<ElementSnapshot>>>,
+    active_skill: super::skills::ActiveSkill,
 ) -> Vec<Box<dyn rig_core::tool::ToolDyn>> {
     vec![
         Box::new(RectangleTool {
@@ -1227,6 +1312,10 @@ pub fn all_tools(
         }),
         Box::new(MindmapTool {
             events: events.clone(),
+        }),
+        Box::new(UseSkillTool {
+            events: events.clone(),
+            active: active_skill,
         }),
         Box::new(ListElementsTool { snapshot }),
     ]

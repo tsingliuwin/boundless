@@ -8,5 +8,6 @@ pub mod eval;
 pub mod log;
 pub mod panel;
 pub mod settings;
+pub mod skills;
 pub mod store;
 pub mod tools;
