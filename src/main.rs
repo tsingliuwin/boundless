@@ -17,6 +17,15 @@ use boundless::board::{
 use gpui::*;
 use gpui_component::Root;
 
+/// Append a diagnostic line to ~/.boundless/panic.log (best effort).
+pub fn append_exit_diag(line: &str) {
+    use std::io::Write;
+    let path = boundless::ai::store::data_dir().join("panic.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 /// Install a process-wide panic hook that appends the panic message,
 /// location, and backtrace to `~/.boundless/panic.log`. Panics inside GPUI's
 /// event loop previously just made the window vanish (debug console closed /
@@ -70,6 +79,7 @@ fn main() {
     // ~/.boundless/panic.log (and stderr) so a "window just vanished" report
     // comes with a location and backtrace instead of nothing.
     install_panic_hook();
+    boundless::platform::install_crash_logger();
 
     Application::new()
         .with_assets(gpui_component_assets::Assets)
@@ -193,6 +203,10 @@ fn main() {
                     // the window is about to close so the red traffic light
                     // actually exits the app.
                     window.on_window_should_close(cx, |_, cx| {
+                        eprintln!("[exit-diag] window should_close requested -> quitting");
+                        boundless::ai::log::log_error(
+                            "window should_close requested -> quitting",
+                        );
                         cx.quit();
                         true
                     });

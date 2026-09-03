@@ -284,6 +284,45 @@ fn end_window_drag_windows() {
     }
 }
 
+/// Install a native unhandled-exception filter that records the exception
+/// code/address to panic.log. Native crashes (access violations in renderer
+/// or win32 calls) bypass Rust panic machinery entirely — without this they
+/// kill the process silently.
+pub fn install_crash_logger() {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        use windows::Win32::System::Diagnostics::Debug::SetUnhandledExceptionFilter;
+        SetUnhandledExceptionFilter(Some(unhandled_exception_filter));
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn unhandled_exception_filter(
+    info: *const windows::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+) -> i32 {
+    // EXCEPTION_EXECUTE_HANDLER
+    let code = if info.is_null() || (*info).ExceptionRecord.is_null() {
+        0
+    } else {
+        (*(*info).ExceptionRecord).ExceptionCode.0
+    };
+    let line = format!(
+        "[native-crash] exception code=0x{code:08x}
+"
+    );
+    let path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_default()
+        .join("native-crash.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write;
+        let _ = f.write_all(line.as_bytes());
+    }
+    eprintln!("[native-crash] exception code=0x{code:08x}");
+    1 // EXCEPTION_EXECUTE_HANDLER
+}
+
 /// Shared HWND lookup for the platform helpers (gpui::Window's inherent
 /// window_handle() shadows the trait method, hence the UFCS).
 #[cfg(target_os = "windows")]

@@ -71,6 +71,8 @@ windows = { version = "0.61", features = [
     # hook that feeds stylus pressure into the ink pipeline.
     "Win32_UI_Shell",
     "Win32_UI_Input_Pointer",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
     "Win32_Foundation",
 ] }
 # raw-window-handle is already in the dep graph (transitively via gpui); we add
