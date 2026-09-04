@@ -104,6 +104,28 @@ enum DownloadMsg {
     Done(std::result::Result<std::path::PathBuf, String>),
 }
 
+/// "当前时间：2026年9月4日 星期五" — pure so the format is unit-testable.
+fn now_line() -> String {
+    let now = chrono::Local::now();
+    // %u = ISO weekday number (Mon=1 … Sun=7); avoids chrono's alloc feature.
+    let wd = match now.format("%u").to_string().as_str() {
+        "1" => "一",
+        "2" => "二",
+        "3" => "三",
+        "4" => "四",
+        "5" => "五",
+        "6" => "六",
+        _ => "日",
+    };
+    format!(
+        "当前时间：{}年{}月{}日 星期{}",
+        now.format("%Y"),
+        now.format("%-m"),
+        now.format("%-d"),
+        wd
+    )
+}
+
 pub struct BoardView {
     pub scene: Scene,
     pub camera: Camera,
@@ -1521,6 +1543,12 @@ impl BoardView {
     /// prompt. The "supersedes earlier snapshots" header is added by the agent.
     pub fn runtime_context(&self) -> String {
         let mut body = String::new();
+
+        // The agent's clock: models have no idea what day it is, and decks /
+        // posters routinely carry dates. Fresh every turn — a long session
+        // crossing midnight stays correct without any tool call.
+        body.push_str(&now_line());
+        body.push('\n');
 
         // Visible world region so the agent draws on-screen instead of at the
         // hardcoded [0,1600]x[0,1000] the system prompt uses as a fallback.
@@ -6233,5 +6261,20 @@ impl BoardView {
                 .child(card)
                 .into_any_element(),
         )
+    }
+}
+
+#[cfg(test)]
+mod time_tests {
+    use super::now_line;
+
+    #[test]
+    fn now_line_has_expected_shape() {
+        let line = now_line();
+        assert!(line.starts_with("当前时间："), "{line}");
+        assert!(line.contains("年") && line.contains("月") && line.contains("日"), "{line}");
+        assert!(line.contains("星期"), "{line}");
+        // %-m / %-d: no leading zeros on month or day.
+        assert!(!line.contains("年0"), "{line}");
     }
 }

@@ -753,6 +753,7 @@ name = "boundless"
 version = "0.2.9"
 dependencies = [
  "anyhow",
+ "chrono",
  "dirs 6.0.0",
  "embed-resource",
  "euclid",

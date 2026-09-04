@@ -14,6 +14,7 @@ roughr = "0.12"
 euclid = "0.22"
 kurbo = "0.11"
 uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 anyhow = "1"
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
