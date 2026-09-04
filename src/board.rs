@@ -126,6 +126,15 @@ fn now_line() -> String {
     )
 }
 
+/// One camera glide: lerp from -> to with smoothstep over `dur_ms`.
+#[derive(Clone, Copy)]
+struct PageAnim {
+    from: Camera,
+    to: Camera,
+    started: std::time::Instant,
+    dur_ms: u64,
+}
+
 pub struct BoardView {
     pub scene: Scene,
     pub camera: Camera,
@@ -201,6 +210,9 @@ pub struct BoardView {
     /// The page the AI last operated on — the stickiness reference for the
     /// follow rule above. Manual page flips don't touch it.
     ai_focus_page: Option<usize>,
+    /// In-flight camera glide between pages (flip / present-open). Driven by
+    /// a 16ms tick task; render interpolates from `started` with smoothstep.
+    page_anim: Option<PageAnim>,
     /// Viewport size the presenting camera was last fit to. The fullscreen
     /// toggle and window resizes land a frame after the fit, so render
     /// re-fits whenever the viewport size drifts from this.
@@ -272,6 +284,7 @@ impl BoardView {
             presenting: None,
             pending_page_focus: None,
             ai_focus_page: None,
+            page_anim: None,
             last_present_fit: None,
             present_debut: false,
             last_seen_viewport: None,
@@ -2094,27 +2107,73 @@ impl BoardView {
         crate::scene::pages::page_at(&self.scene.pages, c.x, c.y)
     }
 
-    /// Camera-fit exactly to a page's rect (no margin) — the flip/present view.
-    fn fit_to_page(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(p) = self.scene.pages.get(index) else {
-            return;
-        };
+    /// The exact-fit camera for a page (presentation framing).
+    fn page_exact_camera(&self, index: usize, cx: &mut Context<Self>) -> Option<Camera> {
+        let p = self.scene.pages.get(index)?;
         let vp = self.viewport_bounds(cx);
-        self.camera.zoom_to_rect_exact(p.bounds(), vp.size);
+        let mut cam = self.camera;
+        cam.zoom_to_rect_exact(p.bounds(), vp.size);
+        Some(cam)
+    }
+
+    /// Glide the camera to `to` over `dur_ms` (smoothstep). A 16ms tick task
+    /// keeps frames coming; render advances the interpolation.
+    fn animate_camera_to(&mut self, to: Camera, dur_ms: u64, cx: &mut Context<Self>) {
+        if self.camera == to {
+            return;
+        }
+        self.page_anim = Some(PageAnim {
+            from: self.camera,
+            to,
+            started: std::time::Instant::now(),
+            dur_ms,
+        });
         cx.notify();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(16))
+                    .await;
+                let mut running = false;
+                this.update(cx, |this, cx| {
+                    if let Some(anim) = &this.page_anim {
+                        running =
+                            anim.started.elapsed().as_millis() < anim.dur_ms as u128 + 2;
+                        cx.notify();
+                    }
+                })
+                .ok();
+                if !running {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Flip to a page by index (clamped). Enters presentation mode if
-    /// presenting, otherwise just moves the camera.
+    /// presenting, otherwise just moves the camera — always as a camera
+    /// glide: pages sit side by side, so flipping reads as a lateral sweep.
     fn goto_page(&mut self, index: usize, cx: &mut Context<Self>) {
         if self.scene.pages.is_empty() {
             return;
         }
         let i = index.min(self.scene.pages.len() - 1);
-        if self.presenting.is_some() {
+        let presenting = self.presenting.is_some();
+        if presenting {
             self.presenting = Some(i);
         }
-        self.fit_to_page(i, cx);
+        match self.page_exact_camera(i, cx) {
+            Some(mut to) => {
+                if !presenting {
+                    // Editing flips keep the fit margin.
+                    let vp = self.viewport_bounds(cx);
+                    to.zoom_to_fit(self.scene.pages[i].bounds(), vp.size);
+                }
+                self.animate_camera_to(to, 300, cx);
+            }
+            None => {}
+        }
     }
 
     fn goto_prev_page(&mut self, cx: &mut Context<Self>) {
@@ -2159,13 +2218,10 @@ impl BoardView {
                 if this.presenting.is_some() && this.present_debut {
                     this.present_debut = false;
                     if let Some(i) = this.presenting {
-                        if let Some(p) = this.scene.pages.get(i) {
-                            let vp = this.viewport_bounds(cx);
-                            let mut cam = this.camera;
-                            cam.zoom_to_rect_exact(p.bounds(), vp.size);
-                            this.camera = cam;
-                            this.last_present_fit =
-                                Some((vp.size.width.to_f64(), vp.size.height.to_f64()));
+                        // Reveal with a glide: from wherever the camera sits
+                        // straight into the page's exact fit.
+                        if let Some(to) = this.page_exact_camera(i, cx) {
+                            this.animate_camera_to(to, 450, cx);
                         }
                     }
                     cx.notify();
@@ -4171,31 +4227,55 @@ impl BoardView {
 
 impl Render for BoardView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Camera glide interpolation. Runs ahead of the presenting drift
+        // refit (which is skipped while an anim is in flight, so the two
+        // never fight); on completion the present-fit bookkeeping syncs.
+        if let Some(anim) = self.page_anim {
+            let t = (anim.started.elapsed().as_millis() as f64 / anim.dur_ms as f64)
+                .clamp(0.0, 1.0);
+            if t >= 1.0 {
+                self.camera = anim.to;
+                self.page_anim = None;
+                if self.presenting.is_some() {
+                    let vp = self.viewport_bounds(cx);
+                    self.last_present_fit =
+                        Some((vp.size.width.to_f64(), vp.size.height.to_f64()));
+                }
+            } else {
+                let e = t * t * (3.0 - 2.0 * t); // smoothstep
+                self.camera.x = anim.from.x + (anim.to.x - anim.from.x) * e;
+                self.camera.y = anim.from.y + (anim.to.y - anim.from.y) * e;
+                self.camera.zoom = anim.from.zoom + (anim.to.zoom - anim.from.zoom) * e;
+            }
+        }
+
         // Presenting camera upkeep: the fullscreen toggle (enter/exit) and
         // window resizes change the viewport a frame after the transition, so
         // re-fit whenever the viewport size drifts from the last fit. This is
         // what keeps the current slide exactly centered and filled.
         if let Some(i) = self.presenting {
-            let vp = self.viewport_bounds(cx);
-            let size = (vp.size.width.to_f64(), vp.size.height.to_f64());
-            if self.last_seen_viewport != Some(size) {
-                self.last_seen_viewport = Some(size);
-                self.present_resize_at = Some(std::time::Instant::now());
-            }
-            // The fullscreen transition and window resizes arrive in stages;
-            // fit only after the viewport has been quiet for a moment, so the
-            // slide never visibly chases the window.
-            let settled = self
-                .present_resize_at
-                .map(|t| t.elapsed() >= std::time::Duration::from_millis(150))
-                .unwrap_or(true);
-            if settled && self.last_present_fit != Some(size) {
-                if let Some(p) = self.scene.pages.get(i) {
-                    let mut cam = self.camera;
-                    cam.zoom_to_rect_exact(p.bounds(), vp.size);
-                    self.camera = cam;
-                    self.last_present_fit = Some(size);
-                    self.present_debut = false;
+            if self.page_anim.is_none() {
+                let vp = self.viewport_bounds(cx);
+                let size = (vp.size.width.to_f64(), vp.size.height.to_f64());
+                if self.last_seen_viewport != Some(size) {
+                    self.last_seen_viewport = Some(size);
+                    self.present_resize_at = Some(std::time::Instant::now());
+                }
+                // The fullscreen transition and window resizes arrive in
+                // stages; fit only after the viewport has been quiet for a
+                // moment, so the slide never visibly chases the window.
+                let settled = self
+                    .present_resize_at
+                    .map(|t| t.elapsed() >= std::time::Duration::from_millis(150))
+                    .unwrap_or(true);
+                if settled && self.last_present_fit != Some(size) {
+                    if let Some(p) = self.scene.pages.get(i) {
+                        let mut cam = self.camera;
+                        cam.zoom_to_rect_exact(p.bounds(), vp.size);
+                        self.camera = cam;
+                        self.last_present_fit = Some(size);
+                        self.present_debut = false;
+                    }
                 }
             }
         }
