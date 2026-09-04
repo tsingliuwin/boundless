@@ -7660,18 +7660,17 @@ impl BoardView {
     /// started before any page exists).
     fn render_page_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let weak = cx.weak_entity();
-        let (weak_prev, weak_next, weak_present, weak_add, weak_del) =
-            (weak.clone(), weak.clone(), weak.clone(), weak.clone(), weak.clone());
+        let (weak_prev, weak_next, weak_present, weak_del) =
+            (weak.clone(), weak.clone(), weak.clone(), weak.clone());
+        // Both branches below capture the add-page handler.
+        let (weak_add_empty, weak_add) = (weak.clone(), weak.clone());
         let total = self.scene.pages.len();
         let current = self
             .current_page_index()
             .map(|i| i + 1)
             .unwrap_or(if total > 0 { 1 } else { 0 });
-        let indicator = if total > 0 {
-            format!("{current}/{total}")
-        } else {
-            "–".to_string()
-        };
+        let indicator = format!("{current}/{total}");
+
         bar_container()
             .absolute()
             .bottom_3()
@@ -7680,30 +7679,75 @@ impl BoardView {
             .when(self.explorer_open, |d| {
                 d.left(px(Self::EXPLORER_W + 12.0))
             })
-            .child(bar_button("‹", false).on_click(move |_, _, cx| {
-                weak_prev.update(cx, |this, cx| this.goto_prev_page(cx)).ok();
-            }))
-            .child(
-                div()
-                    .id("page-indicator")
-                    .w_10()
-                    .text_center()
-                    .text_sm()
-                    .child(indicator),
-            )
-            .child(bar_button("›", false).on_click(move |_, _, cx| {
-                weak_next.update(cx, |this, cx| this.goto_next_page(cx)).ok();
-            }))
-            .child(bar_button("▶", false).on_click(move |_, window, cx| {
-                weak_present
-                    .update(cx, |this, cx| this.start_presenting(window, cx))
-                    .ok();
-            }))
-            .child(bar_button("＋页", false).on_click(move |_, _, cx| {
-                weak_add.update(cx, |this, cx| this.add_page_manual(cx)).ok();
-            }))
+            .when(total == 0, |d| {
+                // No pages yet: the bar is just "add page" — flip controls
+                // and the page counter only make sense once pages exist.
+                d.child(
+                    bar_icon_button(
+                        "page-add",
+                        false,
+                        Icon::new(IconName::Plus)
+                            .size(px(crate::icons::S))
+                            .text_color(icon_color(false)),
+                    )
+                    .on_click(move |_, _, cx| {
+                        weak_add_empty
+                            .update(cx, |this, cx| this.add_page_manual(cx))
+                            .ok();
+                    }),
+                )
+            })
             .when(total > 0, |d| {
-                d.child(bar_button("删页", false).on_click(move |_, _, cx| {
+                d.child(
+                    bar_icon_button(
+                        "page-prev",
+                        false,
+                        Icon::new(IconName::ChevronLeft)
+                            .size(px(crate::icons::S))
+                            .text_color(icon_color(false)),
+                    )
+                    .on_click(move |_, _, cx| {
+                        weak_prev.update(cx, |this, cx| this.goto_prev_page(cx)).ok();
+                    }),
+                )
+                .child(
+                    div()
+                        .id("page-indicator")
+                        .min_w_10()
+                        .text_center()
+                        .text_sm()
+                        .child(indicator),
+                )
+                .child(
+                    bar_icon_button(
+                        "page-next",
+                        false,
+                        Icon::new(IconName::ChevronRight)
+                            .size(px(crate::icons::S))
+                            .text_color(icon_color(false)),
+                    )
+                    .on_click(move |_, _, cx| {
+                        weak_next.update(cx, |this, cx| this.goto_next_page(cx)).ok();
+                    }),
+                )
+                .child(bar_button("▶", false).on_click(move |_, window, cx| {
+                    weak_present
+                        .update(cx, |this, cx| this.start_presenting(window, cx))
+                        .ok();
+                }))
+                .child(
+                    bar_icon_button(
+                        "page-add",
+                        false,
+                        Icon::new(IconName::Plus)
+                            .size(px(crate::icons::S))
+                            .text_color(icon_color(false)),
+                    )
+                    .on_click(move |_, _, cx| {
+                        weak_add.update(cx, |this, cx| this.add_page_manual(cx)).ok();
+                    }),
+                )
+                .child(bar_button("删页", false).on_click(move |_, _, cx| {
                     weak_del.update(cx, |this, cx| this.delete_current_page(cx)).ok();
                 }))
             })
@@ -7756,8 +7800,12 @@ impl BoardView {
         }
         div()
             .absolute()
-            .bottom_3()
+            // Stack above the page bar (which owns the bottom-left corner).
+            .bottom(px(56.0))
             .left_3()
+            .when(self.explorer_open, |d| {
+                d.left(px(Self::EXPLORER_W + 12.0))
+            })
             .text_xs()
             .text_color(rgb(0x888888))
             .child(text)
