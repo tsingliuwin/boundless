@@ -179,6 +179,10 @@ pub struct BoardView {
     /// The page the AI last operated on — the stickiness reference for the
     /// follow rule above. Manual page flips don't touch it.
     ai_focus_page: Option<usize>,
+    /// Viewport size the presenting camera was last fit to. The fullscreen
+    /// toggle and window resizes land a frame after the fit, so render
+    /// re-fits whenever the viewport size drifts from this.
+    last_present_fit: Option<(f64, f64)>,
     /// Index of the currently open top-level menu in the Windows in-app menu
     /// bar (None = all collapsed). Unused on macOS, which uses the native
     /// `set_menus` bar; the field compiles everywhere because the menu-bar
@@ -237,6 +241,7 @@ impl BoardView {
             presenting: None,
             pending_page_focus: None,
             ai_focus_page: None,
+            last_present_fit: None,
             menubar_open: None,
             update_state: crate::updater::UpdateState::default(),
             render_cache: crate::render::cache::RenderCache::new(),
@@ -2084,7 +2089,9 @@ impl BoardView {
 
     /// Enter presentation mode from the current page (or page 1) and take the
     /// window true-fullscreen — like PowerPoint's show mode, no title bar,
-    /// no taskbar. Returns whether presenting actually started.
+    /// no taskbar. Returns whether presenting actually started. The exact
+    /// camera fit happens in render: the fullscreen toggle lands a frame
+    /// after this call, and the viewport size must be final before fitting.
     fn start_presenting(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.scene.pages.is_empty() {
             self.set_notice("画布上还没有幻灯片页面", cx);
@@ -2092,25 +2099,25 @@ impl BoardView {
         }
         let start = self.current_page_index().unwrap_or(0);
         self.presenting = Some(start);
-        self.fit_to_page(start, cx);
+        self.last_present_fit = None;
         if !window.is_fullscreen() {
             window.toggle_fullscreen();
         }
+        cx.notify();
         true
     }
 
-    /// Leave presentation mode; keep the camera on the last page (with the
-    /// regular fit margin so editing can resume comfortably) and restore the
-    /// windowed geometry if the show took the window fullscreen.
+    /// Leave presentation mode; keep the camera on the last page (the fit
+    /// with the regular editing margin happens in render, once the windowed
+    /// viewport is back) and restore the windowed geometry if the show took
+    /// the window fullscreen.
     fn exit_presenting(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let last = self.presenting.take();
+        self.last_present_fit = None;
         if let Some(i) = last {
-            if let Some(p) = self.scene.pages.get(i) {
-                let vp = self.viewport_bounds(cx);
-                let mut cam = self.camera;
-                cam.zoom_to_fit(p.bounds(), vp.size);
-                self.camera = cam;
-            }
+            // Re-fit with the editing margin in render, after the windowed
+            // bounds are back (the current viewport is still fullscreen here).
+            self.pending_page_focus = Some(i);
         }
         if window.is_fullscreen() {
             window.toggle_fullscreen();
@@ -4092,6 +4099,23 @@ impl BoardView {
 
 impl Render for BoardView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Presenting camera upkeep: the fullscreen toggle (enter/exit) and
+        // window resizes change the viewport a frame after the transition, so
+        // re-fit whenever the viewport size drifts from the last fit. This is
+        // what keeps the current slide exactly centered and filled.
+        if let Some(i) = self.presenting {
+            if let Some(p) = self.scene.pages.get(i) {
+                let vp = self.viewport_bounds(cx);
+                let size = (vp.size.width.to_f64(), vp.size.height.to_f64());
+                if self.last_present_fit != Some(size) {
+                    let mut cam = self.camera;
+                    cam.zoom_to_rect_exact(p.bounds(), vp.size);
+                    self.camera = cam;
+                    self.last_present_fit = Some(size);
+                }
+            }
+        }
+
         // Bring the camera to a freshly AI-created page. Deferred from
         // apply_canvas_op (which runs inside the AiPanel's update, where
         // reading the panel's width would panic); render runs outside any
