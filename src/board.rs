@@ -2146,6 +2146,34 @@ impl BoardView {
         if !window.is_fullscreen() {
             window.toggle_fullscreen();
         }
+        // Lift the veil on a timer, NOT on a render frame: once the black
+        // veil is up nothing else repaints, so a render-driven reveal waits
+        // for a stray input (~2s felt delay). 300ms is enough for the
+        // fullscreen toggle to land and the viewport bounds to settle; the
+        // render-side drift refit stays as a backstop for later resizes.
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(300))
+                .await;
+            this.update(cx, |this, cx| {
+                if this.presenting.is_some() && this.present_debut {
+                    this.present_debut = false;
+                    if let Some(i) = this.presenting {
+                        if let Some(p) = this.scene.pages.get(i) {
+                            let vp = this.viewport_bounds(cx);
+                            let mut cam = this.camera;
+                            cam.zoom_to_rect_exact(p.bounds(), vp.size);
+                            this.camera = cam;
+                            this.last_present_fit =
+                                Some((vp.size.width.to_f64(), vp.size.height.to_f64()));
+                        }
+                    }
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
         cx.notify();
         true
     }
