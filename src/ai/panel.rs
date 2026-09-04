@@ -1278,9 +1278,11 @@ impl AiPanel {
         let bar = div()
             .w(px(COMPACT_BAR_WIDTH))
             .max_w_full()
-            .bg(rgb(0xffffff))
+            // Translucent white to match the board's floating chrome (toolbar
+            // / zoom / page bars) — the canvas shows through faintly.
+            .bg(rgba(0xffffffb3))
             .border_1()
-            .border_color(rgb(0xd6d4d0))
+            .border_color(rgba(0xd6d4d099))
             .rounded_full()
             .shadow_lg()
             .flex()

@@ -6006,9 +6006,11 @@ fn bar_container() -> Div {
         .items_center()
         .gap_1()
         .p_1()
-        .bg(rgb(0xffffff))
+        // Translucent white: the canvas shows through faintly so the floating
+        // chrome reads as part of the board instead of stickers on it.
+        .bg(rgba(0xffffffb3))
         .border_1()
-        .border_color(rgb(0xe3e2df))
+        .border_color(rgba(0xe3e2df99))
         .rounded_lg()
         .shadow_lg()
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
