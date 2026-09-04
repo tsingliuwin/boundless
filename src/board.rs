@@ -1914,8 +1914,19 @@ impl BoardView {
     /// Mirror the panel's display mode (compact bar vs docked panel) so it
     /// survives close/reopen. The board re-layouts: the compact bar floats
     /// and must not reserve docked-panel space in the chrome.
-    pub fn set_chat_compact(&mut self, compact: bool, cx: &mut Context<Self>) {
+    pub fn set_chat_compact(&mut self, compact: bool, panel_width: f32, cx: &mut Context<Self>) {
         self.chat_compact = compact;
+        // Switching between the floating compact bar and the docked panel
+        // changes what covers the canvas by the panel's width; pan the camera
+        // half of that so the centered content stays centered — the same
+        // compensation toggle_ai_panel applies on open/close. The width is
+        // passed in because this runs mid-panel-update: re-reading the panel
+        // here would be a re-entrant borrow and panic.
+        if compact {
+            self.camera.pan_by_screen(px(panel_width / 2.0), px(0.0));
+        } else {
+            self.camera.pan_by_screen(px(-panel_width / 2.0), px(0.0));
+        }
         self.workspace.set_chat_prefs(self.ai_panel.is_some(), compact);
         cx.notify();
     }
@@ -2239,13 +2250,14 @@ impl BoardView {
     }
 
     /// The portion of the canvas that is actually visible. The canvas element
-    /// fills the whole window, but the AI panel docks over its right edge, so
-    /// when the panel is open the drawable region excludes the panel width.
-    /// Zoom reset / fit / button-zoom should anchor on *this* rect (not the
-    /// full window) so they behave relative to what the user can actually see.
-    /// While presenting the panel is not rendered, so the full canvas counts —
-    /// subtracting the hidden panel's width centered every page fit in a
-    /// one-panel-too-narrow region and the slide sat half a panel off-center.
+    /// is already inset under the left explorer (see render), and the AI panel
+    /// docks over the right edge, so when the panel is open the drawable
+    /// region excludes the panel width. Zoom reset / fit / button-zoom should
+    /// anchor on *this* rect (not the full window) so they behave relative to
+    /// what the user can actually see. While presenting the panel is not
+    /// rendered, so the full canvas counts — subtracting the hidden panel's
+    /// width centered every page fit in a one-panel-too-narrow region and the
+    /// slide sat half a panel off-center.
     fn viewport_bounds(&self, cx: &mut Context<Self>) -> Bounds<Pixels> {
         let mut b = self.canvas_bounds;
         if self.ai_panel.is_some() && self.presenting.is_none() {
@@ -2560,10 +2572,35 @@ impl BoardView {
     pub fn toggle_explorer(&mut self, cx: &mut Context<Self>) {
         self.explorer_open = !self.explorer_open;
         self.explorer_hover = None;
+        // The canvas insets by EXPLORER_W under the panel (see render), which
+        // shifts everything on screen a full panel width toward the sidebar.
+        // Pan half of that back so whatever was centered stays centered in
+        // the visible area — the same open/close pan the docked AI panel does.
+        let half = px(Self::EXPLORER_W / 2.0);
         if self.explorer_open {
             self.rescan_explorer();
+            self.camera.pan_by_screen(-half, px(0.0));
+        } else {
+            self.camera.pan_by_screen(half, px(0.0));
+        }
+        // The compact chat bar centers over the canvas area too; it renders
+        // from the panel entity, which won't repaint on the board's notify.
+        if let Some(panel) = &self.ai_panel {
+            panel.update(cx, |_, cx| cx.notify());
         }
         cx.notify();
+    }
+
+    /// Width the explorer reserves on the left edge (0 when closed). The AI
+    /// panel's compact bar reads this to center over the same canvas area
+    /// `render_toolbar` centers over, so the two stay aligned as the sidebar
+    /// opens and closes.
+    pub fn explorer_reserved_width(&self) -> f32 {
+        if self.explorer_open {
+            Self::EXPLORER_W
+        } else {
+            0.0
+        }
     }
 
     /// Explorer width in px (fixed; no resize handle — the AI panel's
@@ -5665,7 +5702,15 @@ impl Render for BoardView {
         // div alone is overridden by the canvas's default).
         let cursor = self.cursor_style();
 
-        let canvas_el = canvas(
+        // Hidden while presenting — needed here to decide the canvas inset.
+        let presenting = self.presenting.is_some();
+        // With the explorer open, start the canvas at the panel's right edge
+        // so canvas_bounds (the camera's viewport) tracks the *visible* area:
+        // fit/zoom anchoring, pointer→world math, and the visible-region
+        // report to the agent all follow the sidebar automatically.
+        let canvas_inset = self.explorer_open && !presenting;
+
+        let mut canvas_el = canvas(
             {
                 let this = this.clone();
                 move |bounds, window, cx| {
@@ -5728,14 +5773,16 @@ impl Render for BoardView {
             },
         )
         .absolute()
-        .inset_0()
-        .cursor(cursor);
+        .inset_0();
+        if canvas_inset {
+            canvas_el = canvas_el.left(px(Self::EXPLORER_W));
+        }
+        let canvas_el = canvas_el.cursor(cursor);
 
         // Windows-only in-app menu bar (None on macOS, which uses the native
-        // `set_menus` bar). Computed before the chain so the builder doesn't
+        // set_menus bar). Computed before the chain so the builder doesn't
         // hold a borrow of `self`/`cx` alongside the chain's own use.
         // Hidden while presenting.
-        let presenting = self.presenting.is_some();
         let menubar = if cfg!(target_os = "windows") && !presenting {
             Some(self.render_menu_bar(window, cx))
         } else {

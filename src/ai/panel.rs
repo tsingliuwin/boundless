@@ -292,8 +292,11 @@ impl AiPanel {
             return;
         }
         self.compact = compact;
+        // Pass the width along: the board's handler runs while this panel is
+        // mutably borrowed, so reading the panel there again would panic.
+        let width = self.width;
         self.board
-            .update(cx, |board, cx| board.set_chat_compact(compact, cx))
+            .update(cx, |board, cx| board.set_chat_compact(compact, width, cx))
             .ok();
         cx.notify();
     }
@@ -1373,10 +1376,19 @@ impl AiPanel {
                     .child(send_btn),
             );
 
+        // Center over the canvas area, not the whole window: the toolbar
+        // centers over the space left of the explorer (and right of the
+        // docked panel — impossible here, compact mode has no dock), and the
+        // bar must shift with it or the two centers drift apart.
+        let explorer_w = self
+            .board
+            .upgrade()
+            .map(|b| b.read(cx).explorer_reserved_width())
+            .unwrap_or(0.0);
         let wrapper = div()
             .absolute()
             .bottom_0()
-            .left_0()
+            .left(px(explorer_w))
             .right_0()
             .flex()
             .flex_col()
