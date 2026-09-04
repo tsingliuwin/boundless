@@ -2082,20 +2082,27 @@ impl BoardView {
         self.goto_page(cur + 1, cx);
     }
 
-    /// Enter presentation mode from the current page (or page 1).
-    fn start_presenting(&mut self, cx: &mut Context<Self>) {
+    /// Enter presentation mode from the current page (or page 1) and take the
+    /// window true-fullscreen — like PowerPoint's show mode, no title bar,
+    /// no taskbar. Returns whether presenting actually started.
+    fn start_presenting(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.scene.pages.is_empty() {
             self.set_notice("画布上还没有幻灯片页面", cx);
-            return;
+            return false;
         }
         let start = self.current_page_index().unwrap_or(0);
         self.presenting = Some(start);
         self.fit_to_page(start, cx);
+        if !window.is_fullscreen() {
+            window.toggle_fullscreen();
+        }
+        true
     }
 
     /// Leave presentation mode; keep the camera on the last page (with the
-    /// regular fit margin so editing can resume comfortably).
-    fn exit_presenting(&mut self, cx: &mut Context<Self>) {
+    /// regular fit margin so editing can resume comfortably) and restore the
+    /// windowed geometry if the show took the window fullscreen.
+    fn exit_presenting(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let last = self.presenting.take();
         if let Some(i) = last {
             if let Some(p) = self.scene.pages.get(i) {
@@ -2104,6 +2111,9 @@ impl BoardView {
                 cam.zoom_to_fit(p.bounds(), vp.size);
                 self.camera = cam;
             }
+        }
+        if window.is_fullscreen() {
+            window.toggle_fullscreen();
         }
         cx.notify();
     }
@@ -4338,10 +4348,14 @@ impl Render for BoardView {
                 cx.listener(|this, _: &GotoNextPage, _window, cx| this.goto_next_page(cx)),
             )
             .on_action(
-                cx.listener(|this, _: &PresentStart, _window, cx| this.start_presenting(cx)),
+                cx.listener(|this, _: &PresentStart, window, cx| {
+                    this.start_presenting(window, cx);
+                }),
             )
             .on_action(
-                cx.listener(|this, _: &PresentExit, _window, cx| this.exit_presenting(cx)),
+                cx.listener(|this, _: &PresentExit, window, cx| {
+                    this.exit_presenting(window, cx);
+                }),
             )
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_left_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_down))
@@ -6025,8 +6039,10 @@ impl BoardView {
             .child(bar_button("›", false).on_click(move |_, _, cx| {
                 weak_next.update(cx, |this, cx| this.goto_next_page(cx)).ok();
             }))
-            .child(bar_button("▶", false).on_click(move |_, _, cx| {
-                weak_present.update(cx, |this, cx| this.start_presenting(cx)).ok();
+            .child(bar_button("▶", false).on_click(move |_, window, cx| {
+                weak_present
+                    .update(cx, |this, cx| this.start_presenting(window, cx))
+                    .ok();
             }))
             .child(bar_button("＋页", false).on_click(move |_, _, cx| {
                 weak_add.update(cx, |this, cx| this.add_page_manual(cx)).ok();
