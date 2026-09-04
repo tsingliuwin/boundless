@@ -2201,7 +2201,8 @@ fn tool_call_detail(name: &str, args: &serde_json::Value) -> String {
                 .get("ratio")
                 .and_then(|v| v.as_str())
                 .unwrap_or("16:9");
-            format!("「{title}」（{ratio}）")
+            let effect = obj.get("effect").and_then(|v| v.as_str()).unwrap_or("slide");
+            format!("「{title}」（{ratio} · {effect}）")
         }
         _ => String::new(),
     };

@@ -90,6 +90,35 @@ impl Default for PageRatio {
     }
 }
 
+/// The transition used when this page appears (flip into it / show open).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PageEffect {
+    /// Camera glides from the current framing into the page (default).
+    Slide,
+    /// Fade through black: veil in, instant switch, veil out.
+    Fade,
+    /// Hard cut, no animation.
+    None,
+}
+
+impl PageEffect {
+    /// Parse the tool-facing strings. Unknown values fall back to Slide.
+    pub fn parse(s: &str) -> Option<PageEffect> {
+        match s {
+            "slide" => Some(PageEffect::Slide),
+            "fade" => Some(PageEffect::Fade),
+            "none" => Some(PageEffect::None),
+            _ => None,
+        }
+    }
+}
+
+impl Default for PageEffect {
+    fn default() -> Self {
+        PageEffect::Slide
+    }
+}
+
 /// One slide page: a titled world-space rectangle. Pages are numbered by
 /// their Vec index (1-based); no separate id field.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -99,6 +128,9 @@ pub struct Page {
     pub y: f64,
     pub w: f64,
     pub h: f64,
+    /// How this page enters the view (flip transition / show opener).
+    #[serde(default)]
+    pub effect: PageEffect,
 }
 
 impl Page {
@@ -121,7 +153,12 @@ pub fn next_page_rect(pages: &[Page], ratio: PageRatio) -> (f64, f64, f64, f64) 
 
 /// Append a new page with the given title and return it (plus its 1-based
 /// number) so the caller can report the rect back to the model.
-pub fn push_page(pages: &mut Vec<Page>, title: Option<String>, ratio: PageRatio) -> (&Page, usize) {
+pub fn push_page(
+    pages: &mut Vec<Page>,
+    title: Option<String>,
+    ratio: PageRatio,
+    effect: PageEffect,
+) -> (&Page, usize) {
     let (x, y, w, h) = next_page_rect(pages, ratio);
     let number = pages.len() + 1;
     let page = Page {
@@ -133,6 +170,7 @@ pub fn push_page(pages: &mut Vec<Page>, title: Option<String>, ratio: PageRatio)
         y,
         w,
         h,
+        effect,
     };
     pages.push(page);
     (&pages[number - 1], number)
@@ -167,7 +205,7 @@ mod tests {
             PageRatio::Ratio4_3,
         ];
         for r in ratios {
-            push_page(&mut pages, None, r);
+            push_page(&mut pages, None, r, PageEffect::Slide);
         }
         assert_eq!(pages.len(), 3);
         // First page at the origin; each next starts after prev + gap.
@@ -191,11 +229,11 @@ mod tests {
     #[test]
     fn titled_pages_keep_the_title() {
         let mut pages: Vec<Page> = Vec::new();
-        let (p, n) = push_page(&mut pages, Some("  封面  ".into()), PageRatio::Ratio16_9);
+        let (p, n) = push_page(&mut pages, Some("  封面  ".into()), PageRatio::Ratio16_9, PageEffect::Slide);
         assert_eq!(p.title, "封面");
         assert_eq!(n, 1);
         // Blank titles fall back to the numbered default.
-        let (p, n) = push_page(&mut pages, Some("  ".into()), PageRatio::Ratio16_9);
+        let (p, n) = push_page(&mut pages, Some("  ".into()), PageRatio::Ratio16_9, PageEffect::Slide);
         assert_eq!(p.title, "第 2 页");
         assert_eq!(n, 2);
     }
@@ -215,8 +253,8 @@ mod tests {
     #[test]
     fn page_at_finds_containing_page() {
         let mut pages: Vec<Page> = Vec::new();
-        push_page(&mut pages, None, PageRatio::Ratio16_9);
-        push_page(&mut pages, None, PageRatio::Ratio16_9);
+        push_page(&mut pages, None, PageRatio::Ratio16_9, PageEffect::Slide);
+        push_page(&mut pages, None, PageRatio::Ratio16_9, PageEffect::Slide);
         assert_eq!(page_at(&pages, 800.0, 450.0), Some(0));
         assert_eq!(page_at(&pages, 1600.0 + PAGE_GAP + 100.0, 100.0), Some(1));
         assert_eq!(page_at(&pages, 1600.0 + PAGE_GAP / 2.0, 100.0), None); // in the gap

@@ -277,6 +277,11 @@ pub enum CanvasOp {
         /// Aspect preset: "16:9" (default), "4:3", "9:16", "3:4", "1:1".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ratio: Option<String>,
+        /// Transition used when this page appears (flip into it / show
+        /// opener): "slide" (default, camera glides in), "fade" (through
+        /// black), "none" (hard cut).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effect: Option<String>,
     },
     /// Delete a slide page frame. Elements on that page stay on the canvas
     /// (the model can redraw or the user can clean up) — same semantics as

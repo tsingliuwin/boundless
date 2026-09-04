@@ -561,7 +561,11 @@ pub fn apply(
                 layout.nodes.len()
             );
         }
-        CanvasOp::AddPage { title, ratio } => {
+        CanvasOp::AddPage {
+            title,
+            ratio,
+            effect,
+        } => {
             let r = match ratio.as_deref().map(crate::scene::pages::PageRatio::parse) {
                 Some(Some(r)) => r,
                 Some(None) => {
@@ -570,7 +574,13 @@ pub fn apply(
                 }
                 None => crate::scene::pages::PageRatio::default(),
             };
-            let (page, number) = crate::scene::pages::push_page(&mut c.pages, title.clone(), r);
+            let eff = effect
+                .as_deref()
+                .map(crate::scene::pages::PageEffect::parse)
+                .unwrap_or(Some(crate::scene::pages::PageEffect::default()))
+                .unwrap_or_default();
+            let (page, number) =
+                crate::scene::pages::push_page(&mut c.pages, title.clone(), r, eff);
             c.ops_applied += 1;
             msg = format!(
                 "已创建第 {number} 页「{}」（{}），区域 ({},{}) 尺寸 {}×{}。立即绘制本页的全部内容，画完再开下一页；不要先把所有页面都开完再回头填内容。",
@@ -2100,6 +2110,7 @@ mod slides_tests {
             CanvasOp::AddPage {
                 title: Some(title.into()),
                 ratio: Some(ratio.into()),
+            effect: None,
             },
             None,
         )

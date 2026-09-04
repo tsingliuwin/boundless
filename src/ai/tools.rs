@@ -1217,6 +1217,10 @@ pub struct AddPageArgs {
     /// 页面比例预设："16:9"（默认）、"4:3"、"9:16"（竖屏）、"3:4"、"1:1"。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ratio: Option<String>,
+    /// 本页的过渡动效（放映翻到本页时、以及放映从本页开始时的出现方式）：
+    /// "slide"（默认，相机横扫滑入）、"fade"（经黑淡入淡出）、"none"（硬切）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<String>,
 }
 
 /// Opens a new slide page: a titled world-space rect laid out after the
@@ -1275,11 +1279,24 @@ impl Tool for AddPageTool {
                     .await;
                 }
             }
+            if let Some(e) = &args.effect {
+                if crate::scene::pages::PageEffect::parse(e).is_none() {
+                    return fail_tool(
+                        &events,
+                        next_tool_id(name),
+                        name,
+                        serde_json::to_value(&args).unwrap_or(Value::Null),
+                        ToolError::invalid_args("effect 只支持 slide / fade / none"),
+                    )
+                    .await;
+                }
+            }
             let id = next_tool_id(name);
             let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
             let op = CanvasOp::AddPage {
                 title: args.title,
                 ratio: args.ratio,
+                effect: args.effect,
             };
             run_canvas_op(&events, id, name, args_json, op, None).await
         }

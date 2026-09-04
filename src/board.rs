@@ -126,6 +126,35 @@ fn now_line() -> String {
     )
 }
 
+/// Fade-through-black: veil ramps to opaque over `in_ms`, holds, then ramps
+/// out over `out_ms`. Derived per frame from `started`.
+#[derive(Clone, Copy)]
+struct FadeVeil {
+    started: std::time::Instant,
+    in_ms: u64,
+    hold_ms: u64,
+    out_ms: u64,
+}
+
+impl FadeVeil {
+    /// 0..=1 veil opacity at `now`; None once the out ramp completes.
+    fn opacity_at(&self, now: std::time::Instant) -> Option<f32> {
+        let t = now.duration_since(self.started).as_millis() as u64;
+        let end = self.in_ms + self.hold_ms + self.out_ms;
+        if t >= end {
+            return None;
+        }
+        let o = if t < self.in_ms {
+            t as f32 / self.in_ms as f32
+        } else if t < self.in_ms + self.hold_ms {
+            1.0
+        } else {
+            1.0 - (t - self.in_ms - self.hold_ms) as f32 / self.out_ms as f32
+        };
+        Some(o.clamp(0.0, 1.0))
+    }
+}
+
 /// One camera glide: lerp from -> to with smoothstep over `dur_ms`.
 #[derive(Clone, Copy)]
 struct PageAnim {
@@ -213,6 +242,9 @@ pub struct BoardView {
     /// In-flight camera glide between pages (flip / present-open). Driven by
     /// a 16ms tick task; render interpolates from `started` with smoothstep.
     page_anim: Option<PageAnim>,
+    /// Fade-through-black transition: veil opacity is derived from `started`
+    /// in render (in / hold / out), and the camera cuts at hold start.
+    fade_veil: Option<FadeVeil>,
     /// Viewport size the presenting camera was last fit to. The fullscreen
     /// toggle and window resizes land a frame after the fit, so render
     /// re-fits whenever the viewport size drifts from this.
@@ -285,6 +317,7 @@ impl BoardView {
             pending_page_focus: None,
             ai_focus_page: None,
             page_anim: None,
+            fade_veil: None,
             last_present_fit: None,
             present_debut: false,
             last_seen_viewport: None,
@@ -1219,7 +1252,11 @@ impl BoardView {
                     &root_id.to_string()[..8]
                 ))
             }
-            CanvasOp::AddPage { title, ratio } => {
+            CanvasOp::AddPage {
+                title,
+                ratio,
+                effect,
+            } => {
                 let r = match ratio.as_deref().map(PageRatio::parse) {
                     Some(Some(r)) => r,
                     Some(None) => {
@@ -1229,9 +1266,22 @@ impl BoardView {
                     }
                     None => PageRatio::default(),
                 };
+                let eff = match effect.as_deref().map(crate::scene::pages::PageEffect::parse) {
+                    Some(Some(e)) => e,
+                    Some(None) => {
+                        return Err(CanvasOpError::invalid_args(
+                            "effect 只支持 slide / fade / none",
+                        ));
+                    }
+                    None => crate::scene::pages::PageEffect::default(),
+                };
                 let (rect, title, number) = {
-                    let (p, n) =
-                        crate::scene::pages::push_page(&mut self.scene.pages, title, r);
+                    let (p, n) = crate::scene::pages::push_page(
+                        &mut self.scene.pages,
+                        title,
+                        r,
+                        eff,
+                    );
                     (p.bounds(), p.title.clone(), n)
                 };
                 // Follow camera: the AI switched to the new page. Deferred to
@@ -2107,6 +2157,17 @@ impl BoardView {
         crate::scene::pages::page_at(&self.scene.pages, c.x, c.y)
     }
 
+    /// Camera-fit exactly to a page's rect (no margin) — instant, for
+    /// hard-cut page effects.
+    fn fit_to_page(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(p) = self.scene.pages.get(index) else {
+            return;
+        };
+        let vp = self.viewport_bounds(cx);
+        self.camera.zoom_to_rect_exact(p.bounds(), vp.size);
+        cx.notify();
+    }
+
     /// The exact-fit camera for a page (presentation framing).
     fn page_exact_camera(&self, index: usize, cx: &mut Context<Self>) -> Option<Camera> {
         let p = self.scene.pages.get(index)?;
@@ -2162,6 +2223,19 @@ impl BoardView {
         let presenting = self.presenting.is_some();
         if presenting {
             self.presenting = Some(i);
+            // The page being entered owns its transition.
+            let effect = self.scene.pages.get(i).map(|p| p.effect).unwrap_or_default();
+            match effect {
+                crate::scene::pages::PageEffect::Fade => {
+                    self.enter_fade_page(i, cx);
+                    return;
+                }
+                crate::scene::pages::PageEffect::None => {
+                    self.fit_to_page(i, cx);
+                    return;
+                }
+                crate::scene::pages::PageEffect::Slide => {}
+            }
         }
         match self.page_exact_camera(i, cx) {
             Some(mut to) => {
@@ -2174,6 +2248,31 @@ impl BoardView {
             }
             None => {}
         }
+    }
+
+    /// Fade-through-black into page `i`: cut the camera immediately (the
+    /// veil covers it), then ramp the veil in/hold/out via a 16ms tick.
+    fn enter_fade_page(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.page_anim = None;
+        self.fit_to_page(index, cx);
+        self.last_present_fit = None;
+        self.fade_veil = Some(FadeVeil {
+            started: std::time::Instant::now(),
+            in_ms: 140,
+            hold_ms: 80,
+            out_ms: 260,
+        });
+        cx.notify();
+        let dur = std::time::Duration::from_millis(140 + 80 + 260 + 20);
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(dur).await;
+            this.update(cx, |this, cx| {
+                this.fade_veil = None;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn goto_prev_page(&mut self, cx: &mut Context<Self>) {
@@ -2218,10 +2317,39 @@ impl BoardView {
                 if this.presenting.is_some() && this.present_debut {
                     this.present_debut = false;
                     if let Some(i) = this.presenting {
-                        // Reveal with a glide: from wherever the camera sits
-                        // straight into the page's exact fit.
-                        if let Some(to) = this.page_exact_camera(i, cx) {
-                            this.animate_camera_to(to, 450, cx);
+                        // The first page's effect is the show opener.
+                        let effect =
+                            this.scene.pages.get(i).map(|p| p.effect).unwrap_or_default();
+                        match effect {
+                            crate::scene::pages::PageEffect::Slide => {
+                                if let Some(to) = this.page_exact_camera(i, cx) {
+                                    this.animate_camera_to(to, 450, cx);
+                                }
+                            }
+                            crate::scene::pages::PageEffect::None => {
+                                this.fit_to_page(i, cx);
+                            }
+                            crate::scene::pages::PageEffect::Fade => {
+                                // Cut to the page behind the (opaque) veil,
+                                // then let the veil ramp out in its place.
+                                this.fit_to_page(i, cx);
+                                this.fade_veil = Some(FadeVeil {
+                                    started: std::time::Instant::now(),
+                                    in_ms: 0,
+                                    hold_ms: 0,
+                                    out_ms: 420,
+                                });
+                                let dur = std::time::Duration::from_millis(440);
+                                cx.spawn(async move |this, cx| {
+                                    cx.background_executor().timer(dur).await;
+                                    this.update(cx, |this, cx| {
+                                        this.fade_veil = None;
+                                        cx.notify();
+                                    })
+                                    .ok();
+                                })
+                                .detach();
+                            }
                         }
                     }
                     cx.notify();
@@ -2285,8 +2413,12 @@ impl BoardView {
             .map(|p| PageRatio::from_size(p.w, p.h))
             .unwrap_or_default();
         let (rect, title, number) = {
-            let (page, number) =
-                crate::scene::pages::push_page(&mut self.scene.pages, None, ratio);
+            let (page, number) = crate::scene::pages::push_page(
+                &mut self.scene.pages,
+                None,
+                ratio,
+                crate::scene::pages::PageEffect::Slide,
+            );
             (page.bounds(), page.title.clone(), number)
         };
         self.mark_dirty();
@@ -3804,9 +3936,13 @@ impl BoardView {
         // Slide-page frames: a thin border around each page rect plus the
         // "N. 标题" label at its top-left, so pages read as pages. Painted
         // under the elements (a dark page fill later can sit on top).
+        // Hidden while presenting — a show is the page content alone.
         let mut page_frames = Vec::new();
         let mut page_labels = Vec::new();
         for (i, p) in self.scene.pages.iter().enumerate() {
+            if self.presenting.is_some() {
+                break;
+            }
             if !p.bounds().inflate(80.0, 80.0).intersects(&view_world) {
                 continue;
             }
@@ -4576,6 +4712,18 @@ impl Render for BoardView {
                             d.child(div().absolute().inset_0().bg(gpui::black()))
                         } else {
                             d
+                        };
+                        let d = match self.fade_veil {
+                            Some(v) => {
+                                let o =
+                                    v.opacity_at(std::time::Instant::now()).unwrap_or(0.0);
+                                if o > 0.001 {
+                                    d.child(div().absolute().inset_0().bg(gpui::black().opacity(o)))
+                                } else {
+                                    d
+                                }
+                            }
+                            None => d,
                         };
                         d.child(self.render_present_overlay())
                     })
