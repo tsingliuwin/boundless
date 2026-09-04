@@ -62,8 +62,14 @@ pub struct AiPanel {
     messages: Vec<ChatMessage>,
     streaming: Option<StreamingState>,
     error: Option<String>,
-    /// Multi-line chat input (auto-grow 3..8 lines).
+    /// Multi-line chat input (auto-grow 3..8 lines) — the docked panel's.
     input: Entity<InputState>,
+    /// The compact bar's input: also multi-line capable, but laid out with a
+    /// one-line minimum (no auto-grow), so pinning the bar's height shows a
+    /// single line with in-place scrolling instead of growing. Separate from
+    /// `input` because auto_grow's min-rows layout would overflow a pinned
+    /// one-line box; drafts are carried across on mode switches.
+    compact_input: Entity<InputState>,
     /// Transient panel-level notice (e.g. session save/load failures). Shown
     /// as a slim dismissible bar under the header.
     notice: Option<String>,
@@ -103,6 +109,12 @@ pub struct AiPanel {
 pub const DEFAULT_WIDTH: f32 = 360.0;
 /// Width of the compact bottom bar (the floating conversation input).
 pub const COMPACT_BAR_WIDTH: f32 = 680.0;
+/// Visible height of the compact bar's input: exactly one text line. The
+/// input lays its line out at the window default line height (1.5rem = 24px)
+/// regardless of the `line_height(1.25rem)` refinement on its own root, so
+/// the box must match that or the text sits low and clips. Multi-line
+/// content scrolls inside; the box never grows.
+const INPUT_VISIBLE_H: f32 = 24.0;
 const MIN_WIDTH: f32 = 280.0;
 const MAX_WIDTH: f32 = 640.0;
 
@@ -143,18 +155,26 @@ impl AiPanel {
                 .multi_line(true)
                 .auto_grow(3, 8)
         });
+        // Compact bar's input: multi-line capable but lays out at one line
+        // (PlainText multi-line's min height IS one line), so the bar can pin
+        // a single visible line with internal scrolling.
+        let compact_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("给 AI 发送消息…")
+                .multi_line(true)
+        });
 
         let mut subscriptions = Vec::new();
         // Enter (without Shift) in the chat input sends the message.
-        subscriptions.push(
-            cx.subscribe(&input, |this, _entity, event: &InputEvent, cx| {
+        for input in [&input, &compact_input] {
+            subscriptions.push(cx.subscribe(input, |this, _entity, event: &InputEvent, cx| {
                 if let InputEvent::PressEnter { secondary } = event {
                     if !secondary {
                         this.send_message(cx);
                     }
                 }
-            }),
-        );
+            }));
+        }
 
         // Load stored sessions for this board; resume the most recent one if
         // any, else start a fresh (not-yet-persisted) session.
@@ -177,11 +197,12 @@ impl AiPanel {
             settings,
             compact,
             active_board,
+            input,
+            compact_input,
             session_id,
             messages,
             streaming: None,
             error: None,
-            input,
             notice: None,
             pending_clear_input: false,
             narration_retried: false,
@@ -224,7 +245,12 @@ impl AiPanel {
         if self.streaming.is_some() {
             return;
         }
-        let text = self.input.read(cx).value().to_string();
+        // Read the prompt from whichever input the visible mode uses.
+        let text = self
+            .active_input()
+            .read(cx)
+            .value()
+            .to_string();
         let text = text.trim().to_string();
         if text.is_empty() {
             return;
@@ -267,13 +293,30 @@ impl AiPanel {
         self.compact
     }
 
+    /// The input entity for the currently visible mode.
+    fn active_input(&self) -> &Entity<InputState> {
+        if self.compact {
+            &self.compact_input
+        } else {
+            &self.input
+        }
+    }
+
     /// Switch display mode and mirror the preference to the board so it
     /// survives close/reopen (the board also re-layouts its chrome offsets).
-    pub fn set_compact(&mut self, compact: bool, cx: &mut Context<Self>) {
+    pub fn set_compact(&mut self, compact: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.compact == compact {
             return;
         }
         self.compact = compact;
+        // Carry the draft across: the two modes use separate InputStates.
+        let (from, to) = if compact {
+            (&self.input, &self.compact_input)
+        } else {
+            (&self.compact_input, &self.input)
+        };
+        let draft = from.read(cx).value().to_string();
+        to.update(cx, |s, cx| s.set_value(draft.clone(), window, cx));
         // Pass the width along: the board's handler runs while this panel is
         // mutably borrowed, so reading the panel there again would panic.
         let width = self.width;
@@ -784,10 +827,13 @@ impl Render for AiPanel {
         // Consume the deferred input-clear flag. send_message (called from a
         // subscribe callback that has no Window) sets it; here we have a Window
         // so InputState::set_value can run. Clear the flag first to avoid
-        // re-entrancy. Must run in BOTH display modes (they share the input).
+        // re-entrancy. Clear both inputs: whichever is hidden must not resurrect
+        // the draft on the next mode switch.
         if self.pending_clear_input {
             self.pending_clear_input = false;
-            self.input.update(cx, |s, cx| s.set_value("", window, cx));
+            for input in [&self.input, &self.compact_input] {
+                input.update(cx, |s, cx| s.set_value("", window, cx));
+            }
         }
         if self.compact {
             return self.render_compact(cx).into_any_element();
@@ -818,7 +864,9 @@ impl Render for AiPanel {
                             .child(
                                 // Collapse back to the compact bottom bar.
                                 panel_button("收起", false).on_click(cx.listener(
-                                    |this, _, _, cx| this.set_compact(true, cx),
+                                    |this, _, window, cx| {
+                                        this.set_compact(true, window, cx)
+                                    },
                                 )),
                             )
                             .child(
@@ -941,7 +989,7 @@ impl Render for AiPanel {
         // gpui-component's Button.
         let streaming_now = streaming;
         let model_name = self.settings.model.clone();
-        let reasoning_control = self.reasoning_control(cx);
+        let reasoning_control = self.reasoning_control(false, cx);
 
         // Send/stop icon button (gpui-component Button).
         let send_btn = Button::new("send-btn")
@@ -1111,17 +1159,23 @@ impl Render for AiPanel {
 }
 
 impl AiPanel {
-    /// Reasoning-effort segmented control (低/中/高), shared by the docked
-    /// panel toolbar and the compact bottom bar.
-    fn reasoning_control(&self, cx: &mut Context<Self>) -> Div {
+    /// Reasoning-effort selector (低/中/高). `ghost` renders the borderless
+    /// pill-text style used in the compact bar — the bar is already a pill,
+    /// so the boxed segmented control reads as clutter there; the docked
+    /// toolbar keeps the boxed style.
+    fn reasoning_control(&self, ghost: bool, cx: &mut Context<Self>) -> Div {
         let current_reasoning = self.reasoning;
-        let mut control = div()
-            .flex()
-            .flex_row()
-            .rounded_md()
-            .overflow_hidden()
-            .border_1()
-            .border_color(rgb(0xd6d4d0));
+        let mut control = if ghost {
+            div().flex().flex_row().items_center().gap_0p5()
+        } else {
+            div()
+                .flex()
+                .flex_row()
+                .rounded_md()
+                .overflow_hidden()
+                .border_1()
+                .border_color(rgb(0xd6d4d0))
+        };
         for (i, level) in [
             ReasoningLevel::Low,
             ReasoningLevel::Medium,
@@ -1133,15 +1187,26 @@ impl AiPanel {
             let active = level == current_reasoning;
             let mut seg = div()
                 .id(("reasoning", i))
-                .px_2()
-                .py_1()
-                .text_xs()
                 .cursor_pointer()
+                .text_xs()
                 .child(level.label());
-            if active {
-                seg = seg.bg(rgb(0x1a5fd7)).text_color(rgb(0xffffff));
+            if ghost {
+                seg = seg.px_1p5().py_0p5().rounded_full();
+                if active {
+                    seg = seg
+                        .bg(rgb(0xe8f0fe))
+                        .text_color(rgb(0x1a5fd7))
+                        .font_weight(FontWeight::SEMIBOLD);
+                } else {
+                    seg = seg.hover(|s| s.bg(rgb(0xf0efec))).text_color(rgb(0x999999));
+                }
             } else {
-                seg = seg.hover(|s| s.bg(rgb(0xefeeec))).text_color(rgb(0x555555));
+                seg = seg.px_2().py_1();
+                if active {
+                    seg = seg.bg(rgb(0x1a5fd7)).text_color(rgb(0xffffff));
+                } else {
+                    seg = seg.hover(|s| s.bg(rgb(0xefeeec))).text_color(rgb(0x555555));
+                }
             }
             control =
                 control.child(seg.on_click(cx.listener(move |this, _, _, cx| {
@@ -1157,23 +1222,42 @@ impl AiPanel {
     /// the board is the point; the full transcript lives one toggle away.
     fn render_compact(&mut self, cx: &mut Context<Self>) -> Div {
         let streaming = self.streaming.is_some();
-        let reasoning_control = self.reasoning_control(cx);
+        let reasoning_control = self.reasoning_control(true, cx);
 
-        // Send/stop button (mirrors the docked panel's).
-        let send_btn = Button::new("send-btn-compact")
-            .icon(if streaming {
-                IconName::Close
-            } else {
-                IconName::ArrowUp
+        // Send/stop: the bar's single accent — a filled circle. Turns red
+        // while streaming so "stop" reads at a glance.
+        let send_btn = div()
+            .id("send-btn-compact")
+            .w_7()
+            .h_7()
+            .rounded_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .when(streaming, |d| {
+                d.bg(rgb(0xc92a2a))
+                    .text_color(rgb(0xffffff))
+                    .hover(|s| s.bg(rgb(0xb02525)))
             })
-            .small()
+            .when(!streaming, |d| {
+                d.bg(rgb(0x1a5fd7))
+                    .text_color(rgb(0xffffff))
+                    .hover(|s| s.bg(rgb(0x1550b3)))
+            })
             .on_click(cx.listener(move |this, _, _window, cx| {
                 if streaming {
                     this.stop_streaming(cx);
                 } else {
                     this.send_message(cx);
                 }
-            }));
+            }))
+            .child(Icon::new(if streaming {
+                IconName::Close
+            } else {
+                IconName::ArrowUp
+            })
+            .size_4());
 
         // Expand back to the docked chat panel (the mic-icon slot in the
         // reference layout).
@@ -1188,7 +1272,7 @@ impl AiPanel {
             .text_color(rgb(0x999999))
             .cursor_pointer()
             .hover(|s| s.bg(rgb(0xefeeec)).text_color(rgb(0x1e1e1e)))
-            .on_click(cx.listener(|this, _, _, cx| this.set_compact(false, cx)))
+            .on_click(cx.listener(|this, _, window, cx| this.set_compact(false, window, cx)))
             .child(Icon::new(IconName::PanelRightOpen));
 
         let bar = div()
@@ -1197,18 +1281,30 @@ impl AiPanel {
             .bg(rgb(0xffffff))
             .border_1()
             .border_color(rgb(0xd6d4d0))
-            .rounded_lg()
+            .rounded_full()
             .shadow_lg()
             .flex()
             .flex_row()
-            .items_end()
+            .items_center()
             .gap_2()
-            .p_2()
+            .px_3()
+            .py_1()
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
-                    .child(Input::new(&self.input).appearance(false)),
+                    // One visible line: the box is exactly one text line tall
+                    // (1.25rem) so the text fills it flush and centers in the
+                    // pill. The overflow_hidden wrapper clips the input's
+                    // scrolled lines — multi-line content scrolls inside
+                    // instead of growing the bar or bleeding past the pill.
+                    .h(px(INPUT_VISIBLE_H))
+                    .overflow_hidden()
+                    // gpui-component gives the input root a default 8px
+                    // vertical padding (input_py); without zeroing it the
+                    // text line paints 8px down inside the pinned box and
+                    // clips at the bottom.
+                    .child(Input::new(&self.compact_input).appearance(false).py_0()),
             )
             .child(
                 div()
@@ -1216,7 +1312,6 @@ impl AiPanel {
                     .flex_row()
                     .items_center()
                     .gap_1p5()
-                    .pb_1()
                     .child(reasoning_control)
                     .child(expand_btn)
                     .child(send_btn),
