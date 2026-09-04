@@ -205,6 +205,15 @@ pub struct BoardView {
     /// toggle and window resizes land a frame after the fit, so render
     /// re-fits whenever the viewport size drifts from this.
     last_present_fit: Option<(f64, f64)>,
+    /// True from PresentStart until the first settled fit. During this veil
+    /// the presenting view paints solid black — the fullscreen toggle lands
+    /// in stages (frameless first, then monitor-sized), and fitting into
+    /// those intermediate frames makes the slide visibly chase the window.
+    present_debut: bool,
+    /// Viewport size last seen while presenting, and when it changed — the
+    /// settle detector (a resize counts as settled after a quiet period).
+    last_seen_viewport: Option<(f64, f64)>,
+    present_resize_at: Option<std::time::Instant>,
     /// Index of the currently open top-level menu in the Windows in-app menu
     /// bar (None = all collapsed). Unused on macOS, which uses the native
     /// `set_menus` bar; the field compiles everywhere because the menu-bar
@@ -264,6 +273,9 @@ impl BoardView {
             pending_page_focus: None,
             ai_focus_page: None,
             last_present_fit: None,
+            present_debut: false,
+            last_seen_viewport: None,
+            present_resize_at: None,
             menubar_open: None,
             update_state: crate::updater::UpdateState::default(),
             render_cache: crate::render::cache::RenderCache::new(),
@@ -2128,6 +2140,9 @@ impl BoardView {
         let start = self.current_page_index().unwrap_or(0);
         self.presenting = Some(start);
         self.last_present_fit = None;
+        self.present_debut = true;
+        self.last_seen_viewport = None;
+        self.present_resize_at = None;
         if !window.is_fullscreen() {
             window.toggle_fullscreen();
         }
@@ -2142,6 +2157,7 @@ impl BoardView {
     fn exit_presenting(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let last = self.presenting.take();
         self.last_present_fit = None;
+        self.present_debut = false;
         if let Some(i) = last {
             // Re-fit with the editing margin in render, after the windowed
             // bounds are back (the current viewport is still fullscreen here).
@@ -4132,14 +4148,26 @@ impl Render for BoardView {
         // re-fit whenever the viewport size drifts from the last fit. This is
         // what keeps the current slide exactly centered and filled.
         if let Some(i) = self.presenting {
-            if let Some(p) = self.scene.pages.get(i) {
-                let vp = self.viewport_bounds(cx);
-                let size = (vp.size.width.to_f64(), vp.size.height.to_f64());
-                if self.last_present_fit != Some(size) {
+            let vp = self.viewport_bounds(cx);
+            let size = (vp.size.width.to_f64(), vp.size.height.to_f64());
+            if self.last_seen_viewport != Some(size) {
+                self.last_seen_viewport = Some(size);
+                self.present_resize_at = Some(std::time::Instant::now());
+            }
+            // The fullscreen transition and window resizes arrive in stages;
+            // fit only after the viewport has been quiet for a moment, so the
+            // slide never visibly chases the window.
+            let settled = self
+                .present_resize_at
+                .map(|t| t.elapsed() >= std::time::Duration::from_millis(150))
+                .unwrap_or(true);
+            if settled && self.last_present_fit != Some(size) {
+                if let Some(p) = self.scene.pages.get(i) {
                     let mut cam = self.camera;
                     cam.zoom_to_rect_exact(p.bounds(), vp.size);
                     self.camera = cam;
                     self.last_present_fit = Some(size);
+                    self.present_debut = false;
                 }
             }
         }
@@ -4432,7 +4460,17 @@ impl Render for BoardView {
                     .min_h_0()
                     .overflow_hidden()
                     .child(canvas_el)
-                    .when(presenting, |d| d.child(self.render_present_overlay()))
+                    .when(presenting, |d| {
+                        let d = if self.present_debut {
+                            // Black veil until the settled fit: the show opens
+                            // on a black field like PowerPoint's, then the
+                            // slide appears already centered and filled.
+                            d.child(div().absolute().inset_0().bg(gpui::black()))
+                        } else {
+                            d
+                        };
+                        d.child(self.render_present_overlay())
+                    })
                     .when(!presenting, |d| {
                         d.child(self.render_toolbar(cx))
                             .child(self.render_style_bar(cx))
