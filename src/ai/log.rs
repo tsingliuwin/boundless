@@ -178,9 +178,11 @@ pub fn log_tool_call(tool: &str, args: &serde_json::Value) {
     );
 }
 
-/// Log the outcome of the most recent tool invocation. No-op when no run is
-/// active or no call is pending.
-pub fn log_tool_result(ok: bool, outcome: &str) {
+/// Log the outcome of the most recent tool invocation. `is_error` is the
+/// tool's error flag (as on `AgentEvent::ToolResult`); the event stores
+/// `ok: !is_error` so a logged `true` always means success. No-op when no
+/// run is active or no call is pending.
+pub fn log_tool_result(is_error: bool, outcome: &str) {
     let mut guard = RUN.lock().unwrap_or_else(|e| e.into_inner());
     let Some(state) = guard.as_mut() else {
         return;
@@ -194,7 +196,7 @@ pub fn log_tool_result(ok: bool, outcome: &str) {
             ts: now_ms(),
             seq,
             tool,
-            ok,
+            ok: !is_error,
             outcome: outcome.to_string(),
             duration_ms: called_at.elapsed().as_millis(),
         },
@@ -266,8 +268,9 @@ mod tests {
         // begin_run/end_run on the global slot — safe in tests because they
         // are sequential. Use a marker prompt to identify this run's file.
         let path = begin_run("日志自检", "test-model").expect("log should start");
+        // Success path: is_error=false → the event records ok=true.
         log_tool_call("draw_text", &serde_json::json!({"x": 1.0, "text": "你好"}));
-        log_tool_result(true, "已添加文本 id=00000000");
+        log_tool_result(false, "已添加文本 id=00000000");
         end_run(true, "完成");
         let content = fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
@@ -276,5 +279,8 @@ mod tests {
         assert!(lines[1].contains("tool_call"));
         assert!(lines[2].contains("tool_result"));
         assert!(lines[3].contains("done"));
+        // The log dir is real user data (~/.boundless/agent-logs) — this test
+        // must not leave a fake "test-model" run behind for later analysis.
+        let _ = fs::remove_file(&path);
     }
 }

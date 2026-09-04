@@ -404,6 +404,10 @@ impl AiPanel {
         ) {
             Ok(request) => self.start_stream_task(request, snapshot, cx),
             Err(e) => {
+                // Surface in the UI *and* in the run log — a run that dies
+                // here otherwise leaves a run-*.jsonl with only `run_start`,
+                // which reads as a mystery failure during replay analysis.
+                super::log::log_error(&format!("{e:#}"));
                 self.error = Some(format!("{e:#}"));
                 cx.notify();
             }
