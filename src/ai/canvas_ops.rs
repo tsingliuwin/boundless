@@ -55,11 +55,22 @@ pub enum OpFillStyle {
 /// matching how a user drawing by hand would get styled.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct CanvasStyle {
-    /// Stroke color as `0xRRGGBB` integer (e.g. `0x1e1e1e`). Omit = default.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Stroke color: 0xRRGGBB as a decimal integer (e.g. `0x1e1e1e` =
+    /// 1973790) or a hex string (`"0x1e1e1e"` / `"#1e1e1e"`). Omit = default.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_color"
+    )]
     pub stroke: Option<u32>,
-    /// Fill color as `0xRRGGBB` integer. Omit / null = no fill (transparent).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Fill color: 0xRRGGBB as a decimal integer (e.g. `0xE7F0FF` =
+    /// 15200511) or a hex string (`"0xE7F0FF"` / `"#E7F0FF"`). Omit / null =
+    /// no fill (transparent).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_color"
+    )]
     pub fill: Option<u32>,
     /// Stroke width in world units. Omit = default (~2).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -110,7 +121,7 @@ pub enum CanvasOp {
         y: f64,
         w: f64,
         h: f64,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "de_style")]
         style: CanvasStyle,
         /// Optional text label drawn inside the shape (bound label). Empty = no label.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -122,7 +133,7 @@ pub enum CanvasOp {
         y: f64,
         w: f64,
         h: f64,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "de_style")]
         style: CanvasStyle,
         /// Optional text label drawn inside the shape (bound label). Empty = no label.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -134,7 +145,7 @@ pub enum CanvasOp {
         y: f64,
         w: f64,
         h: f64,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "de_style")]
         style: CanvasStyle,
         /// Optional text label drawn inside the shape (bound label). Empty = no label.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -143,7 +154,7 @@ pub enum CanvasOp {
     /// Polyline through the given absolute points.
     Line {
         points: Vec<OpPoint>,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "de_style")]
         style: CanvasStyle,
         /// Optional text label on the line (e.g. "是"/"否" on a flow arrow).
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -158,7 +169,7 @@ pub enum CanvasOp {
         /// Draw an arrowhead at the end (last point). Defaults to true.
         #[serde(default = "default_true")]
         end_arrowhead: bool,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "de_style")]
         style: CanvasStyle,
         /// Optional text label on the arrow (e.g. "是"/"否" on a flow arrow).
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -178,7 +189,7 @@ pub enum CanvasOp {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,
         /// Optional visual style override. Omitted fields keep current style.
-        #[serde(default)]
+        #[serde(default, deserialize_with = "de_style")]
         style: CanvasStyle,
         /// New font size (text elements only). Omit to keep current.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -193,7 +204,7 @@ pub enum CanvasOp {
     /// point connects back to the first.
     Polygon {
         points: Vec<OpPoint>,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "de_style")]
         style: CanvasStyle,
     },
     /// Standalone text. `text` may contain newlines for multi-line.
@@ -224,15 +235,20 @@ pub enum CanvasOp {
         /// left-edge offsets by character count.
         #[serde(skip_serializing_if = "Option::is_none")]
         anchor: Option<String>,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "de_style")]
         style: CanvasStyle,
     },
     /// Set the canvas surface color (the "board"). `None` restores the
     /// default white board. First move for a blackboard poster.
     SetBackground {
-        /// `0xRRGGBB` integer, e.g. `0x2a5240` (chalkboard green).
-        /// `null` = white.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Surface color: 0xRRGGBB as a decimal integer (e.g. `0x2a5240` =
+        /// 2773568, chalkboard green) or a hex string (`"0x2a5240"` /
+        /// `"#2a5240"`). `null` = white.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "de_color"
+        )]
         color: Option<u32>,
     },
     /// A whole mind map from one nested tree. The model supplies only the
@@ -312,6 +328,109 @@ pub fn is_gaudy_fill(c: u32) -> bool {
     let spread = r.max(g.max(b)) - r.min(g.min(b));
     let neon = (r + g + b) >= 600 && spread >= 180;
     magenta_like || pure_red || neon
+}
+
+/// Parse a color in the string forms models actually emit: `#RRGGBB`,
+/// `0xRRGGBB`, bare `RRGGBB` (case-insensitive), CSS short `#RGB`, and
+/// 8-digit hex with an alpha pair — `#RRGGBBAA` (alpha last) / `0xAARRGGBB`
+/// (alpha first); the alpha pair is dropped because opacity is a separate
+/// style field. Everything else is a corrective error the model can retry
+/// against.
+pub fn parse_color_hex(s: &str) -> Result<u32, String> {
+    let err = || {
+        format!(
+            "无法识别的颜色 \"{s}\"：请用 0xRRGGBB 整数，或 \"#RRGGBB\" / \"0xRRGGBB\" 字符串"
+        )
+    };
+    let t = s.trim();
+    let t = t.strip_prefix('#').unwrap_or(t);
+    if let Some(rest) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        return match rest.len() {
+            6 => u32::from_str_radix(rest, 16).map_err(|_| err()),
+            8 => u32::from_str_radix(&rest[2..], 16).map_err(|_| err()),
+            _ => Err(err()),
+        };
+    }
+    match t.len() {
+        3 => {
+            let expanded: String = t.chars().flat_map(|c| [c, c]).collect();
+            u32::from_str_radix(&expanded, 16).map_err(|_| err())
+        }
+        6 => u32::from_str_radix(t, 16).map_err(|_| err()),
+        8 => u32::from_str_radix(&t[..6], 16).map_err(|_| err()),
+        _ => Err(err()),
+    }
+}
+
+/// serde `deserialize_with` for model-supplied color fields. The schema says
+/// "0xRRGGBB integer", but models frequently answer with the *string*
+/// `"0xE7F0FF"` / `"#E7F0FF"`, which a bare `u32` rejects — failing the whole
+/// tool call until the model gives up on colors entirely (observed: a whole
+/// slide deck drawn with `style: {}` after exactly such retries). Accept the
+/// decimal number, the hex string, and null/missing alike.
+pub fn de_color<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match v {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(n)) => {
+            const MAX: u64 = 0xFF_FF_FF;
+            if let Some(u) = n.as_u64() {
+                if u <= MAX {
+                    Ok(Some(u as u32))
+                } else {
+                    Err(serde::de::Error::custom(format!(
+                        "颜色 {u} 超出 0xRRGGBB 范围（最大 0xFFFFFF）"
+                    )))
+                }
+            } else if let Some(f) = n.as_f64() {
+                // Models occasionally emit colors as floats (1.5187711e7).
+                if f.fract() == 0.0 && f >= 0.0 && f <= MAX as f64 {
+                    Ok(Some(f as u32))
+                } else {
+                    Err(serde::de::Error::custom(format!(
+                        "颜色 {f} 超出 0xRRGGBB 范围（最大 0xFFFFFF）"
+                    )))
+                }
+            } else {
+                Err(serde::de::Error::custom(
+                    "颜色必须是 0xRRGGBB 整数或十六进制字符串",
+                ))
+            }
+        }
+        Some(serde_json::Value::String(s)) => {
+            parse_color_hex(&s).map(Some).map_err(serde::de::Error::custom)
+        }
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "颜色必须是 0xRRGGBB 整数或十六进制字符串，收到 {other}"
+        ))),
+    }
+}
+
+/// serde `deserialize_with` for `style` fields. Some models (observed with
+/// glm-5.3-flash) serialize the nested style object as a *string* —
+/// `"style": "{\"fill\":...}"` — which a plain struct deserializer rejects,
+/// failing the whole tool call invisibly (before the tool runs, so nothing
+/// reaches the log or the UI) until the model concludes style "cannot be
+/// passed" and draws everything unstyled. Accept the double-encoded form by
+/// parsing the string as JSON first; objects and null behave as before.
+pub fn de_style<'de, D>(deserializer: D) -> Result<CanvasStyle, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(deserializer)?;
+    match v {
+        serde_json::Value::String(s) => serde_json::from_str::<CanvasStyle>(&s).map_err(|e| {
+            serde::de::Error::custom(format!(
+                "style 应为对象（或对象的 JSON 字符串形式），解析失败：{e}"
+            ))
+        }),
+        serde_json::Value::Null => Ok(CanvasStyle::default()),
+        other => serde_json::from_value(other)
+            .map_err(|e| serde::de::Error::custom(format!("style 解析失败：{e}"))),
+    }
 }
 
 impl CanvasOp {
@@ -484,6 +603,100 @@ mod tests {
         let json = serde_json::to_string(&op).unwrap();
         let back: CanvasOp = serde_json::from_str(&json).unwrap();
         assert_eq!(op, back);
+    }
+
+    #[test]
+    fn fill_accepts_number_and_hex_string_forms() {
+        // The DuckDB-slide failure: models answer the "0xRRGGBB integer"
+        // schema with the *string* "0xE7F0FF" — the bare u32 deserializer
+        // rejected the whole tool call and the model gave up on fills.
+        for form in ["15200511", "\"0xE7F0FF\"", "\"#E7F0FF\"", "\"e7f0ff\""] {
+            let style: CanvasStyle =
+                serde_json::from_str(&format!("{{\"fill\":{form}}}"))
+                    .unwrap_or_else(|e| panic!("form {form}: {e}"));
+            assert_eq!(style.fill, Some(0xE7_F0_FF), "form {form}");
+        }
+    }
+
+    #[test]
+    fn fill_accepts_null_and_omission() {
+        let style: CanvasStyle = serde_json::from_str("{\"fill\":null}").unwrap();
+        assert_eq!(style.fill, None);
+        let style: CanvasStyle = serde_json::from_str("{}").unwrap();
+        assert_eq!(style.fill, None);
+    }
+
+    #[test]
+    fn fill_drops_alpha_pair() {
+        // #RRGGBBAA (alpha last) and 0xAARRGGBB (alpha first): opacity is a
+        // separate style field, so strip the alpha instead of rejecting.
+        let style: CanvasStyle = serde_json::from_str("{\"fill\":\"#E7F0FFCC\"}").unwrap();
+        assert_eq!(style.fill, Some(0xE7_F0_FF));
+        let style: CanvasStyle = serde_json::from_str("{\"fill\":\"0xFFE7F0FF\"}").unwrap();
+        assert_eq!(style.fill, Some(0xE7_F0_FF));
+    }
+
+    #[test]
+    fn fill_expands_short_hex() {
+        let style: CanvasStyle = serde_json::from_str("{\"fill\":\"#FFF\"}").unwrap();
+        assert_eq!(style.fill, Some(0xFF_FF_FF));
+    }
+
+    #[test]
+    fn fill_rejects_garbage_with_corrective_message() {
+        for form in ["\"红色\"", "\"rgb(230,240,255)\"", "true", "-5"] {
+            let err = serde_json::from_str::<CanvasStyle>(&format!("{{\"fill\":{form}}}"))
+                .expect_err(form);
+            assert!(err.to_string().contains("0xRRGGBB"), "{form}: {err}");
+        }
+    }
+
+    #[test]
+    fn fill_out_of_range_number_still_rejected() {
+        let err = serde_json::from_str::<CanvasStyle>("{\"fill\":4294967295}").unwrap_err();
+        assert!(err.to_string().contains("超出"), "{err}");
+    }
+
+    #[test]
+    fn set_background_accepts_string_color() {
+        let op: CanvasOp =
+            serde_json::from_str("{\"shape\":\"set_background\",\"color\":\"#2a5240\"}").unwrap();
+        match op {
+            CanvasOp::SetBackground { color } => assert_eq!(color, Some(0x2A_52_40)),
+            _ => panic!("expected set_background"),
+        }
+    }
+
+    #[test]
+    fn style_accepts_double_encoded_json_string() {
+        // glm-5.3-flash serializes the nested style object as a string; the
+        // whole tool call then failed invisibly (before the tool ran) and the
+        // model declared style "un-passable", drawing everything unstyled.
+        let op: CanvasOp = serde_json::from_str(
+            r##"{"shape":"rectangle","x":0,"y":0,"w":10,"h":10,"style":"{\"fill\":\"#E7F0FF\"}"}"##,
+        )
+        .unwrap();
+        match op {
+            CanvasOp::Rectangle { style, .. } => assert_eq!(style.fill, Some(0xE7_F0_FF)),
+            _ => panic!("expected rectangle"),
+        }
+    }
+
+    #[test]
+    fn style_null_and_garbage_string() {
+        let op: CanvasOp =
+            serde_json::from_str(r#"{"shape":"rectangle","x":0,"y":0,"w":10,"h":10,"style":null}"#)
+                .unwrap();
+        match op {
+            CanvasOp::Rectangle { style, .. } => assert_eq!(style, CanvasStyle::default()),
+            _ => panic!("expected rectangle"),
+        }
+        // A string that isn't a style object is a corrective error, not silence.
+        let err = serde_json::from_str::<CanvasOp>(
+            r#"{"shape":"rectangle","x":0,"y":0,"w":10,"h":10,"style":"随便什么"}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("style"), "{err}");
     }
 
     #[test]

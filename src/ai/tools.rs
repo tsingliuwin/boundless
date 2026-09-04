@@ -22,8 +22,8 @@ use serde_json::Value;
 
 use super::agent::{next_tool_id, AgentEvent};
 use super::canvas_ops::{
-    CanvasOp, CanvasOpError, CanvasOpErrorCode, CanvasOpOutcome, CanvasStyle, OpMindmapNode,
-    OpPoint, OpTextAlign,
+    de_color, de_style, CanvasOp, CanvasOpError, CanvasOpErrorCode, CanvasOpOutcome, CanvasStyle,
+    OpMindmapNode, OpPoint, OpTextAlign,
 };
 use super::client::ChatMessage;
 
@@ -257,7 +257,7 @@ pub struct BoxArgs {
     /// Height in world units.
     pub h: f64,
     /// Optional visual style. Omitted fields inherit the board's current style.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_style")]
     pub style: CanvasStyle,
     /// Optional text to draw inside the shape (e.g. "登录" inside an ellipse,
     /// "是否为空?" inside a diamond). The text is centered and follows the
@@ -279,7 +279,7 @@ pub struct PointsArgs {
     #[serde(default = "default_true")]
     pub end_arrowhead: bool,
     /// Optional visual style.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_style")]
     pub style: CanvasStyle,
     /// Optional text label on the line/arrow (e.g. "是"/"否" on a flow arrow).
     /// The label is centered on the line and follows it when moved.
@@ -316,7 +316,7 @@ pub struct TextArgs {
     #[serde(default)]
     pub anchor: Option<String>,
     /// Optional visual style (opacity etc.).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_style")]
     pub style: CanvasStyle,
 }
 
@@ -647,7 +647,7 @@ pub struct UpdateElementArgs {
     pub text: Option<String>,
     /// Optional visual style override (stroke/fill/width/roughness/opacity).
     /// Omitted fields keep the element's current style.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_style")]
     pub style: CanvasStyle,
     /// New font size (text elements only). Omit to keep current.
     #[serde(default)]
@@ -820,8 +820,14 @@ pub struct SetBackgroundArgs {
     /// (黑板黑), or `white` (恢复白板). Either preset or color is required.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset: Option<String>,
-    /// Explicit surface color as `0xRRGGBB`. Overrides `preset`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Explicit surface color: 0xRRGGBB as a decimal integer (e.g. `0x2a5240`
+    /// = 2773568) or a hex string (`"0x2a5240"` / `"#2a5240"`). Overrides
+    /// `preset`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_color"
+    )]
     pub color: Option<u32>,
 }
 
@@ -930,7 +936,7 @@ pub struct PolygonArgs {
     pub points: Vec<OpPoint>,
     /// Optional visual style. Ink-wash guidance: fill + fill_style="solid"
     /// with opacity 0.35~0.5 for 远山，0.6~0.7 for 近岸.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_style")]
     pub style: CanvasStyle,
 }
 
