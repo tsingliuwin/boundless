@@ -1,4 +1,5 @@
-//! AI side panel: settings, chat with SSE streaming, insert-to-canvas.
+//! AI side panel: chat with SSE streaming, insert-to-canvas. Model/provider
+//! settings live in the app-wide settings page (crate::settings_page).
 //!
 //! Input fields use gpui-component's `InputState`/`Input` (multi-line with
 //! auto-grow, IME, selection, clipboard) instead of a hand-rolled TextField.
@@ -13,8 +14,7 @@ use gpui::*;
 use gpui_component::button::Button;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::text::TextView;
-use gpui_component::IconName;
-use gpui_component::Sizable;
+use gpui_component::{Icon, IconName, Sizable};
 
 use crate::board::BoardView;
 
@@ -49,7 +49,16 @@ struct StreamingState {
 pub struct AiPanel {
     board: WeakEntity<BoardView>,
     settings: AiSettings,
-    show_settings: bool,
+    /// Display mode: false = the classic right-docked chat panel; true = the
+    /// compact bottom bar (one-line streaming status above the input), the
+    /// ChatGPT-canvas style where the agent's actions are watched on the
+    /// board itself. Mirrored to `BoardView::chat_compact` so the mode
+    /// survives close/reopen.
+    compact: bool,
+    /// Workspace-relative path of the board the conversations belong to.
+    /// None = untitled board (sessions stay unbound). Session list and
+    /// history are filtered to this board.
+    active_board: Option<String>,
     /// Whether the session-list section is shown.
     show_sessions: bool,
     /// All known sessions (newest first), for the list UI.
@@ -61,10 +70,8 @@ pub struct AiPanel {
     error: Option<String>,
     /// Multi-line chat input (auto-grow 3..8 lines).
     input: Entity<InputState>,
-    /// Settings fields.
-    base_url_input: Entity<InputState>,
-    api_key_input: Entity<InputState>,
-    model_input: Entity<InputState>,
+    /// Transient panel-level notice (e.g. session save/load failures). Shown
+    /// as a slim dismissible bar under the header.
     notice: Option<String>,
     /// Current reasoning-effort selection, mirrored to settings on send.
     reasoning: ReasoningLevel,
@@ -100,6 +107,8 @@ pub struct AiPanel {
 
 /// Default / min / max panel width in px.
 pub const DEFAULT_WIDTH: f32 = 360.0;
+/// Width of the compact bottom bar (the floating conversation input).
+pub const COMPACT_BAR_WIDTH: f32 = 680.0;
 const MIN_WIDTH: f32 = 280.0;
 const MAX_WIDTH: f32 = 640.0;
 
@@ -124,7 +133,13 @@ impl Render for ResizeDrag {
 }
 
 impl AiPanel {
-    pub fn new(board: WeakEntity<BoardView>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        board: WeakEntity<BoardView>,
+        active_board: Option<String>,
+        compact: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let settings = AiSettings::load();
 
         // Chat input: multi-line, auto-grow 3..8 lines.
@@ -133,23 +148,6 @@ impl AiPanel {
                 .placeholder("给 AI 发送消息…")
                 .multi_line(true)
                 .auto_grow(3, 8)
-        });
-        // Settings inputs: single-line.
-        let base_url_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("https://api.openai.com/v1")
-                .default_value(settings.base_url.clone())
-        });
-        let api_key_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("sk-...")
-                .masked(true)
-                .default_value(settings.api_key.clone())
-        });
-        let model_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("gpt-4o-mini")
-                .default_value(settings.model.clone())
         });
 
         let mut subscriptions = Vec::new();
@@ -164,9 +162,12 @@ impl AiPanel {
             }),
         );
 
-        // Load stored sessions; resume the most recent one if any, else start a
-        // fresh (not-yet-persisted) session.
-        let sessions = list_sessions();
+        // Load stored sessions for this board; resume the most recent one if
+        // any, else start a fresh (not-yet-persisted) session.
+        let sessions = list_sessions()
+            .into_iter()
+            .filter(|s| s.board == active_board)
+            .collect::<Vec<_>>();
         let (session_id, messages) = match sessions.first() {
             Some(latest) => {
                 let id = latest.id.clone();
@@ -180,7 +181,8 @@ impl AiPanel {
             board,
             reasoning: settings.reasoning_effort,
             settings,
-            show_settings: false,
+            compact,
+            active_board,
             show_sessions: false,
             sessions,
             session_id,
@@ -188,9 +190,6 @@ impl AiPanel {
             streaming: None,
             error: None,
             input,
-            base_url_input,
-            api_key_input,
-            model_input,
             notice: None,
             pending_clear_input: false,
             narration_retried: false,
@@ -209,33 +208,13 @@ impl AiPanel {
         self.width
     }
 
-    fn save_settings(&mut self, cx: &mut Context<Self>) {
-        let base_url = self.base_url_input.read(cx).value().to_string();
-        let api_key = self.api_key_input.read(cx).value().to_string();
-        let model = self.model_input.read(cx).value().to_string();
-        self.settings = AiSettings {
-            base_url: if base_url.trim().is_empty() {
-                AiSettings::default().base_url
-            } else {
-                base_url.trim().to_string()
-            },
-            api_key: api_key.trim().to_string(),
-            model: if model.trim().is_empty() {
-                AiSettings::default().model
-            } else {
-                model.trim().to_string()
-            },
-            // Preserve the current reasoning-effort choice (set via the bottom
-            // toolbar), so saving settings doesn't reset it.
-            reasoning_effort: self.settings.reasoning_effort,
-        };
-        match self.settings.save() {
-            Ok(()) => {
-                self.notice = Some("设置已保存".to_string());
-                self.show_settings = false;
-            }
-            Err(e) => self.notice = Some(format!("保存失败: {e}")),
-        }
+    /// Re-read settings from disk after the user saved the settings page, so
+    /// the model label and the next request pick up the new values. The
+    /// reasoning-effort toggle is re-synced too (the page never writes it, so
+    /// this is a no-op in practice).
+    pub fn reload_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings = AiSettings::load();
+        self.reasoning = self.settings.reasoning_effort;
         cx.notify();
     }
 
@@ -244,7 +223,7 @@ impl AiPanel {
         self.reasoning = level;
         self.settings.reasoning_effort = level;
         if let Err(e) = self.settings.save() {
-            self.notice = Some(format!("保存设置失败: {e}"));
+            eprintln!("failed to persist reasoning effort: {e}");
         }
         cx.notify();
     }
@@ -266,7 +245,7 @@ impl AiPanel {
         self.narration_retried = false;
         self.error = None;
         let msg = ChatMessage::user(text);
-        self.persist(&msg);
+        self.persist(&msg, cx);
         self.messages.push(msg);
         self.start_agent(cx);
     }
@@ -274,16 +253,104 @@ impl AiPanel {
     /// Append a message to the current session's JSONL file. Failures are
     /// surfaced as a notice rather than aborting the conversation - an
     /// in-memory-only session is still usable.
-    fn persist(&mut self, msg: &ChatMessage) {
-        if let Err(e) = store::append_message(&self.session_id, msg) {
+    fn persist(&mut self, msg: &ChatMessage, cx: &mut Context<Self>) {
+        if let Err(e) = store::append_message(&self.session_id, msg, self.active_board.as_deref()) {
             self.notice = Some(format!("会话保存失败: {e}"));
         }
+        // Keep the explorer's session level in sync (new session appears,
+        // preview/count update).
+        self.board
+            .update(cx, |board, cx| board.refresh_explorer_sessions(cx))
+            .ok();
     }
 
     /// Refresh the cached session list from disk (preview/mtime may change as
-    /// messages are appended).
+    /// messages are appended). Only sessions bound to the active board (or,
+    /// on an untitled board, unbound ones) are shown.
     fn refresh_sessions(&mut self) {
-        self.sessions = list_sessions();
+        self.sessions = list_sessions()
+            .into_iter()
+            .filter(|s| s.board == self.active_board)
+            .collect();
+    }
+
+    /// True while an agent run is in flight. Board switches are refused during
+    /// this window so the in-progress reply can't land in the wrong session.
+    pub fn is_streaming(&self) -> bool {
+        self.streaming.is_some()
+    }
+
+    /// Display mode: true = compact bottom bar, false = docked panel.
+    pub fn is_compact(&self) -> bool {
+        self.compact
+    }
+
+    /// Switch display mode and mirror the preference to the board so it
+    /// survives close/reopen (the board also re-layouts its chrome offsets).
+    pub fn set_compact(&mut self, compact: bool, cx: &mut Context<Self>) {
+        if self.compact == compact {
+            return;
+        }
+        self.compact = compact;
+        self.board
+            .update(cx, |board, cx| board.set_chat_compact(compact, cx))
+            .ok();
+        cx.notify();
+    }
+
+    /// The session the panel currently shows (explorer highlight).
+    pub fn active_session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Switch to a specific stored session of the active board — the
+    /// explorer's session level uses this to open a past conversation.
+    pub fn activate_session(&mut self, id: String, cx: &mut Context<Self>) {
+        self.switch_session(id, cx);
+    }
+
+    /// Start a fresh conversation bound to the active board (the explorer's
+    /// "new session" button). Binding is written with the first message.
+    pub fn start_new_session(&mut self, cx: &mut Context<Self>) {
+        self.new_session(cx);
+    }
+
+    /// Bind the panel to a board: filter the session list, and resume that
+    /// board's newest conversation (or start a fresh one). Called on board
+    /// open/create/workspace switches; refused while streaming (the caller
+    /// surfaces a notice).
+    pub fn set_active_board(&mut self, board: Option<String>, cx: &mut Context<Self>) {
+        if self.active_board == board {
+            return;
+        }
+        self.active_board = board;
+        let sessions = list_sessions()
+            .into_iter()
+            .filter(|s| s.board == self.active_board)
+            .collect::<Vec<_>>();
+        match sessions.first() {
+            Some(latest) => {
+                self.session_id = latest.id.clone();
+                self.messages = load_messages(&latest.id).unwrap_or_default();
+            }
+            None => {
+                self.session_id = create_session();
+                self.messages = Vec::new();
+            }
+        }
+        self.sessions = sessions;
+        // Caller refuses to switch while streaming; this is belt-and-braces so
+        // a leaked stream can't write into the new board's session.
+        if let Some(s) = &self.streaming {
+            s.cancel.store(true, Ordering::Relaxed);
+        }
+        self.streaming = None;
+        self.error = None;
+        self.show_sessions = false;
+        self.open_stream_steps.clear();
+        self.open_done_steps.clear();
+        self.active_skill.clear();
+        cx.notify();
     }
 
     /// Start a brand-new, empty session and switch to it.
@@ -708,7 +775,7 @@ impl AiPanel {
                 // Preserve the ordered reasoning/tool steps so they survive
                 // after streaming - the user can re-expand any step.
                 msg.steps = s.steps;
-                self.persist(&msg);
+                self.persist(&msg, cx);
                 self.messages.push(msg);
             }
             // The model narrated but never called a drawing tool - surface it
@@ -752,10 +819,13 @@ impl Render for AiPanel {
         // Consume the deferred input-clear flag. send_message (called from a
         // subscribe callback that has no Window) sets it; here we have a Window
         // so InputState::set_value can run. Clear the flag first to avoid
-        // re-entrancy.
+        // re-entrancy. Must run in BOTH display modes (they share the input).
         if self.pending_clear_input {
             self.pending_clear_input = false;
             self.input.update(cx, |s, cx| s.set_value("", window, cx));
+        }
+        if self.compact {
+            return self.render_compact(cx).into_any_element();
         }
         let streaming = self.streaming.is_some();
 
@@ -781,23 +851,17 @@ impl Render for AiPanel {
                     .flex_row()
                     .gap_1()
                     .child(
+                        // Collapse back to the compact bottom bar.
+                        panel_button("收起", false).on_click(cx.listener(
+                            |this, _, _, cx| this.set_compact(true, cx),
+                        )),
+                    )
+                    .child(
                         panel_button("会话", self.show_sessions).on_click(cx.listener(
                             |this, _, _, cx| {
                                 this.show_sessions = !this.show_sessions;
                                 if this.show_sessions {
-                                    this.show_settings = false;
                                     this.refresh_sessions();
-                                }
-                                cx.notify();
-                            },
-                        )),
-                    )
-                    .child(
-                        panel_button("设置", self.show_settings).on_click(cx.listener(
-                            |this, _, _, cx| {
-                                this.show_settings = !this.show_settings;
-                                if this.show_settings {
-                                    this.show_sessions = false;
                                 }
                                 cx.notify();
                             },
@@ -809,34 +873,27 @@ impl Render for AiPanel {
                     ),
             );
 
-        // ---- settings section ----
-        let settings_section = if self.show_settings {
-            let notice = self.notice.clone().unwrap_or_default();
-            div()
+        // Slim dismissible notice bar (session IO failures etc.), directly
+        // under the header. Click to dismiss.
+        let notice_bar = match self.notice.clone() {
+            Some(text) => div()
+                .id("panel-notice")
                 .flex()
-                .flex_col()
-                .gap_2()
+                .flex_row()
+                .items_center()
                 .px_3()
-                .py_2()
-                .border_b_1()
-                .border_color(rgb(0xeeeeec))
-                .child(field_row("Base URL", self.base_url_input.clone()))
-                .child(field_row("API Key", self.api_key_input.clone()))
-                .child(field_row("模型", self.model_input.clone()))
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .child(div().text_xs().text_color(rgb(0x2f9e44)).child(notice))
-                        .child(
-                            panel_button("保存设置", false)
-                                .on_click(cx.listener(|this, _, _, cx| this.save_settings(cx))),
-                        ),
-                )
-        } else {
-            div().hidden()
+                .py_1()
+                .bg(rgb(0xfff0f0))
+                .text_xs()
+                .text_color(rgb(0xc92a2a))
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.notice = None;
+                    cx.notify();
+                }))
+                .child(text)
+                .into_any_element(),
+            None => div().hidden().into_any_element(),
         };
 
         // ---- sessions section ----
@@ -1034,42 +1091,7 @@ impl Render for AiPanel {
         // gpui-component's Button.
         let streaming_now = streaming;
         let model_name = self.settings.model.clone();
-        let current_reasoning = self.reasoning;
-
-        // Reasoning-effort segmented control: 低 / 中 / 高.
-        let mut reasoning_control = div()
-            .flex()
-            .flex_row()
-            .rounded_md()
-            .overflow_hidden()
-            .border_1()
-            .border_color(rgb(0xd6d4d0));
-        for (i, level) in [
-            ReasoningLevel::Low,
-            ReasoningLevel::Medium,
-            ReasoningLevel::High,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let active = level == current_reasoning;
-            let mut seg = div()
-                .id(("reasoning", i))
-                .px_2()
-                .py_1()
-                .text_xs()
-                .cursor_pointer()
-                .child(level.label());
-            if active {
-                seg = seg.bg(rgb(0x1a5fd7)).text_color(rgb(0xffffff));
-            } else {
-                seg = seg.hover(|s| s.bg(rgb(0xefeeec))).text_color(rgb(0x555555));
-            }
-            reasoning_control =
-                reasoning_control.child(seg.on_click(cx.listener(move |this, _, _, cx| {
-                    this.set_reasoning(level, cx);
-                })));
-        }
+        let reasoning_control = self.reasoning_control(cx);
 
         // Send/stop icon button (gpui-component Button).
         let send_btn = Button::new("send-btn")
@@ -1089,6 +1111,8 @@ impl Render for AiPanel {
 
         // Bottom toolbar row (inside the input box): model label | spacer |
         // reasoning | send icon. Pinned to the bottom-right inside the box.
+        // The model label opens the app-wide settings page (the model settings
+        // used to live here; they moved to 设置 → AI 模型).
         let toolbar = div()
             .flex()
             .flex_row()
@@ -1103,10 +1127,11 @@ impl Render for AiPanel {
                     .text_color(rgb(0x999999))
                     .child(format!("模型: {model_name}"))
                     .cursor_pointer()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.show_settings = true;
-                        this.show_sessions = false;
-                        cx.notify();
+                    .hover(|s| s.text_color(rgb(0x555555)))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.board
+                            .update(cx, |board, cx| board.open_settings(window, cx))
+                            .ok();
                     })),
             )
             .child(div().flex_1())
@@ -1227,11 +1252,212 @@ impl Render for AiPanel {
             // context (see main.rs), so this guard is unnecessary.
             .child(resize_handle)
             .child(header)
-            .child(settings_section)
+            .child(notice_bar)
             .child(sessions_section)
             .child(messages_area)
             .child(error_bar)
             .child(input_area)
+            .into_any_element()
+    }
+}
+
+impl AiPanel {
+    /// Reasoning-effort segmented control (低/中/高), shared by the docked
+    /// panel toolbar and the compact bottom bar.
+    fn reasoning_control(&self, cx: &mut Context<Self>) -> Div {
+        let current_reasoning = self.reasoning;
+        let mut control = div()
+            .flex()
+            .flex_row()
+            .rounded_md()
+            .overflow_hidden()
+            .border_1()
+            .border_color(rgb(0xd6d4d0));
+        for (i, level) in [
+            ReasoningLevel::Low,
+            ReasoningLevel::Medium,
+            ReasoningLevel::High,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let active = level == current_reasoning;
+            let mut seg = div()
+                .id(("reasoning", i))
+                .px_2()
+                .py_1()
+                .text_xs()
+                .cursor_pointer()
+                .child(level.label());
+            if active {
+                seg = seg.bg(rgb(0x1a5fd7)).text_color(rgb(0xffffff));
+            } else {
+                seg = seg.hover(|s| s.bg(rgb(0xefeeec))).text_color(rgb(0x555555));
+            }
+            control =
+                control.child(seg.on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_reasoning(level, cx);
+                })));
+        }
+        control
+    }
+
+    /// The compact conversation form: a floating bottom-center input bar with
+    /// a single status line above it (streaming tail / tool in flight / last
+    /// reply / error). The agent's actions unfold on the canvas — watching
+    /// the board is the point; the full transcript lives one toggle away.
+    fn render_compact(&mut self, cx: &mut Context<Self>) -> Div {
+        let streaming = self.streaming.is_some();
+        let reasoning_control = self.reasoning_control(cx);
+
+        // Send/stop button (mirrors the docked panel's).
+        let send_btn = Button::new("send-btn-compact")
+            .icon(if streaming {
+                IconName::Close
+            } else {
+                IconName::ArrowUp
+            })
+            .small()
+            .on_click(cx.listener(move |this, _, _window, cx| {
+                if streaming {
+                    this.stop_streaming(cx);
+                } else {
+                    this.send_message(cx);
+                }
+            }));
+
+        // Expand back to the docked chat panel (the mic-icon slot in the
+        // reference layout).
+        let expand_btn = div()
+            .id("chat-mode-expand")
+            .w_7()
+            .h_7()
+            .rounded_md()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_color(rgb(0x999999))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(0xefeeec)).text_color(rgb(0x1e1e1e)))
+            .on_click(cx.listener(|this, _, _, cx| this.set_compact(false, cx)))
+            .child(Icon::new(IconName::PanelRightOpen));
+
+        let bar = div()
+            .w(px(COMPACT_BAR_WIDTH))
+            .max_w_full()
+            .bg(rgb(0xffffff))
+            .border_1()
+            .border_color(rgb(0xd6d4d0))
+            .rounded_lg()
+            .shadow_lg()
+            .flex()
+            .flex_row()
+            .items_end()
+            .gap_2()
+            .p_2()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Input::new(&self.input).appearance(false)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1p5()
+                    .pb_1()
+                    .child(reasoning_control)
+                    .child(expand_btn)
+                    .child(send_btn),
+            );
+
+        let wrapper = div()
+            .absolute()
+            .bottom_0()
+            .left_0()
+            .right_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_1()
+            .pb_3()
+            .px_3();
+        match self.compact_status_line() {
+            Some(line) => wrapper.child(line).child(bar),
+            None => wrapper.child(bar),
+        }
+    }
+
+    /// The one line above the compact bar: the streaming tail (reasoning /
+    /// tool / text), then the last reply once done, with errors and panel
+    /// notices taking precedence. None = keep the canvas clean.
+    fn compact_status_line(&mut self) -> Option<AnyElement> {
+        let (text, color) = if let Some(err) = &self.error {
+            (err.clone(), rgb(0xc92a2a))
+        } else if let Some(notice) = &self.notice {
+            (notice.clone(), rgb(0xe8590c))
+        } else if let Some(stream) = &self.streaming {
+            let text = if !stream.buffer.trim().is_empty() {
+                tail_chars(&stream.buffer, 64)
+            } else if let Some(step) = stream.steps.last() {
+                match step {
+                    super::client::AssistantStep::Reasoning { text } => {
+                        if text.trim().is_empty() {
+                            "思考中…".to_string()
+                        } else {
+                            tail_chars(text, 64)
+                        }
+                    }
+                    super::client::AssistantStep::Tool { name, .. } => {
+                        format!("正在调用工具：{}", tool_label(name))
+                    }
+                    super::client::AssistantStep::Text { text } => {
+                        if text.trim().is_empty() {
+                            "生成中…".to_string()
+                        } else {
+                            tail_chars(text, 64)
+                        }
+                    }
+                }
+            } else {
+                "正在思考…".to_string()
+            };
+            (text, rgb(0x555555))
+        } else {
+            // Idle: keep the last reply visible (tail) until the next send.
+            let last = self.messages.last()?;
+            if last.role != "assistant" || last.content.trim().is_empty() {
+                return None;
+            }
+            (tail_chars(&last.content, 64), rgb(0x999999))
+        };
+        Some(
+            div()
+                .w(px(COMPACT_BAR_WIDTH))
+                .max_w_full()
+                .px_1()
+                .text_xs()
+                .text_color(color)
+                .child(div().truncate().child(text))
+                .into_any_element(),
+        )
+    }
+}
+
+/// Last `n` characters of `s`, newlines flattened so it reads as one line.
+fn tail_chars(s: &str, n: usize) -> String {
+    let one_line: String = s
+        .trim()
+        .chars()
+        .map(|c| if c == '\n' { ' ' } else { c })
+        .collect();
+    let chars: Vec<char> = one_line.chars().collect();
+    if chars.len() <= n {
+        one_line
+    } else {
+        chars[chars.len() - n..].iter().collect()
     }
 }
 
@@ -1607,15 +1833,6 @@ fn message_bubble(
         col = col.child(extra);
     }
     col
-}
-
-fn field_row(label: &'static str, field: Entity<InputState>) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(div().text_xs().text_color(rgb(0x777777)).child(label))
-        .child(Input::new(&field))
 }
 
 fn panel_button(label: &'static str, active: bool) -> Stateful<Div> {

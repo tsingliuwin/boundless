@@ -11,8 +11,9 @@
 use boundless::board::{
     ArrowTool, BoardView, BringForward, BringToFront, CancelOp, CheckForUpdates, DeleteSelection,
     DiamondTool, EllipseTool, EraserTool, GotoNextPage, GotoPrevPage, HandTool, LineTool,
-    OpenScene, PenTool, PresentExit, PresentStart, Quit, RectTool, Redo, SaveScene, SelectTool,
-    SendBackward, SendToBack, TextTool, ToggleAi, Undo, ZoomIn, ZoomOut, ZoomReset,
+    OpenScene, OpenSettings, PenTool, PresentExit, PresentStart, Quit, RectTool, Redo, SaveScene,
+    SelectTool, SendBackward, SendToBack, TextTool, ToggleAi, ToggleExplorer, Undo, ZoomIn,
+    ZoomOut, ZoomReset,
 };
 use gpui::*;
 use gpui_component::Root;
@@ -134,6 +135,11 @@ fn main() {
                 KeyBinding::new("ctrl--", ZoomOut, Some("Board")),
                 KeyBinding::new("ctrl-0", ZoomReset, Some("Board")),
                 KeyBinding::new("ctrl-b", ToggleAi, Some("Board")),
+                // Left explorer (workspace tree) toggle.
+                KeyBinding::new("ctrl-e", ToggleExplorer, Some("Board")),
+                // Standard settings shortcut (gear button in the menu bar /
+                // the chat panel's model label open the same page).
+                KeyBinding::new("ctrl-,", OpenSettings, Some("Board")),
                 // Slide pages: flip while editing; full set while presenting
                 // (direction keys / PageUp-Down / space advance, Esc exits).
                 KeyBinding::new("pagedown", GotoNextPage, Some("Board")),
@@ -214,6 +220,16 @@ fn main() {
                     // the window is about to close so the red traffic light
                     // actually exits the app.
                     window.on_window_should_close(cx, |_, cx| {
+                        // Flush an autosave-pending board before quitting so
+                        // the last tick's edits can't be lost.
+                        cx.update_global::<boundless::board::ActiveBoardHandle, _>(
+                            |handle, cx| {
+                                handle
+                                    .0
+                                    .update(cx, |board, _cx| board.save_if_dirty())
+                                    .ok();
+                            },
+                        );
                         eprintln!("[exit-diag] window should_close requested -> quitting");
                         boundless::ai::log::log_error(
                             "window should_close requested -> quitting",

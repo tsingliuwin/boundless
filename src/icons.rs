@@ -463,3 +463,42 @@ pub fn align_icon(c: Hsla, align: crate::scene::TextAlign) -> impl IntoElement {
 }
 
 // Send/stop icons were moved to gpui-component's IconName enum (ArrowUp / Close).
+
+/// Edit/rename icon: a lucide-style diagonal pencil (closed barrel outline +
+/// ferrule line), drawn to visually match the SVG icon family used in the
+/// explorer rows (folder/file/plus), unlike the calligraphy `pen` tool icon.
+pub fn pencil(c: Hsla) -> impl IntoElement {
+    icon(c, |b| {
+        b.mv(3.5, 16.5); // tip
+        b.ln(13.4, 6.6); // upper edge to the cap shoulder
+        b.ln(15.7, 8.9); // cap, perpendicular to the barrel
+        b.ln(5.8, 18.8); // lower edge back down
+        b.cp(); // close at the tip
+        // Ferrule: the wood/eraser boundary line.
+        b.mv(6.3, 13.7);
+        b.ln(8.6, 16.0);
+    })
+}
+
+/// Explorer (workspace tree) icon: a panel with a sidebar strip and list
+/// lines — the classic "file explorer" glyph.
+pub fn explorer(c: Hsla) -> impl IntoElement {
+    icon(c, |b| {
+        // Outer panel.
+        b.mv(3.5, 4.5);
+        b.ln(16.5, 4.5);
+        b.ln(16.5, 15.5);
+        b.ln(3.5, 15.5);
+        b.cp();
+        // Sidebar divider.
+        b.mv(8.0, 4.5);
+        b.ln(8.0, 15.5);
+        // List lines in the content area.
+        b.mv(10.5, 7.5);
+        b.ln(14.0, 7.5);
+        b.mv(10.5, 10.0);
+        b.ln(14.0, 10.0);
+        b.mv(10.5, 12.5);
+        b.ln(14.0, 12.5);
+    })
+}

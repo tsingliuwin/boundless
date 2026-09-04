@@ -1,8 +1,9 @@
 //! BoardView: the infinite canvas — scene, camera, tools, selection,
 //! text editing and the surrounding chrome (toolbar, style bar, zoom bar).
 
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gpui::prelude::*;
 use gpui::*;
@@ -18,9 +19,20 @@ use crate::scene::{
     Element, ElementId, ElementKind, ElementStyle, LineType, Scene, SceneFile, StrokeStyle,
     TextAlign, WBounds, WPoint, DEFAULT_FONT_SIZE, LINE_HEIGHT,
 };
+use crate::settings_page::SettingsPage;
+use crate::ai::store::{list_sessions, rebind_session_boards as store_rebind, SessionMeta};
 use crate::text::{utf16_to_utf8, utf8_to_utf16, TextEditSession};
 use crate::tools::{ActiveTool, DragState, PointTarget};
-use gpui_component::{Icon, IconName};
+use crate::workspace::{self, Workspace};
+use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::{Icon, IconName, Sizable};
+
+/// In-progress inline rename in the explorer: the workspace-relative path of
+/// the board/folder being renamed and its kind.
+struct ExplorerRename {
+    rel: String,
+    is_folder: bool,
+}
 
 actions!(
     boundless,
@@ -55,12 +67,21 @@ actions!(
         GotoNextPage,
         PresentStart,
         PresentExit,
+        OpenSettings,
+        ToggleExplorer,
     ]
 );
 
 pub const SELECTION_COLOR: u32 = 0x4c9ffe;
 const BG_COLOR: u32 = 0xffffff;
 const GRID_COLOR: u32 = 0xcccccc;
+
+/// Process-wide handle to the board view, for hooks that only receive
+/// `&mut App` (the window-close handler in main.rs): they flush a dirty
+/// board through it before quitting. Set in `BoardView::new`.
+pub struct ActiveBoardHandle(pub WeakEntity<BoardView>);
+
+impl gpui::Global for ActiveBoardHandle {}
 
 pub struct EditingState {
     pub element_id: ElementId,
@@ -263,6 +284,39 @@ pub struct BoardView {
     /// `set_menus` bar; the field compiles everywhere because the menu-bar
     /// rendering is pure GPUI.
     menubar_open: Option<usize>,
+    /// Independent settings page (shown as a full-area overlay below the
+    /// menu bar while `settings_open`). Owned eagerly so its input state
+    /// survives open/close cycles; fields re-sync from disk on every open.
+    settings_page: Entity<SettingsPage>,
+    /// Whether the settings page overlay is currently shown.
+    settings_open: bool,
+    /// The active workspace: the directory tree holding the user's boards.
+    /// Session storage routes into `<root>/.boundless/`.
+    workspace: Workspace,
+    /// Left explorer panel showing the workspace tree (folders + boards).
+    explorer_open: bool,
+    /// Explorer tree, re-scanned on open and after create/workspace switches.
+    explorer_nodes: Vec<workspace::Node>,
+    /// Workspace-relative paths of folders the user expanded. Root-level
+    /// folders start expanded on first open.
+    explorer_expanded: HashSet<String>,
+    /// False until the first explorer open seeded the expanded set above.
+    explorer_seeded: bool,
+    /// Inline rename state (the row being renamed), None when idle.
+    renaming: Option<ExplorerRename>,
+    /// Shared single-line input used by the inline rename editor.
+    explorer_rename_input: Entity<InputState>,
+    /// Workspace-relative path of the explorer row under the pointer; the
+    /// ＋/✎ action buttons show only on the hovered row.
+    explorer_hover: Option<String>,
+    /// Sessions grouped by workspace-relative board path, refreshed together
+    /// with the tree. The explorer renders them as an expandable level under
+    /// each board.
+    explorer_sessions: HashMap<String, Vec<SessionMeta>>,
+    /// Conversation display mode for newly opened chat UIs: true = compact
+    /// bottom bar (the default; watch the agent on the canvas), false =
+    /// docked chat panel. Mirrored from/to the live panel on mode switches.
+    chat_compact: bool,
     /// Auto-update flow state (check / download / ready-to-restart). Driven by
     /// the `CheckForUpdates` action + a delayed startup poll; see `src/updater.rs`.
     update_state: crate::updater::UpdateState,
@@ -283,7 +337,28 @@ impl BoardView {
         // the ink pipeline gets real stylus pressure and the eraser tip.
         // Idempotent; no-op on other platforms.
         crate::platform::init_pen_input(window);
-        let view = Self {
+        let weak_board = cx.weak_entity();
+        let settings_page = cx.new(|cx| SettingsPage::new(weak_board, window, cx));
+        // Resolve the workspace before anything reads sessions: the AI panel
+        // (created later, lazily) lists conversations from the workspace data
+        // dir. The last-worked-on board is reopened right after construction.
+        let workspace = Workspace::load();
+        let _ = workspace.activate();
+        let reopen = workspace.last_board();
+        let (chat_open, chat_compact) = workspace.chat_prefs();
+        cx.set_global(ActiveBoardHandle(cx.weak_entity()));
+        // Inline rename editor for the explorer (created once; the row being
+        // renamed renders it in place). Enter commits, blur commits too.
+        let explorer_rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("名称"));
+        cx.subscribe(&explorer_rename_input, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur)
+                && this.renaming.is_some()
+            {
+                this.commit_renaming(cx);
+            }
+        })
+        .detach();
+        let mut view = Self {
             scene: Scene::new(),
             camera: Camera::default(),
             tool: ActiveTool::Select,
@@ -323,6 +398,18 @@ impl BoardView {
             last_seen_viewport: None,
             present_resize_at: None,
             menubar_open: None,
+            settings_page,
+            settings_open: false,
+            workspace,
+            explorer_open: false,
+            explorer_nodes: Vec::new(),
+            explorer_expanded: HashSet::new(),
+            explorer_seeded: false,
+            renaming: None,
+            explorer_rename_input,
+            explorer_hover: None,
+            explorer_sessions: HashMap::new(),
+            chat_compact: true,
             update_state: crate::updater::UpdateState::default(),
             render_cache: crate::render::cache::RenderCache::new(),
             text_cache: crate::render::cache::TextCache::new(),
@@ -353,6 +440,32 @@ impl BoardView {
             }
         })
         .detach();
+        // Reopen the last-worked-on board. No AI panel exists yet; it binds to
+        // the board via active_board_key() when the user opens it.
+        if let Some(path) = reopen {
+            let _ = view.load_board_file(&path);
+        }
+        // The conversation is on by default: open it on start (in the user's
+        // mode) unless they explicitly closed it last session. This also
+        // persists the open state via toggle_ai_panel.
+        if chat_open {
+            view.toggle_ai_panel(window, cx);
+        }
+        // Autosave ticker: while a board with a workspace file is dirty,
+        // write it out every 1.5s (the file is always writeable — no dialog
+        // path). Detached; the update fails and the loop exits when the
+        // window closes.
+        let autosave = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(1500))
+                    .await;
+                if this.update(cx, |this, cx| this.autosave_tick(cx)).is_err() {
+                    return;
+                }
+            }
+        });
+        autosave.detach();
         view
     }
 
@@ -521,6 +634,12 @@ impl BoardView {
     }
 
     fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The settings page absorbs Esc: close it instead of any canvas cancel.
+        if self.settings_open {
+            self.settings_open = false;
+            cx.notify();
+            return;
+        }
         // An open context menu absorbs Esc: close it instead of clearing the
         // selection / committing an edit.
         if self.context_menu.is_some() {
@@ -1721,33 +1840,84 @@ impl BoardView {
             // Closing: undo the pan applied on open (plus any accumulated
             // during resizing). The net shift to reverse is exactly the
             // panel's current width / 2: open panned -w0/2, each resize panned
-            // -Δ/2, so the total is -w_current/2.
-            let w = panel.read(cx).width();
-            self.camera.pan_by_screen(px(w / 2.0), px(0.0));
+            // -Δ/2, so the total is -w_current/2. The compact bar floats and
+            // never displaced the camera, so nothing to undo there.
+            if !panel.read(cx).is_compact() {
+                let w = panel.read(cx).width();
+                self.camera.pan_by_screen(px(w / 2.0), px(0.0));
+            }
+            // Respect an explicit close across restarts (default-open only
+            // applies while the user hasn't turned it off).
+            self.workspace.set_chat_prefs(false, self.chat_compact);
         } else {
             // Opening: the right-docked panel overlays the canvas, so the
             // visible canvas center jumps left by w/2. Pan the camera to
             // follow it, keeping whatever was centered still centered in the
             // (narrower) visible area - otherwise the focal content can end up
             // hidden behind the panel. Excalidraw does the same. Zoom is left
-            // untouched (no need to fit + restore 100%).
+            // untouched (no need to fit + restore 100%). The compact bar
+            // floats at the bottom and doesn't displace the canvas center.
             let weak = cx.weak_entity();
-            let panel = cx.new(|cx| AiPanel::new(weak, window, cx));
-            let w = panel.read(cx).width();
+            let active_board = self.active_board_key();
+            let compact = self.chat_compact;
+            let panel = cx.new(|cx| AiPanel::new(weak, active_board, compact, window, cx));
+            if !compact {
+                let w = panel.read(cx).width();
+                self.camera.pan_by_screen(px(-w / 2.0), px(0.0));
+            }
             self.ai_panel = Some(panel);
-            self.camera.pan_by_screen(px(-w / 2.0), px(0.0));
+            self.workspace.set_chat_prefs(true, self.chat_compact);
         }
         cx.notify();
     }
 
     /// Current AI panel width (its live, user-resizable value), or the default
     /// if the panel is closed. Used to offset the toolbar / zoom bar so they
-    /// never sit under the panel.
+    /// never sit under the panel. The compact bar floats and reserves nothing.
     fn ai_panel_width(&self, cx: &mut Context<Self>) -> f32 {
-        self.ai_panel
-            .as_ref()
-            .map(|p| p.read(cx).width())
-            .unwrap_or(crate::ai::panel::DEFAULT_WIDTH)
+        match &self.ai_panel {
+            Some(p) if p.read(cx).is_compact() => 0.0,
+            Some(p) => p.read(cx).width(),
+            None => crate::ai::panel::DEFAULT_WIDTH,
+        }
+    }
+
+    // Settings page
+
+    /// Show the settings page overlay (menu-bar gear button, or the chat
+    /// panel's model label). Closes any transient popups first so they can't
+    /// float above the page, and re-syncs the fields from disk.
+    pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.menubar_open = None;
+        self.context_menu = None;
+        self.settings_open = true;
+        self.settings_page
+            .update(cx, |page, cx| page.open(window, cx));
+        cx.notify();
+    }
+
+    /// Hide the settings page overlay (X button, or Esc via `cancel`).
+    pub fn close_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings_open = false;
+        cx.notify();
+    }
+
+    /// Called by the settings page after a successful save: push the new
+    /// settings into the live AI panel so the model label and the next
+    /// request pick them up.
+    pub fn on_settings_saved(&mut self, cx: &mut Context<Self>) {
+        if let Some(panel) = &self.ai_panel {
+            panel.update(cx, |panel, cx| panel.reload_settings(cx));
+        }
+    }
+
+    /// Mirror the panel's display mode (compact bar vs docked panel) so it
+    /// survives close/reopen. The board re-layouts: the compact bar floats
+    /// and must not reserve docked-panel space in the chrome.
+    pub fn set_chat_compact(&mut self, compact: bool, cx: &mut Context<Self>) {
+        self.chat_compact = compact;
+        self.workspace.set_chat_prefs(self.ai_panel.is_some(), compact);
+        cx.notify();
     }
 
     // ------------------------------------------------------------------
@@ -1971,6 +2141,24 @@ impl BoardView {
         if self.ai_panel.is_none() || self.presenting.is_some() {
             return false;
         }
+        let compact = self
+            .ai_panel
+            .as_ref()
+            .is_some_and(|p| p.read(cx).is_compact());
+        if compact {
+            // The compact bar floats bottom-center: shield only its strip
+            // (bar + status line), leaving the rest of the canvas free.
+            let viewport = window.viewport_size();
+            let win_h = f32::from(viewport.height);
+            let win_w = f32::from(viewport.width);
+            if f32::from(position.y) < win_h - 120.0 {
+                return false;
+            }
+            let half = crate::ai::panel::COMPACT_BAR_WIDTH / 2.0 + 12.0;
+            let left = (win_w / 2.0 - half).max(0.0);
+            let right = (win_w / 2.0 + half).min(win_w);
+            return f32::from(position.x) >= left && f32::from(position.x) <= right;
+        }
         let panel_w = self.ai_panel_width(cx);
         let win_right = f32::from(window.viewport_size().width);
         let panel_left = win_right - panel_w;
@@ -2070,18 +2258,9 @@ impl BoardView {
     // ------------------------------------------------------------------
     // persistence
 
-    fn save(&mut self, save_as: bool, cx: &mut Context<Self>) {
-        let path = if save_as || self.file_path.is_none() {
-            let dialog = rfd::FileDialog::new()
-                .add_filter("Boundless 场景", &["boundless"])
-                .set_file_name("untitled.boundless");
-            match dialog.save_file() {
-                Some(p) => p,
-                None => return,
-            }
-        } else {
-            self.file_path.clone().unwrap()
-        };
+    /// Serialize the current scene to `path`. The single write path shared by
+    /// manual save, autosave, and board creation.
+    fn write_scene_to(&self, path: &Path) -> anyhow::Result<()> {
         let file = SceneFile::new(&self.scene, self.camera);
         let file = SceneFile {
             show_grid: self.show_grid,
@@ -2089,46 +2268,964 @@ impl BoardView {
             pages: self.scene.pages.clone(),
             ..file
         };
-        let result = serde_json::to_string_pretty(&file)
-            .map_err(anyhow::Error::from)
-            .and_then(|json| std::fs::write(&path, json).map_err(anyhow::Error::from));
-        match result {
+        let json = serde_json::to_string_pretty(&file)?;
+        std::fs::write(path, json)?;
+        Ok(())
+    }
+
+    /// Autosave tick (runs every 1.5s): write the scene when dirty and the
+    /// board lives in the workspace. Silent on success — only failures surface
+    /// a notice.
+    fn autosave_tick(&mut self, cx: &mut Context<Self>) {
+        if !self.dirty {
+            return;
+        }
+        if let Some(path) = self.file_path.clone() {
+            match self.write_scene_to(&path) {
+                Ok(()) => self.dirty = false,
+                Err(e) => self.set_notice(format!("自动保存失败: {e}"), cx),
+            }
+        }
+    }
+
+    /// Flush the scene to its file if dirty. Used before board/workspace
+    /// switches and on window close.
+    pub fn save_if_dirty(&mut self) {
+        if self.dirty {
+            self.autosave_tick_to_disk();
+        }
+    }
+
+    /// save_if_dirty's body without the context-taking notice path (used from
+    /// contexts without a GPUI context, e.g. the window-close hook).
+    fn autosave_tick_to_disk(&mut self) {
+        if let Some(path) = self.file_path.clone() {
+            if self.write_scene_to(&path).is_ok() {
+                self.dirty = false;
+            }
+        }
+    }
+
+    /// Save the board. A board with a file writes in place (this is what
+    /// autosave does too); an untitled board saves straight into the
+    /// workspace root under an auto-generated name — no dialog. The
+    /// workspace is the save location by design; moving/renaming files
+    /// happens in the OS, and the classic 打开 dialog still accepts any
+    /// path for opening.
+    fn save(&mut self, cx: &mut Context<Self>) {
+        let path = match self.file_path.clone() {
+            Some(path) => path,
+            None => match self.workspace.free_board_path(None) {
+                Ok(path) => path,
+                Err(e) => {
+                    self.set_notice(format!("保存失败: {e}"), cx);
+                    return;
+                }
+            },
+        };
+        self.finish_save(path, cx);
+    }
+
+    /// Write the scene to `path` and mark it the board's home file.
+    fn finish_save(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        match self.write_scene_to(&path) {
             Ok(()) => {
                 self.file_path = Some(path.clone());
                 self.dirty = false;
+                // A board saved anywhere becomes workspace-managed from here
+                // on (autosave takes over), so remember it for resume.
+                if let Some(key) = self.active_board_key() {
+                    self.workspace.set_last_board(Some(&key));
+                }
                 self.set_notice(format!("已保存到 {}", path.display()), cx);
             }
             Err(e) => self.set_notice(format!("保存失败: {e}"), cx),
         }
+        cx.notify();
     }
 
     fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.commit_editing(window, cx);
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("Boundless 场景", &["boundless"])
-            .pick_file()
-        else {
+        // Same rule as `save`: the picker runs in a detached task so the
+        // modal loop never pumps tasks while an entity borrow is held.
+        cx.spawn(async move |this, cx| {
+            let dialog = rfd::FileDialog::new().add_filter("Boundless 场景", &["boundless"]);
+            if let Some(path) = dialog.pick_file() {
+                this.update(cx, |this, cx| this.open_board_inner(path, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Open a specific conversation from the explorer's session level: open
+    /// its board first (if not active), surface the AI panel, and switch the
+    /// panel to that session.
+    pub fn open_session(
+        &mut self,
+        rel: String,
+        session_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.switch_refused(cx) {
             return;
-        };
-        let result = std::fs::read_to_string(&path)
-            .map_err(anyhow::Error::from)
-            .and_then(|json| SceneFile::parse(&json));
-        match result {
-            Ok(file) => {
-                self.scene.restore(file.elements);
-                self.scene.pages = file.pages;
-                self.camera = file.camera;
-                self.show_grid = file.show_grid;
-                self.canvas_background = file.background;
-                self.selection.clear();
-                self.history = History::new();
-                self.file_path = Some(path.clone());
-                self.dirty = false;
-                self.set_notice(format!("已打开 {}", path.display()), cx);
+        }
+        if self.active_board_key().as_deref() != Some(rel.as_str()) {
+            let path = self.workspace.root().join(&rel);
+            self.open_board(path, window, cx);
+        }
+        if self.ai_panel.is_none() {
+            self.toggle_ai_panel(window, cx);
+        }
+        if let Some(panel) = &self.ai_panel {
+            panel.update(cx, |panel, cx| panel.activate_session(session_id, cx));
+        }
+        cx.notify();
+    }
+
+    /// Start a brand-new conversation for the given board (explorer ＋
+    /// button): open the board if needed, surface the AI panel, and reset the
+    /// panel to a fresh session bound to that board.
+    pub fn new_session_for(
+        &mut self,
+        rel: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.switch_refused(cx) {
+            return;
+        }
+        if self.active_board_key().as_deref() != Some(rel.as_str()) {
+            let path = self.workspace.root().join(&rel);
+            self.open_board(path, window, cx);
+        }
+        if self.ai_panel.is_none() {
+            self.toggle_ai_panel(window, cx);
+        }
+        if let Some(panel) = &self.ai_panel {
+            panel.update(cx, |panel, cx| panel.start_new_session(cx));
+        }
+        // Reveal the fresh conversation under its board right away (the
+        // render-time injection shows it even before its first message).
+        self.explorer_expanded.insert(rel.clone());
+        self.set_notice("已新建对话", cx);
+        cx.notify();
+    }
+
+    /// The workspace-relative key of the open board (session-binding key /
+    /// last-board resume path). None on an untitled board.
+    pub fn active_board_key(&self) -> Option<String> {
+        self.file_path
+            .as_ref()
+            .and_then(|p| workspace::rel_key(self.workspace.root(), p))
+    }
+
+    /// The active workspace root (for the settings page display).
+    pub fn workspace_root(&self) -> &Path {
+        self.workspace.root()
+    }
+
+    /// True while the AI panel is mid-run. Board/workspace switches are
+    /// refused then: the in-flight reply must land in the session it started
+    /// with, not the one the user switched to.
+    fn switch_refused(&mut self, cx: &mut Context<Self>) -> bool {
+        let streaming = self
+            .ai_panel
+            .as_ref()
+            .is_some_and(|p| p.read(cx).is_streaming());
+        if streaming {
+            self.set_notice("AI 正在创作，请等待完成或先停止再切换白板", cx);
+        }
+        streaming
+    }
+
+    /// Start an empty, untitled board. Untitled boards autosave only after
+    /// they're saved somewhere (nowhere to write to before that).
+    pub fn new_board(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.switch_refused(cx) {
+            return;
+        }
+        self.save_if_dirty();
+        self.commit_editing(window, cx);
+        self.reset_board_state();
+        self.workspace.set_last_board(None);
+        if let Some(panel) = &self.ai_panel {
+            panel.update(cx, |panel, cx| panel.set_active_board(None, cx));
+        }
+        // New boards start with the conversation UI open (compact bottom bar
+        // by default — the agent's work is watched on the canvas).
+        if self.ai_panel.is_none() {
+            self.toggle_ai_panel(window, cx);
+        }
+        self.set_notice("已新建白板（保存后自动保存生效）", cx);
+        cx.notify();
+    }
+
+    /// Open a board file from the workspace (or anywhere) and bind the AI
+    /// panel to it. Flushes the current board first.
+    pub fn open_board(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_editing(window, cx);
+        self.open_board_inner(path, cx);
+    }
+
+    /// Like `open_board` but without the text-edit commit — used from the
+    /// deferred file-picker task where no `Window` is available. Safe: the
+    /// modal picker blocks all canvas interaction, so no editing session can
+    /// start between the caller's commit and this.
+    fn open_board_inner(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.switch_refused(cx) {
+            return;
+        }
+        self.save_if_dirty();
+        self.renaming = None;
+        match self.load_board_file(&path) {
+            Ok(()) => {
+                let key = self.active_board_key();
+                self.workspace.set_last_board(key.as_deref());
+                if let Some(panel) = &self.ai_panel {
+                    panel.update(cx, |panel, cx| panel.set_active_board(key, cx));
+                }
+                let name = path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.display().to_string());
+                self.set_notice(format!("已打开 {name}"), cx);
             }
             Err(e) => self.set_notice(format!("打开失败: {e}"), cx),
         }
         cx.notify();
+    }
+
+    /// Low-level scene restore from a board file. Also used at startup for
+    /// the resume-on-open flow (no panel to rebind yet).
+    fn load_board_file(&mut self, path: &Path) -> anyhow::Result<()> {
+        let json = std::fs::read_to_string(path)?;
+        let file = SceneFile::parse(&json)?;
+        self.scene.restore(file.elements);
+        self.scene.pages = file.pages;
+        self.camera = file.camera;
+        self.show_grid = file.show_grid;
+        self.canvas_background = file.background;
+        self.selection.clear();
+        self.history = History::new();
+        self.file_path = Some(path.to_path_buf());
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// Clear the board back to a fresh untitled state (shared by 新建白板 and
+    /// workspace switches).
+    fn reset_board_state(&mut self) {
+        self.renaming = None;
+        self.scene.restore(Vec::new());
+        self.scene.pages = Vec::new();
+        self.camera = Camera::default();
+        self.show_grid = false;
+        self.canvas_background = None;
+        self.selection.clear();
+        self.history = History::new();
+        self.file_path = None;
+        self.dirty = false;
+    }
+
+    /// Point the app at a new workspace directory: session storage moves to
+    /// `<root>/.boundless/`, the current board is flushed and replaced by a
+    /// fresh untitled one, and the explorer tree re-scans.
+    pub fn switch_workspace(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        if self.switch_refused(cx) {
+            return;
+        }
+        self.save_if_dirty();
+        self.reset_board_state();
+        self.workspace = Workspace::with_root(root);
+        if let Err(e) = self.workspace.activate() {
+            self.set_notice(format!("切换工作区失败: {e}"), cx);
+            return;
+        }
+        self.explorer_nodes = self.workspace.scan();
+        self.explorer_expanded.clear();
+        self.explorer_seeded = false;
+        if let Some(panel) = &self.ai_panel {
+            panel.update(cx, |panel, cx| panel.set_active_board(None, cx));
+        }
+        self.set_notice(format!("工作区已切换至 {}", self.workspace.root().display()), cx);
+        cx.notify();
+    }
+
+    // ------------------------------------------------------------------
+    // explorer (workspace tree panel)
+
+    /// Toggle the left explorer panel. Opening re-scans the workspace so the
+    /// tree reflects external file changes.
+    pub fn toggle_explorer(&mut self, cx: &mut Context<Self>) {
+        self.explorer_open = !self.explorer_open;
+        self.explorer_hover = None;
+        if self.explorer_open {
+            self.rescan_explorer();
+        }
+        cx.notify();
+    }
+
+    /// Explorer width in px (fixed; no resize handle — the AI panel's
+    /// resize drag was the only user request so far).
+    const EXPLORER_W: f32 = 236.0;
+
+    fn rescan_explorer(&mut self) {
+        // Any pending inline edit refers to a tree that's about to change.
+        self.renaming = None;
+        self.explorer_nodes = self.workspace.scan();
+        // Group sessions by board so the tree can render them as an
+        // expandable level under each board file.
+        self.explorer_sessions = group_sessions_by_board();
+        // First open: root-level folders start expanded so the tree doesn't
+        // read as empty. After that the user's collapse/expand wins.
+        if !self.explorer_seeded {
+            self.explorer_seeded = true;
+            let roots = self
+                .explorer_nodes
+                .iter()
+                .filter_map(|n| match n {
+                    workspace::Node::Folder { rel, .. } => Some(rel.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            for rel in roots {
+                self.explorer_expanded.insert(rel);
+            }
+        }
+    }
+
+    /// Create a board file under `folder_rel` (None = workspace root) and
+    /// open it — creation and "open for editing" are one gesture.
+    pub fn create_board_in(
+        &mut self,
+        folder_rel: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.switch_refused(cx) {
+            return;
+        }
+        match self.workspace.create_board(folder_rel.as_deref()) {
+            Ok(path) => {
+                self.rescan_explorer();
+                self.open_board(path, window, cx);
+                // New boards start with the conversation UI open.
+                if self.ai_panel.is_none() {
+                    self.toggle_ai_panel(window, cx);
+                }
+            }
+            Err(e) => self.set_notice(format!("创建白板失败: {e}"), cx),
+        }
+    }
+
+    /// Create a subfolder under `folder_rel` (None = workspace root).
+    pub fn create_folder_in(
+        &mut self,
+        folder_rel: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        match self.workspace.create_folder(folder_rel.as_deref()) {
+            Ok(_) => self.rescan_explorer(),
+            Err(e) => self.set_notice(format!("创建文件夹失败: {e}"), cx),
+        }
+        cx.notify();
+    }
+
+    /// Rebuild the explorer's per-board session index (the tree's session
+    /// level). Cheap enough to run per conversation turn.
+    pub fn refresh_explorer_sessions(&mut self, cx: &mut Context<Self>) {
+        self.explorer_sessions = group_sessions_by_board();
+        cx.notify();
+    }
+
+    /// Sessions displayed under a board row: the stored ones plus, for the
+    /// active board, the panel's current session even before its first
+    /// message has persisted it to disk (sessions are lazy-created).
+    fn explorer_board_sessions(&self, rel: &str, cx: &Context<Self>) -> Vec<SessionMeta> {
+        let mut list = self.explorer_sessions.get(rel).cloned().unwrap_or_default();
+        if self.active_board_key().as_deref() == Some(rel) {
+            if let Some(panel) = &self.ai_panel {
+                let sid = panel.read(cx).active_session_id().to_string();
+                if !list.iter().any(|s| s.id == sid) {
+                    list.insert(
+                        0,
+                        SessionMeta {
+                            id: sid,
+                            preview: "新对话".to_string(),
+                            mtime: std::time::SystemTime::now(),
+                            count: 0,
+                            board: Some(rel.to_string()),
+                        },
+                    );
+                }
+            }
+        }
+        list
+    }
+
+    /// Does the given window position land on the explorer panel? Same
+    /// geometric-shield pattern as `over_ai_panel`.
+    fn over_explorer(&self, position: Point<Pixels>) -> bool {
+        self.explorer_open && position.x < px(Self::EXPLORER_W)
+    }
+
+    /// Begin inline-renaming a board/folder row: swap the label for the
+    /// shared rename input, pre-filled with the current name and focused.
+    fn start_renaming(
+        &mut self,
+        rel: String,
+        is_folder: bool,
+        current: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.renaming = Some(ExplorerRename { rel, is_folder });
+        self.explorer_rename_input.update(cx, |state, cx| {
+            state.set_value(current, window, cx);
+            state.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Apply the inline rename: rename on disk, re-bind the conversation
+    /// sessions, remap the active board / expanded folders / resume path.
+    fn commit_renaming(&mut self, cx: &mut Context<Self>) {
+        let Some(renaming) = self.renaming.take() else {
+            return;
+        };
+        let name = self
+            .explorer_rename_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        // No-op when the name didn't change.
+        let old_name = Path::new(&renaming.rel)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if name == old_name {
+            cx.notify();
+            return;
+        }
+        // Renaming the board the AI is currently drawing into would yank the
+        // conversation out from under the in-flight reply.
+        let active_rel = self.active_board_key();
+        let affects_active = active_rel.as_deref().is_some_and(|active| {
+            if renaming.is_folder {
+                active == renaming.rel || active.starts_with(&format!("{}/", renaming.rel))
+            } else {
+                active == renaming.rel
+            }
+        });
+        if affects_active && self.switch_refused(cx) {
+            return;
+        }
+        match self.workspace.rename(&renaming.rel, &name) {
+            Ok(new_abs) => {
+                let new_rel = workspace::rel_key(self.workspace.root(), &new_abs)
+                    .unwrap_or_else(|| new_abs.display().to_string());
+                if renaming.is_folder {
+                    store_rebind(&renaming.rel, &new_rel, true);
+                    // Folder rows below the old path keep their expansion.
+                    let marker = format!("{}/", renaming.rel);
+                    self.explorer_expanded = self
+                        .explorer_expanded
+                        .iter()
+                        .map(|k| {
+                            if k == &renaming.rel {
+                                new_rel.clone()
+                            } else if k.starts_with(&marker) {
+                                format!("{new_rel}{}", &k[renaming.rel.len()..])
+                            } else {
+                                k.clone()
+                            }
+                        })
+                        .collect();
+                } else {
+                    store_rebind(&renaming.rel, &new_rel, false);
+                    // An expanded session level follows the renamed board.
+                    if self.explorer_expanded.remove(&renaming.rel) {
+                        self.explorer_expanded.insert(new_rel.clone());
+                    }
+                }
+                if affects_active {
+                    let new_active = if renaming.is_folder && active_rel.as_deref() != Some(renaming.rel.as_str())
+                    {
+                        format!(
+                            "{new_rel}{}",
+                            &active_rel.unwrap()[renaming.rel.len()..]
+                        )
+                    } else {
+                        new_rel.clone()
+                    };
+                    self.file_path = Some(self.workspace.root().join(&new_active));
+                    self.workspace.set_last_board(Some(&new_active));
+                    if let Some(panel) = &self.ai_panel {
+                        panel.update(cx, |panel, cx| {
+                            panel.set_active_board(Some(new_active.clone()), cx)
+                        });
+                    }
+                }
+                self.rescan_explorer();
+                self.set_notice(format!("已重命名为 {name}"), cx);
+            }
+            Err(e) => {
+                self.rescan_explorer();
+                self.set_notice(format!("重命名失败: {e}"), cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// The left explorer panel: header (title + create buttons), the
+    /// workspace tree, and a footer naming the workspace root.
+    fn render_explorer(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let active_key = self.active_board_key();
+        let mut tree = div()
+            .id("explorer-tree")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .px_1()
+            .py_1();
+        for node in &self.explorer_nodes {
+            tree = tree.children(self.render_explorer_node(node, 0, &active_key, cx));
+        }
+
+        // Header: 新建白板 / 新建文件夹 in the workspace root.
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .px_3()
+            .h(px(42.0))
+            .border_b_1()
+            .border_color(rgb(0xe3e2df))
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("白板"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_1()
+                    .child(explorer_mini_button("explorer-new-board", "＋白板").on_click(
+                        cx.listener(|this, _, window, cx| {
+                            this.create_board_in(None, window, cx);
+                        }),
+                    ))
+                    .child(explorer_mini_button("explorer-new-folder", "＋文件夹").on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.create_folder_in(None, cx);
+                        }),
+                    )),
+            );
+
+        // Footer: where the workspace (and its .boundless data) lives.
+        let footer = div()
+            .px_3()
+            .py_2()
+            .border_t_1()
+            .border_color(rgb(0xe3e2df))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x999999))
+                    .child(div().truncate().child(format!("{}", self.workspace.root().display()))),
+            );
+
+        div()
+            .id("explorer")
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .left_0()
+            .w(px(Self::EXPLORER_W))
+            .bg(rgb(0xfbfaf9))
+            .border_r_1()
+            .border_color(rgb(0xe3e2df))
+            .cursor(CursorStyle::Arrow)
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(tree)
+            .child(footer)
+    }
+
+    /// One explorer row (folder or board) plus, for expanded folders, their
+    /// descendants — depth-tracked for indentation. Each row carries a ✎
+    /// button that swaps the label for an inline rename input (Enter or blur
+    /// commits).
+    fn render_explorer_node(
+        &self,
+        node: &workspace::Node,
+        depth: usize,
+        active_key: &Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        use crate::icons as ic;
+        let mut out = Vec::new();
+        let indent = px(6.0 + 14.0 * depth as f32);
+        let renaming_rel = self.renaming.as_ref().map(|r| r.rel.clone());
+        match node {
+            workspace::Node::Folder { name, rel, children } => {
+                let expanded = self.explorer_expanded.contains(rel);
+                let rel_toggle = rel.clone();
+                let rel_add = rel.clone();
+                let rel_hover = rel.clone();
+                // The "＋" adds a board inside this folder; it must not also
+                // toggle the folder, so its mouse-down stops propagation.
+                let add_btn = div()
+                    .id(SharedString::from(format!("explorer-add::{rel}")))
+                    .w_5()
+                    .h_5()
+                    .rounded_sm()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(rgb(0xaaaaaa))
+                    .hover(|s| s.bg(rgb(0xe3e2df)).text_color(rgb(0x555555)))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.create_board_in(Some(rel_add.clone()), window, cx);
+                    }))
+                    .child(Icon::new(IconName::Plus));
+                let rel_ren = rel.clone();
+                let rename_btn = div()
+                    .id(SharedString::from(format!("explorer-rename::{rel}")))
+                    .w_5()
+                    .h_5()
+                    .rounded_sm()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(rgb(0xaaaaaa))
+                    .hover(|s| s.bg(rgb(0xe3e2df)).text_color(rgb(0x555555)))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        let current = Path::new(&rel_ren)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        this.start_renaming(rel_ren.clone(), true, current, window, cx);
+                    }))
+                    .child(ic::pencil(icon_color(false)));
+                let renaming_this = renaming_rel.as_deref() == Some(rel.as_str());
+                let hovered_this =
+                    self.explorer_hover.as_deref() == Some(rel.as_str()) && !renaming_this;
+                let mut row = div()
+                    .id(SharedString::from(rel.clone()))
+                    .h_7()
+                    .pl(indent)
+                    .pr_1()
+                    .rounded_md()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .text_sm()
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        let next = if *hovered {
+                            Some(rel_hover.clone())
+                        } else if this.explorer_hover.as_deref() == Some(rel_hover.as_str()) {
+                            None
+                        } else {
+                            return;
+                        };
+                        this.explorer_hover = next;
+                        cx.notify();
+                    }));
+                if renaming_this {
+                    // Edit mode: the label becomes the inline input; the
+                    // row's own click/hover are suspended until commit.
+                    row = row
+                        .bg(rgb(0xffffff))
+                        .child(Icon::new(IconName::Folder).text_color(rgb(0x777777)))
+                        .child(
+                            div().flex_1().min_w_0().h_6().child(
+                                Input::new(&self.explorer_rename_input)
+                                    .appearance(false)
+                                    .small(),
+                            ),
+                        );
+                } else {
+                    row = row
+                        .cursor_pointer()
+                        .text_color(rgb(0x3b3b3b))
+                        .hover(|s| s.bg(rgb(0xefeeec)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let removed = this.explorer_expanded.remove(&rel_toggle);
+                            if !removed {
+                                this.explorer_expanded.insert(rel_toggle.clone());
+                            }
+                            cx.notify();
+                        }))
+                        .child(
+                            Icon::new(if expanded {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .text_color(rgb(0xaaaaaa)),
+                        )
+                        .child(Icon::new(IconName::Folder).text_color(rgb(0x777777)))
+                        .child(div().flex_1().truncate().child(name.clone()));
+                    // Row actions show only while the pointer is on the row,
+                    // keeping the resting tree quiet.
+                    if hovered_this {
+                        row = row.child(add_btn).child(rename_btn);
+                    }
+                }
+                out.push(row.into_any_element());
+                if expanded {
+                    for child in children {
+                        out.extend(self.render_explorer_node(child, depth + 1, active_key, cx));
+                    }
+                }
+            }
+            workspace::Node::Board { name, rel } => {
+                let is_active = active_key.as_deref() == Some(rel.as_str());
+                let rel_open = rel.clone();
+                let rel_ren = rel.clone();
+                let rel_hover = rel.clone();
+                let rel_expand = rel.clone();
+                let renaming_this = renaming_rel.as_deref() == Some(rel.as_str());
+                let hovered_this =
+                    self.explorer_hover.as_deref() == Some(rel.as_str()) && !renaming_this;
+                let sessions = self.explorer_board_sessions(rel, cx);
+                let has_sessions = !sessions.is_empty();
+                let sessions_expanded = has_sessions && self.explorer_expanded.contains(rel);
+                // The session level toggles from the chevron only; the rest of
+                // the row still opens the board.
+                let chevron = has_sessions.then(|| {
+                    let rel_toggle = rel_expand.clone();
+                    div()
+                        .id(SharedString::from(format!("explorer-sessions::{rel}")))
+                        .w_4()
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .flex_shrink_0()
+                        .cursor_pointer()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if !this.explorer_expanded.remove(&rel_toggle) {
+                                this.explorer_expanded.insert(rel_toggle.clone());
+                            }
+                            cx.notify();
+                        }))
+                        .child(
+                            Icon::new(if sessions_expanded {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .text_color(rgb(0xaaaaaa)),
+                        )
+                });
+                // ＋ starts a fresh conversation for this board; ✎ renames it.
+                let rel_new_session = rel.clone();
+                let new_session_btn = div()
+                    .id(SharedString::from(format!("explorer-new-session::{rel}")))
+                    .w_5()
+                    .h_5()
+                    .rounded_sm()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(rgb(0xaaaaaa))
+                    .hover(|s| s.bg(rgb(0xe3e2df)).text_color(rgb(0x555555)))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.new_session_for(rel_new_session.clone(), window, cx);
+                    }))
+                    .child(Icon::new(IconName::Plus));
+                let rename_btn = div()
+                    .id(SharedString::from(format!("explorer-rename::{rel}")))
+                    .w_5()
+                    .h_5()
+                    .rounded_sm()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(rgb(0xaaaaaa))
+                    .hover(|s| s.bg(rgb(0xe3e2df)).text_color(rgb(0x555555)))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        // Boards show/rename the stem only — the extension is
+                        // an implementation detail (appended on commit).
+                        let current = Path::new(&rel_ren)
+                            .file_stem()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        this.start_renaming(rel_ren.clone(), false, current, window, cx);
+                    }))
+                    .child(ic::pencil(icon_color(false)));
+                let current_session = self
+                    .ai_panel
+                    .as_ref()
+                    .map(|p| p.read(cx).active_session_id().to_string());
+                let mut row = div()
+                    .id(SharedString::from(rel.clone()))
+                    .h_7()
+                    .pl(indent)
+                    .pr_1()
+                    .rounded_md()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .text_sm()
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        let next = if *hovered {
+                            Some(rel_hover.clone())
+                        } else if this.explorer_hover.as_deref() == Some(rel_hover.as_str()) {
+                            None
+                        } else {
+                            return;
+                        };
+                        this.explorer_hover = next;
+                        cx.notify();
+                    }));
+                if renaming_this {
+                    row = row
+                        .bg(rgb(0xffffff))
+                        .child(
+                            Icon::new(IconName::File).text_color(if is_active {
+                                rgb(0x1a5fd7)
+                            } else {
+                                rgb(0x777777)
+                            }),
+                        )
+                        .child(
+                            div().flex_1().min_w_0().h_6().child(
+                                Input::new(&self.explorer_rename_input)
+                                    .appearance(false)
+                                    .small(),
+                            ),
+                        );
+                } else {
+                    row = row.cursor_pointer();
+                    if is_active {
+                        row = row.bg(rgb(0xdce8ff)).text_color(rgb(0x1a5fd7));
+                    } else {
+                        row = row
+                            .text_color(rgb(0x3b3b3b))
+                            .hover(|s| s.bg(rgb(0xefeeec)));
+                    }
+                    row = row
+                        .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                            // Like folders, a single click toggles the level;
+                            // double-click opens the board (a session row also
+                            // opens board + session in one hit). Boards with
+                            // no sessions open on a single click — there's
+                            // nothing to toggle.
+                            let double_click = match event {
+                                ClickEvent::Mouse(click) => click.up.click_count > 1,
+                                ClickEvent::Keyboard(_) => false,
+                            };
+                            if has_sessions && !double_click {
+                                if !this.explorer_expanded.remove(&rel_open) {
+                                    this.explorer_expanded.insert(rel_open.clone());
+                                }
+                                cx.notify();
+                            } else {
+                                let path = this.workspace.root().join(&rel_open);
+                                this.open_board(path, window, cx);
+                            }
+                        }));
+                    // Chevron gutter — boards without sessions get a blank
+                    // spacer so every icon column stays aligned.
+                    match chevron {
+                        Some(chevron) => row = row.child(chevron),
+                        None => row = row.child(div().w_4()),
+                    }
+                    row = row
+                        .child(
+                            Icon::new(IconName::File).text_color(if is_active {
+                                rgb(0x1a5fd7)
+                            } else {
+                                rgb(0x777777)
+                            }),
+                        )
+                        .child(div().flex_1().truncate().child(name.clone()));
+                    // Row actions show only while the pointer is on the row,
+                    // keeping the resting tree quiet.
+                    if hovered_this {
+                        row = row.child(new_session_btn).child(rename_btn);
+                    }
+                }
+                out.push(row.into_any_element());
+                // The session level under the board.
+                if sessions_expanded {
+                    for session in &sessions {
+                            let sid = session.id.clone();
+                            let preview = session.preview.clone();
+                            let rel_session = rel.clone();
+                            let is_current = is_active
+                                && current_session.as_deref() == Some(sid.as_str());
+                            out.push(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "explorer-session::{rel}::{sid}"
+                                    )))
+                                    .h_6()
+                                    // Aligned with the parent board's file
+                                    // icon column — the bot icon itself
+                                    // marks the level, no extra indent.
+                                    .pl(indent + px(20.0))
+                                    .pr_1()
+                                    .rounded_md()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1()
+                                    .text_xs()
+                                    .cursor_pointer()
+                                    .when(is_current, |d| d.text_color(rgb(0x1a5fd7)))
+                                    .when(!is_current, |d| {
+                                        d.text_color(rgb(0x666666))
+                                    })
+                                    .hover(|s| s.bg(rgb(0xefeeec)))
+                                    .on_click(cx.listener(
+                                        move |this, _, window, cx| {
+                                            this.open_session(
+                                                rel_session.clone(),
+                                                sid.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        },
+                                    ))
+                                    .child(
+                                        Icon::new(IconName::Bot).text_color(if is_current {
+                                            rgb(0x1a5fd7)
+                                        } else {
+                                            rgb(0x999999)
+                                        }),
+                                    )
+                                    .child(div().flex_1().truncate().child(preview))
+                                    // Count sits apart in a lighter shade so
+                                    // the preview text stays the anchor.
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_color(rgb(0xbbbbbb))
+                                            .child(format!("{}条", session.count)),
+                                    )
+                                    .into_any_element(),
+                            );
+                        }
+                }
+            }
+        }
+        out
     }
 
     // ------------------------------------------------------------------
@@ -2297,6 +3394,9 @@ impl BoardView {
         }
         let start = self.current_page_index().unwrap_or(0);
         self.presenting = Some(start);
+        // Presentation hides all chrome, settings included; drop the overlay
+        // so exiting the show doesn't resurrect it.
+        self.settings_open = false;
         self.last_present_fit = None;
         self.present_debut = true;
         self.last_seen_viewport = None;
@@ -2463,6 +3563,11 @@ impl BoardView {
         if self.presenting.is_some() {
             return;
         }
+        // The settings page covers the whole content area: clicks belong to
+        // its fields/buttons, never to the canvas beneath.
+        if self.settings_open {
+            return;
+        }
         // Windows: the in-app menu bar spans the top MENU_BAR_HEIGHT px. Clicks
         // there belong to the menu bar (labels / drag spacer / caption buttons),
         // not the canvas, so don't start a canvas action. The caption buttons
@@ -2482,6 +3587,10 @@ impl BoardView {
         // input field, selectable text, buttons). Returning before the focus
         // grab below keeps the panel's widgets focused and interactive.
         if self.over_ai_panel(event.position, window, cx) {
+            return;
+        }
+        // Same for the left explorer panel (workspace tree).
+        if self.over_explorer(event.position) {
             return;
         }
         self.focus_handle.focus(window);
@@ -2765,7 +3874,13 @@ impl BoardView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.settings_open {
+            return;
+        }
         if self.over_ai_panel(event.position, window, cx) {
+            return;
+        }
+        if self.over_explorer(event.position) {
             return;
         }
         let world = self.to_world(event.position);
@@ -2824,7 +3939,13 @@ impl BoardView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.settings_open {
+            return;
+        }
         if self.over_ai_panel(event.position, window, cx) {
+            return;
+        }
+        if self.over_explorer(event.position) {
             return;
         }
         self.drag = DragState::Panning {
@@ -2839,10 +3960,19 @@ impl BoardView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The settings page owns hover/cursor on the whole content area while
+        // it's open; the canvas must not react to moves beneath it.
+        if self.settings_open {
+            return;
+        }
         // Ignore moves over the AI panel — the panel owns hover/cursor/selection
         // there, and the canvas must not fight it (e.g. update the hover handle
         // or keep an in-progress drag updating while the pointer is over text).
         if self.over_ai_panel(event.position, window, cx) {
+            return;
+        }
+        // The explorer panel owns hover there too.
+        if self.over_explorer(event.position) {
             return;
         }
         // Track modifier state so render() can hint the pending gesture cursor
@@ -3234,10 +4364,20 @@ impl BoardView {
 
     fn on_left_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         let _ = window;
+        // A click/drag release on the settings page belongs to the page.
+        if self.settings_open {
+            return;
+        }
         // A drag that ends over the AI panel is abandoned (the release point
         // maps to an occluded canvas region). Reset the drag state so the
         // canvas doesn't stay stuck mid-draw, but don't commit anything.
         if self.over_ai_panel(event.position, window, cx) {
+            self.drag = DragState::Idle;
+            cx.notify();
+            return;
+        }
+        // Same for the left explorer panel.
+        if self.over_explorer(event.position) {
             self.drag = DragState::Idle;
             cx.notify();
             return;
@@ -3336,8 +4476,18 @@ impl BoardView {
     }
 
     fn on_middle_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_open {
+            return;
+        }
         if self.over_ai_panel(event.position, window, cx) {
             // Reset any in-progress pan so the canvas doesn't stay stuck.
+            if matches!(self.drag, DragState::Panning { .. }) {
+                self.drag = DragState::Idle;
+                cx.notify();
+            }
+            return;
+        }
+        if self.over_explorer(event.position) {
             if matches!(self.drag, DragState::Panning { .. }) {
                 self.drag = DragState::Idle;
                 cx.notify();
@@ -3361,9 +4511,18 @@ impl BoardView {
         if self.presenting.is_some() {
             return;
         }
+        // The settings page scrolls its own content; don't zoom/pan the canvas
+        // underneath while it's open.
+        if self.settings_open {
+            return;
+        }
         // Let the AI panel's messages area handle its own scroll; don't zoom/pan
         // the canvas when the wheel turns over the panel.
         if self.over_ai_panel(event.position, window, cx) {
+            return;
+        }
+        // Same for the left explorer tree (it scrolls its own content).
+        if self.over_explorer(event.position) {
             return;
         }
         let delta = event.delta.pixel_delta(px(20.0));
@@ -4608,7 +5767,7 @@ impl Render for BoardView {
             .cursor(cursor)
             .on_action(cx.listener(|this, _: &Undo, window, cx| this.undo(window, cx)))
             .on_action(cx.listener(|this, _: &Redo, window, cx| this.redo(window, cx)))
-            .on_action(cx.listener(|this, _: &SaveScene, _window, cx| this.save(false, cx)))
+            .on_action(cx.listener(|this, _: &SaveScene, _window, cx| this.save(cx)))
             .on_action(cx.listener(|this, _: &OpenScene, window, cx| this.open(window, cx)))
             .on_action(
                 cx.listener(|this, _: &DeleteSelection, _window, cx| this.delete_selection(cx)),
@@ -4681,6 +5840,12 @@ impl Render for BoardView {
                     this.exit_presenting(window, cx);
                 }),
             )
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                this.open_settings(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleExplorer, _window, cx| {
+                this.toggle_explorer(cx);
+            }))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_left_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_down))
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_down))
@@ -4736,7 +5901,15 @@ impl Render for BoardView {
                             .child(self.render_notice_bar())
                             .children(self.render_update_banner(cx))
                             .children(self.render_context_menu(cx))
+                            .when(self.explorer_open, |d| {
+                                d.child(self.render_explorer(cx))
+                            })
                             .children(self.ai_panel.clone())
+                            // Settings page paints above every other chrome
+                            // (AI panel included) — it's a full-area page.
+                            .when(self.settings_open, |d| {
+                                d.child(self.settings_page.clone())
+                            })
                     })
             )
             // Dropdown overlay rendered last so it paints above the canvas.
@@ -4942,46 +6115,32 @@ fn window_control_button(
         .child(Icon::new(icon))
 }
 
-/// The minimize / maximize-or-restore / close button group on the right of the
-/// menu bar. The maximize icon swaps to a restore glyph when the window is
-/// already maximized. Close quits (single-window app: closing the window quits
-/// the process, matching the "退出" menu item).
-fn window_controls(window: &Window) -> Div {
-    let max_icon = if window.is_maximized() {
-        IconName::WindowRestore
-    } else {
-        IconName::WindowMaximize
-    };
-    div()
+/// Group stored sessions by their bound board (workspace-relative path) for
+/// the explorer's session level. Unbound sessions (untitled boards) don't
+/// appear in the tree.
+fn group_sessions_by_board() -> HashMap<String, Vec<SessionMeta>> {
+    let mut sessions: HashMap<String, Vec<SessionMeta>> = HashMap::new();
+    for meta in list_sessions() {
+        if let Some(board) = meta.board.clone() {
+            sessions.entry(board).or_default().push(meta);
+        }
+    }
+    sessions
+}
+
+/// Small text button for the explorer header (＋白板 / ＋文件夹).
+fn explorer_mini_button(id: &'static str, label: &'static str) -> Stateful<Div> {    div()
+        .id(id)
+        .h_6()
+        .px_2()
+        .rounded_md()
         .flex()
-        .flex_row()
         .items_center()
-        .h_full()
-        .child(window_control_button(
-            "win-min",
-            IconName::WindowMinimize,
-            rgb(0xf1f0ee),
-            rgb(0x1e1e1e),
-            |_, window, _| window.minimize_window(),
-        ))
-        .child(window_control_button(
-            "win-max",
-            max_icon,
-            rgb(0xf1f0ee),
-            rgb(0x1e1e1e),
-            |_, window, _| crate::platform::toggle_maximize(window),
-        ))
-        // Soft red hover (light tint bg + red icon) instead of a harsh solid
-        // red square - still reads as the "close" button but is gentler, and
-        // matches the gray hovers of the other two in intensity. Palette
-        // follows GitHub's danger colors (#ffebe9 / #cf222e).
-        .child(window_control_button(
-            "win-close",
-            IconName::WindowClose,
-            rgb(0xffebe9),
-            rgb(0xcf222e),
-            |_, _, cx| cx.quit(),
-        ))
+        .text_xs()
+        .text_color(rgb(0x666666))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(0xefeeec)).text_color(rgb(0x1e1e1e)))
+        .child(label)
 }
 
 /// One row of the right-click context menu: an optional leading icon, a
@@ -5047,6 +6206,66 @@ fn context_menu_row(
 }
 
 impl BoardView {
+    /// The settings-gear / minimize-or-restore / close button group on the
+    /// right of the menu bar. The maximize icon swaps to a restore glyph when
+    /// the window is already maximized. Close quits (single-window app:
+    /// closing the window quits the process, matching the "退出" menu item).
+    fn window_controls(&self, window: &Window, cx: &mut Context<Self>) -> Div {
+        let max_icon = if window.is_maximized() {
+            IconName::WindowRestore
+        } else {
+            IconName::WindowMaximize
+        };
+        // Settings gear, left of the minimize caption button: opens the
+        // full-area settings page. Same size and neutral hover as the caption
+        // buttons (no close-red); stops mouse-down propagation like they do so
+        // the click never reaches the canvas.
+        let gear = div()
+            .id("win-settings")
+            .w(px(WIN_BTN_W))
+            .h_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_color(rgb(0x1e1e1e))
+            .hover(|s| s.bg(rgb(0xf1f0ee)))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx)))
+            .child(Icon::new(IconName::Settings));
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .h_full()
+            .child(gear)
+            .child(window_control_button(
+                "win-min",
+                IconName::WindowMinimize,
+                rgb(0xf1f0ee),
+                rgb(0x1e1e1e),
+                |_, window, _| window.minimize_window(),
+            ))
+            .child(window_control_button(
+                "win-max",
+                max_icon,
+                rgb(0xf1f0ee),
+                rgb(0x1e1e1e),
+                |_, window, _| crate::platform::toggle_maximize(window),
+            ))
+            // Soft red hover (light tint bg + red icon) instead of a harsh
+            // solid red square - still reads as the "close" button but is
+            // gentler, and matches the gray hovers of the other two in
+            // intensity. Palette follows GitHub's danger colors
+            // (#ffebe9 / #cf222e).
+            .child(window_control_button(
+                "win-close",
+                IconName::WindowClose,
+                rgb(0xffebe9),
+                rgb(0xcf222e),
+                |_, _, cx| cx.quit(),
+            ))
+    }
+
     fn apply_style_to_selection(
         &mut self,
         apply: impl Fn(&mut ElementStyle) + Copy,
@@ -5250,7 +6469,9 @@ impl BoardView {
         let weak_save = weak.clone();
         let weak_open = weak.clone();
         let weak_ai = weak.clone();
+        let weak_explorer = weak.clone();
         let ai_active = self.ai_panel.is_some();
+        let explorer_active = self.explorer_open;
         bar = bar
             .child(div().w(px(1.0)).h_5().bg(rgb(0xe3e2df)).mx_1())
             .child(
@@ -5271,7 +6492,7 @@ impl BoardView {
             .child(
                 bar_icon_button("保存", false, ic::save(icon_color(false))).on_click(
                     move |_, _, cx| {
-                        weak_save.update(cx, |this, cx| this.save(false, cx)).ok();
+                        weak_save.update(cx, |this, cx| this.save(cx)).ok();
                     },
                 ),
             )
@@ -5283,6 +6504,18 @@ impl BoardView {
                 ),
             )
             .child(div().w(px(1.0)).h_5().bg(rgb(0xe3e2df)).mx_1())
+            .child(
+                bar_icon_button(
+                    "白板",
+                    explorer_active,
+                    ic::explorer(icon_color(explorer_active)),
+                )
+                .on_click(move |_, _, cx| {
+                    weak_explorer
+                        .update(cx, |this, cx| this.toggle_explorer(cx))
+                        .ok();
+                }),
+            )
             .child(
                 bar_icon_button("AI", ai_active, ic::ai(icon_color(ai_active))).on_click(
                     move |_, window, cx| {
@@ -5296,7 +6529,8 @@ impl BoardView {
         // Center the toolbar over the *canvas* area. When the AI panel (which
         // docks to the right) is open, exclude its current width from the
         // centering region so the toolbar stays visually centered in the
-        // remaining drawable space instead of drifting toward the panel.
+        // remaining drawable space instead of drifting toward the panel. The
+        // left explorer panel shifts the canvas the same way on the left.
         let panel_width = self.ai_panel_width(cx);
         let panel_open = self.ai_panel.is_some();
 
@@ -5304,6 +6538,7 @@ impl BoardView {
             .absolute()
             .top_3()
             .left_0()
+            .when(self.explorer_open, |d| d.left(px(Self::EXPLORER_W)))
             .when(panel_open, |d| d.right(px(panel_width)))
             .when(!panel_open, |d| d.right_0())
             .flex()
@@ -5721,6 +6956,10 @@ impl BoardView {
         let wrapper = div()
             .absolute()
             .left_3()
+            // Keep the style bar clear of the left explorer panel.
+            .when(self.explorer_open, |d| {
+                d.left(px(Self::EXPLORER_W + 12.0))
+            })
             .top_24()
             .flex()
             .when(show, |d| d.child(bar));
@@ -6023,8 +7262,9 @@ impl BoardView {
                     cx.stop_propagation();
                 }),
         );
-        // Caption buttons on the right; the OS handles their clicks.
-        bar = bar.child(window_controls(window));
+        // Caption buttons on the right; the OS handles their clicks. The gear
+        // button (left of minimize) opens the settings page.
+        bar = bar.child(self.window_controls(window, cx));
         bar
     }
 
@@ -6068,6 +7308,22 @@ impl BoardView {
                 // 文件
                 let w = weak.clone();
                 card = card.child(context_menu_row(
+                    "m-new-board",
+                    Some(IconName::File),
+                    "新建白板".into(),
+                    None,
+                    true,
+                    move |_, window, cx| {
+                        w.update(cx, |this, cx| {
+                            this.new_board(window, cx);
+                            this.menubar_open = None;
+                            cx.notify();
+                        })
+                        .ok();
+                    },
+                ));
+                let w = weak.clone();
+                card = card.child(context_menu_row(
                     "m-open",
                     Some(IconName::FolderOpen),
                     "打开场景…".into(),
@@ -6091,7 +7347,7 @@ impl BoardView {
                     true,
                     move |_, _, cx| {
                         w.update(cx, |this, cx| {
-                            this.save(false, cx);
+                            this.save(cx);
                             this.menubar_open = None;
                             cx.notify();
                         })
@@ -6371,6 +7627,10 @@ impl BoardView {
             .absolute()
             .bottom_3()
             .left_3()
+            // Keep the page bar clear of the left explorer panel.
+            .when(self.explorer_open, |d| {
+                d.left(px(Self::EXPLORER_W + 12.0))
+            })
             .child(bar_button("‹", false).on_click(move |_, _, cx| {
                 weak_prev.update(cx, |this, cx| this.goto_prev_page(cx)).ok();
             }))
