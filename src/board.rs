@@ -1858,7 +1858,9 @@ impl BoardView {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.ai_panel.is_none() {
+        // While presenting the panel is hidden — clicks in that strip belong
+        // to the canvas (flip/exit), not to an invisible panel.
+        if self.ai_panel.is_none() || self.presenting.is_some() {
             return false;
         }
         let panel_w = self.ai_panel_width(cx);
@@ -1945,9 +1947,12 @@ impl BoardView {
     /// when the panel is open the drawable region excludes the panel width.
     /// Zoom reset / fit / button-zoom should anchor on *this* rect (not the
     /// full window) so they behave relative to what the user can actually see.
+    /// While presenting the panel is not rendered, so the full canvas counts —
+    /// subtracting the hidden panel's width centered every page fit in a
+    /// one-panel-too-narrow region and the slide sat half a panel off-center.
     fn viewport_bounds(&self, cx: &mut Context<Self>) -> Bounds<Pixels> {
         let mut b = self.canvas_bounds;
-        if self.ai_panel.is_some() {
+        if self.ai_panel.is_some() && self.presenting.is_none() {
             let panel_w = self.ai_panel_width(cx);
             b.size.width = (b.size.width - px(panel_w)).max(px(1.0));
         }
