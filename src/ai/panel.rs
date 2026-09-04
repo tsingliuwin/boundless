@@ -21,9 +21,7 @@ use crate::board::BoardView;
 use super::agent::{AgentEvent, AgentRequest, BoundlessAgent};
 use super::client::ChatMessage;
 use super::settings::{AiSettings, ReasoningLevel};
-use super::store::{
-    self, create_session, delete_session, list_sessions, load_messages, SessionMeta,
-};
+use super::store::{self, create_session, list_sessions, load_messages};
 use super::tools::ElementSnapshot;
 
 // ---------------------------------------------------------------------
@@ -56,13 +54,9 @@ pub struct AiPanel {
     /// survives close/reopen.
     compact: bool,
     /// Workspace-relative path of the board the conversations belong to.
-    /// None = untitled board (sessions stay unbound). Session list and
-    /// history are filtered to this board.
+    /// None = untitled board (sessions stay unbound). Conversation resume
+    /// picks the board's newest session.
     active_board: Option<String>,
-    /// Whether the session-list section is shown.
-    show_sessions: bool,
-    /// All known sessions (newest first), for the list UI.
-    sessions: Vec<SessionMeta>,
     /// The currently active session's id.
     session_id: String,
     messages: Vec<ChatMessage>,
@@ -183,8 +177,6 @@ impl AiPanel {
             settings,
             compact,
             active_board,
-            show_sessions: false,
-            sessions,
             session_id,
             messages,
             streaming: None,
@@ -264,16 +256,6 @@ impl AiPanel {
             .ok();
     }
 
-    /// Refresh the cached session list from disk (preview/mtime may change as
-    /// messages are appended). Only sessions bound to the active board (or,
-    /// on an untitled board, unbound ones) are shown.
-    fn refresh_sessions(&mut self) {
-        self.sessions = list_sessions()
-            .into_iter()
-            .filter(|s| s.board == self.active_board)
-            .collect();
-    }
-
     /// True while an agent run is in flight. Board switches are refused during
     /// this window so the in-progress reply can't land in the wrong session.
     pub fn is_streaming(&self) -> bool {
@@ -341,7 +323,6 @@ impl AiPanel {
                 self.messages = Vec::new();
             }
         }
-        self.sessions = sessions;
         // Caller refuses to switch while streaming; this is belt-and-braces so
         // a leaked stream can't write into the new board's session.
         if let Some(s) = &self.streaming {
@@ -349,7 +330,6 @@ impl AiPanel {
         }
         self.streaming = None;
         self.error = None;
-        self.show_sessions = false;
         self.open_stream_steps.clear();
         self.open_done_steps.clear();
         self.active_skill.clear();
@@ -364,14 +344,13 @@ impl AiPanel {
         self.session_id = create_session();
         self.messages.clear();
         self.active_skill.clear();
-        self.show_sessions = false;
         cx.notify();
     }
 
-    /// Switch to an existing session, loading its messages.
+    /// Switch to an existing session, loading its messages. The explorer's
+    /// session level reaches this through [`Self::activate_session`].
     fn switch_session(&mut self, id: String, cx: &mut Context<Self>) {
         if id == self.session_id {
-            self.show_sessions = false;
             cx.notify();
             return;
         }
@@ -383,26 +362,11 @@ impl AiPanel {
             Ok(msgs) => {
                 self.session_id = id;
                 self.messages = msgs;
-                self.show_sessions = false;
             }
             Err(e) => {
                 self.notice = Some(format!("加载会话失败: {e}"));
             }
         }
-        cx.notify();
-    }
-
-    /// Delete a session. If it's the current one, start a fresh session.
-    fn remove_session(&mut self, id: String, cx: &mut Context<Self>) {
-        if let Err(e) = delete_session(&id) {
-            self.notice = Some(format!("删除会话失败: {e}"));
-            cx.notify();
-            return;
-        }
-        if id == self.session_id {
-            self.new_session(cx);
-        }
-        self.refresh_sessions();
         cx.notify();
     }
 
@@ -790,8 +754,6 @@ impl AiPanel {
             }
             // Steps of the finished turn are now persisted; drop live toggles.
             self.open_done_steps.clear();
-            // Refresh the list so this session's preview/mtime updates.
-            self.refresh_sessions();
             cx.notify();
         }
     }
@@ -848,33 +810,22 @@ impl Render for AiPanel {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child("AI 创作助手"),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap_1()
                     .child(
-                        // Collapse back to the compact bottom bar.
-                        panel_button("收起", false).on_click(cx.listener(
-                            |this, _, _, cx| this.set_compact(true, cx),
-                        )),
-                    )
-                    .child(
-                        panel_button("会话", self.show_sessions).on_click(cx.listener(
-                            |this, _, _, cx| {
-                                this.show_sessions = !this.show_sessions;
-                                if this.show_sessions {
-                                    this.refresh_sessions();
-                                }
-                                cx.notify();
-                            },
-                        )),
-                    )
-                    .child(
-                        panel_button("新建", false)
-                            .on_click(cx.listener(|this, _, _, cx| this.clear_chat(cx))),
-                    ),
-            );
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_1()
+                            .child(
+                                // Collapse back to the compact bottom bar.
+                                panel_button("收起", false).on_click(cx.listener(
+                                    |this, _, _, cx| this.set_compact(true, cx),
+                                )),
+                            )
+                            .child(
+                                panel_button("新建", false)
+                                    .on_click(cx.listener(|this, _, _, cx| this.clear_chat(cx))),
+                            ),
+                    );
 
         // Slim dismissible notice bar (session IO failures etc.), directly
         // under the header. Click to dismiss.
@@ -897,110 +848,6 @@ impl Render for AiPanel {
                 .child(text)
                 .into_any_element(),
             None => div().hidden().into_any_element(),
-        };
-
-        // ---- sessions section ----
-        // Shows the conversation history list with a "new session" button.
-        let sessions_section = if self.show_sessions {
-            let mut col = div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .px_3()
-                .py_2()
-                .border_b_1()
-                .border_color(rgb(0xeeeeec))
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .child(div().text_xs().text_color(rgb(0x777777)).child("会话历史"))
-                        .child(
-                            panel_button("＋ 新建", false)
-                                .on_click(cx.listener(|this, _, _, cx| this.new_session(cx))),
-                        ),
-                );
-            if self.sessions.is_empty() {
-                col = col.child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(0x999999))
-                        .child("还没有会话记录。"),
-                );
-            }
-            // Render each session row. Cap the list height so long histories
-            // scroll rather than pushing the input box off-screen.
-            let mut list = div()
-                .id("session-list")
-                .flex()
-                .flex_col()
-                .gap_1()
-                .max_h(px(320.0))
-                .overflow_y_scroll();
-            for (idx, s) in self.sessions.iter().enumerate() {
-                let is_current = s.id == self.session_id;
-                let preview = s.preview.clone();
-                let count = s.count;
-                let id_for_del = s.id.clone();
-                let id_for_switch = s.id.clone();
-                let row = div()
-                    .id(("session", idx))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .when(is_current, |d| {
-                        d.bg(rgb(0xdce8ff)).text_color(rgb(0x1a5fd7))
-                    })
-                    .when(!is_current, |d| d.hover(|s| s.bg(rgb(0xefeeec))))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            this.switch_session(id_for_switch.clone(), cx);
-                        }),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_xs()
-                            .child(div().truncate().child(preview))
-                            .child(
-                                div()
-                                    .text_color(rgb(if is_current { 0x1a5fd7 } else { 0x999999 }))
-                                    .child(format!("{count} 条")),
-                            ),
-                    )
-                    .child(
-                        // Delete button: stop propagation so clicking it doesn't
-                        // also switch into the (about-to-be-deleted) session.
-                        div()
-                            .id(("session-del", idx))
-                            .px_1()
-                            .text_xs()
-                            .text_color(rgb(0xc92a2a))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(0xfff0f0)).rounded_md())
-                            .child("删除")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.remove_session(id_for_del.clone(), cx);
-                                }),
-                            ),
-                    );
-                list = list.child(row);
-            }
-            col = col.child(list);
-            col
-        } else {
-            div().hidden()
         };
 
         // ---- messages ----
@@ -1256,7 +1103,6 @@ impl Render for AiPanel {
             .child(resize_handle)
             .child(header)
             .child(notice_bar)
-            .child(sessions_section)
             .child(messages_area)
             .child(error_bar)
             .child(input_area)
