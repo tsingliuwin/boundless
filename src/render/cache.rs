@@ -129,6 +129,7 @@ fn fingerprint_into(h: &mut Fnv, el: &Element) {
         crate::scene::FillStyle::Dense => 1,
         crate::scene::FillStyle::Solid => 2,
         crate::scene::FillStyle::Watercolor => 3,
+        crate::scene::FillStyle::Gradient => 4,
     });
     // 细粒度排线参数参与指纹：agent 调参必须触发重绘。
     h.write_u64(match s.brush {

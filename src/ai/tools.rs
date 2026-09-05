@@ -497,7 +497,7 @@ impl Tool for LineTool {
     ) -> impl std::future::Future<Output = ToolDefinition> + Send {
         let def = tool_def::<PointsArgs>(
             Self::NAME,
-            "在画布上画一条折线（无箭头），经过给定的若干点（世界坐标，至少两点）。",
+            "在画布上画一条折线或平滑曲线（无箭头），经过给定的若干点（世界坐标，至少两点）。smooth=true 时为波浪/河流/微笑等有机曲线的首选。",
         );
         async move { def }
     }
@@ -1004,6 +1004,10 @@ pub struct PolygonArgs {
     /// The last point connects back to the first. For mountains: 6~10 points
     /// with an irregular ridgeline reads best.
     pub points: Vec<OpPoint>,
+    /// Draw as a smooth curve through the points (waves, rivers, smiles)
+    /// instead of straight segments. Recommended for organic strokes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smooth: Option<bool>,
     /// Optional visual style. Ink-wash guidance: fill + fill_style="solid"
     /// with opacity 0.35~0.5 for 远山，0.6~0.7 for 近岸；fill_style="dense"
     /// 为近乎实心的密排填充；fill_style="watercolor" 为多层晕染 + 边缘
@@ -1073,7 +1077,7 @@ impl Tool for PolygonTool {
             }
             let op = CanvasOp::Polygon {
                 points: args.points,
-                smooth: false,
+                smooth: args.smooth.unwrap_or(false),
                 style: args.style,
             };
             run_canvas_op(&events, id, name, args_json, op, Some(new_element_id())).await

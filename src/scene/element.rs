@@ -175,6 +175,9 @@ pub enum FillStyle {
     /// Watercolor wash: several translucent hachure layers at different
     /// angles plus darkened edge pooling — soft, layered, hand-painted.
     Watercolor,
+    /// Vertical linear gradient: the fill color fades into a darkened
+    /// variant toward the bottom (sky panels, depth shading).
+    Gradient,
 }
 
 /// Stroke rendering style for freehand pen strokes: solid ink (default),

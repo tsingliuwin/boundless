@@ -6890,6 +6890,7 @@ impl BoardView {
                     ("密", crate::scene::FillStyle::Dense),
                     ("实", crate::scene::FillStyle::Solid),
                     ("彩", crate::scene::FillStyle::Watercolor),
+                    ("渐", crate::scene::FillStyle::Gradient),
                 ]
                 .into_iter()
                 .enumerate()
@@ -6912,7 +6913,16 @@ impl BoardView {
                             .when(!active, |d| d.border_color(rgb(0xcccccc)))
                             .on_click(move |_, _, cx| {
                                 weak.update(cx, |this, cx| {
-                                    this.apply_style_to_selection(|s| s.fill_style = fs, cx)
+                                    this.apply_style_to_selection(|s| {
+                                        s.fill_style = fs;
+                                        // 渐变需要底色才有内容可渐变：无填充色时
+                                        // 默认天蓝，保证点下去立刻有可见效果。
+                                        if fs == crate::scene::FillStyle::Gradient
+                                            && s.background.is_none()
+                                        {
+                                            s.background = Some(0xa5d8ff);
+                                        }
+                                    }, cx)
                                 })
                                 .ok();
                             }),

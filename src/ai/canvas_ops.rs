@@ -51,6 +51,7 @@ pub enum OpFillStyle {
     Dense,
     Solid,
     Watercolor,
+    Gradient,
 }
 
 /// Optional visual style. Every field is optional: when omitted the element
@@ -88,10 +89,15 @@ pub struct CanvasStyle {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub opacity: Option<f32>,
     /// Fill pattern for shape backgrounds: `hachure` (sketch lines, default),
-    /// `dense` (overlapping lines), `solid` (near-flat block), or
-    /// `watercolor` (layered wash with edge pooling). Omit = hachure.
+    /// `dense` (overlapping lines), `solid` (near-flat block), `watercolor`
+    /// (layered wash with edge pooling), or `gradient` (vertical fade into a
+    /// darkened shade — sky panels, depth). Omit = hachure.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fill_style: Option<OpFillStyle>,
+    /// Draw a line/arrow as a smooth curve through the points (waves,
+    /// rivers, smiles) instead of straight segments. Omit = straight.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smooth: Option<bool>,
     /// Fine-grained fill tuning (overrides the fill_style preset): fill line
     /// spacing in world units (2~6 reads best). Omit = preset value.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -567,6 +573,14 @@ impl CanvasStyle {
                 OpFillStyle::Dense => crate::scene::FillStyle::Dense,
                 OpFillStyle::Solid => crate::scene::FillStyle::Solid,
                 OpFillStyle::Watercolor => crate::scene::FillStyle::Watercolor,
+                OpFillStyle::Gradient => crate::scene::FillStyle::Gradient,
+            };
+        }
+        if let Some(smooth) = self.smooth {
+            out.line_type = if smooth {
+                crate::scene::LineType::Curved
+            } else {
+                crate::scene::LineType::Straight
             };
         }
         if let Some(v) = self.hachure_gap {
