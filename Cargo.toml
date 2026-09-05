@@ -1,6 +1,6 @@
 [package]
 name = "boundless"
-version = "0.2.9"
+version = "0.3.0"
 edition = "2021"
 description = "A boundless Excalidraw-style whiteboard built on GPUI, with a rig-powered AI agent that draws directly onto the canvas"
 
