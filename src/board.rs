@@ -249,6 +249,11 @@ pub struct BoardView {
     /// fits exactly to that page's rect, all floating chrome hides, and
     /// PageUp/PageDown/Escape flip or exit. None = normal editing view.
     presenting: Option<usize>,
+    /// Floating page controls over the running show: visible while the
+    /// pointer is active, hidden again after a short idle so the slide owns
+    /// the screen.
+    present_chrome_visible: bool,
+    present_last_move: Option<std::time::Instant>,
     /// Page index to bring the camera to on the next render frame. Set when
     /// the AI **switches pages**: an op landing on a different page than the
     /// AI's previous one moves the camera there (watching each slide being
@@ -389,6 +394,8 @@ impl BoardView {
             show_grid: false,
             canvas_background: None,
             presenting: None,
+            present_chrome_visible: false,
+            present_last_move: None,
             pending_page_focus: None,
             ai_focus_page: None,
             page_anim: None,
@@ -2831,21 +2838,29 @@ impl BoardView {
             tree = tree.children(self.render_explorer_node(node, 0, &active_key, cx));
         }
 
-        // Header: 新建白板 / 新建文件夹 in the workspace root.
+        // Header: 新建白板 / 新建文件夹 in the workspace root. Its content
+        // starts below whatever owns the top-left corner on this platform —
+        // the native traffic lights on macOS, the in-app menu bar on Windows.
+        let top_inset = if cfg!(target_os = "macos") {
+            28.0
+        } else {
+            MENU_BAR_HEIGHT
+        };
         let header = div()
             .flex()
             .flex_row()
             .items_center()
             .justify_between()
             .px_3()
-            .h(px(42.0))
+            .pt(px(top_inset))
+            .h(px(42.0 + top_inset))
             .border_b_1()
             .border_color(rgb(0xe3e2df))
             .child(
                 div()
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child("白板"),
+                    .child("无界白板"),
             )
             .child(
                 div()
@@ -3431,6 +3446,9 @@ impl BoardView {
         }
         let start = self.current_page_index().unwrap_or(0);
         self.presenting = Some(start);
+        // Chrome starts visible; the idle watcher below hides it.
+        self.present_chrome_visible = true;
+        self.present_last_move = Some(std::time::Instant::now());
         // Presentation hides all chrome, settings included; drop the overlay
         // so exiting the show doesn't resurrect it.
         self.settings_open = false;
@@ -3441,6 +3459,36 @@ impl BoardView {
         if !window.is_fullscreen() {
             window.toggle_fullscreen();
         }
+        // Auto-hide watcher: while presenting, fade the page controls out
+        // after a short pointer idle; any move re-shows them
+        // (bump_present_chrome). Exits the loop when the show ends.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(400))
+                    .await;
+                let keep = this.update(cx, |this, cx| {
+                    if this.presenting.is_none() {
+                        return false;
+                    }
+                    let idle = this
+                        .present_last_move
+                        .map_or(true, |t| t.elapsed() >= std::time::Duration::from_millis(2500));
+                    if idle && this.present_chrome_visible {
+                        this.present_chrome_visible = false;
+                        cx.notify();
+                    } else if !idle && !this.present_chrome_visible {
+                        this.present_chrome_visible = true;
+                        cx.notify();
+                    }
+                    true
+                });
+                if !matches!(keep, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
         // Lift the veil on a timer, NOT on a render frame: once the black
         // veil is up nothing else repaints, so a render-driven reveal waits
         // for a stray input (~2s felt delay). 300ms is enough for the
@@ -5898,6 +5946,13 @@ impl Render for BoardView {
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_left_up))
             .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_middle_up))
+            // While presenting, pointer movement drives the auto-hiding page
+            // controls (separate from on_mouse_move, which is view-only).
+            .when(presenting, |d| {
+                d.on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, _, cx| {
+                    this.bump_present_chrome(cx);
+                }))
+            })
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .on_key_down(cx.listener(Self::on_key_down))
@@ -5937,7 +5992,7 @@ impl Render for BoardView {
                             }
                             None => d,
                         };
-                        d.child(self.render_present_overlay())
+                        d.child(self.render_present_overlay(cx))
                     })
                     .when(!presenting, |d| {
                         d.child(self.render_toolbar(cx))
@@ -7679,6 +7734,7 @@ impl BoardView {
     /// Shown whenever the board is in editing mode (always, so a deck can be
     /// started before any page exists).
     fn render_page_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::icons as ic;
         let weak = cx.weak_entity();
         let (weak_prev, weak_next, weak_present, weak_del) =
             (weak.clone(), weak.clone(), weak.clone(), weak.clone());
@@ -7767,17 +7823,29 @@ impl BoardView {
                         weak_add.update(cx, |this, cx| this.add_page_manual(cx)).ok();
                     }),
                 )
-                .child(bar_button("删页", false).on_click(move |_, _, cx| {
-                    weak_del.update(cx, |this, cx| this.delete_current_page(cx)).ok();
-                }))
+                .child(
+                    bar_icon_button(
+                        "page-del",
+                        false,
+                        ic::trash(icon_color(false)),
+                    )
+                    .on_click(move |_, _, cx| {
+                        weak_del.update(cx, |this, cx| this.delete_current_page(cx)).ok();
+                    }),
+                )
             })
     }
 
-    /// Full-screen presentation overlay: the current page number and the
-    /// flip/exit hints, painted as floating chrome over the canvas.
-    fn render_present_overlay(&self) -> impl IntoElement {
+    /// Full-screen presentation overlay: floating page controls in the same
+    /// icon family as the editing page bar — prev / counter / next / exit.
+    /// Hidden while the pointer idles (see `bump_present_chrome`) so the
+    /// slide owns the screen; any movement brings it back.
+    fn render_present_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let weak = cx.weak_entity();
+        let (weak_prev, weak_next, weak_exit) = (weak.clone(), weak.clone(), weak.clone());
         let total = self.scene.pages.len();
         let current = self.presenting.map(|i| i + 1).unwrap_or(1);
+        let ic_s = px(crate::icons::S);
         div()
             .absolute()
             .bottom_4()
@@ -7785,18 +7853,77 @@ impl BoardView {
             .right_0()
             .flex()
             .justify_center()
-            .child(
-                div()
-                    .px_3()
-                    .py_1()
-                    .rounded_md()
-                    .bg(gpui::black().opacity(0.55))
-                    .text_color(gpui::white())
-                    .text_sm()
-                    .child(format!(
-                        "{current}/{total}　·　PageUp/PageDown 翻页　·　Esc 退出"
-                    )),
-            )
+            .when(self.present_chrome_visible, |d| {
+                d.child(
+                    bar_container()
+                        .gap_1p5()
+                        .child(
+                            bar_icon_button(
+                                "present-prev",
+                                false,
+                                Icon::new(IconName::ChevronLeft)
+                                    .size(ic_s)
+                                    .text_color(icon_color(false)),
+                            )
+                            .on_click(move |_, _, cx| {
+                                weak_prev
+                                    .update(cx, |this, cx| this.goto_prev_page(cx))
+                                    .ok();
+                            }),
+                        )
+                        .child(
+                            div()
+                                .min_w_12()
+                                .text_center()
+                                .text_sm()
+                                .child(format!("{current}/{total}")),
+                        )
+                        .child(
+                            bar_icon_button(
+                                "present-next",
+                                false,
+                                Icon::new(IconName::ChevronRight)
+                                    .size(ic_s)
+                                    .text_color(icon_color(false)),
+                            )
+                            .on_click(move |_, _, cx| {
+                                weak_next
+                                    .update(cx, |this, cx| this.goto_next_page(cx))
+                                    .ok();
+                            }),
+                        )
+                        // A slim divider, then exit — the keyboard hint the
+                        // old text bar carried, as a button.
+                        .child(div().w(px(1.0)).h_5().bg(rgba(0xe3e2df99)))
+                        .child(
+                            bar_icon_button(
+                                "present-exit",
+                                false,
+                                Icon::new(IconName::Close)
+                                    .size(ic_s)
+                                    .text_color(icon_color(false)),
+                            )
+                            .on_click(move |_, window, cx| {
+                                weak_exit
+                                    .update(cx, |this, cx| this.exit_presenting(window, cx))
+                                    .ok();
+                            }),
+                        ),
+                )
+            })
+    }
+
+    /// Pointer moved while presenting: show the page controls and restart
+    /// the idle clock that hides them.
+    fn bump_present_chrome(&mut self, cx: &mut Context<Self>) {
+        if self.presenting.is_none() {
+            return;
+        }
+        self.present_last_move = Some(std::time::Instant::now());
+        if !self.present_chrome_visible {
+            self.present_chrome_visible = true;
+            cx.notify();
+        }
     }
 
     fn render_notice_bar(&self) -> impl IntoElement {        let mut text = String::new();
