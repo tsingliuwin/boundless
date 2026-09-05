@@ -24,6 +24,19 @@ pub struct ReadyPath {
 pub struct RoughOpSet {
     pub op_set_type: OpSetType,
     pub ops: kurbo::BezPath,
+    /// Per-opset paint override (world units). None = derive color/width
+    /// from the element style by op type (the classic single-style look).
+    /// Watercolor layers and edge pooling set this.
+    pub paint: Option<PaintOverride>,
+}
+
+/// Paint override for one op set. `color` replaces the type-derived color;
+/// `width` replaces the type-derived stroke width (world units, camera
+/// scaled at paint time). Both optional so an override can tweak one.
+#[derive(Debug, Clone, Copy)]
+pub struct PaintOverride {
+    pub color: Option<Hsla>,
+    pub width: Option<f64>,
 }
 
 /// Collect the op sets of a roughr drawable into cache-friendly form.
@@ -34,6 +47,7 @@ fn sets_of(drawable: &rough_piet::KurboDrawable<f64>) -> Vec<RoughOpSet> {
         .map(|s| RoughOpSet {
             op_set_type: s.op_set_type.clone(),
             ops: s.ops.clone(),
+            paint: None,
         })
         .collect()
 }
@@ -121,36 +135,153 @@ fn options_for(style: &ElementStyle, seed: u64, is_freedraw: bool) -> Options {
         options.fill = Some(srgba(bg, style.opacity));
         // gpui 0.2.2 在 Windows 上 PathBuilder::fill() 的产物不可见（最小
         // 复现工程 fill_repro 证实：同窗口 quad 正常、fill 路径消失）。因此
-        // 所有填充统一走已被证明可靠的排线（FillSketch→stroke）管线：
-        // - hachure：经典手绘排线，间距 = 线宽×4；
-        // - solid：密排线（间距 = 线宽），线宽 ≥ 间距 → 视觉实心色块，
-        //   且细纹理恰好契合粉笔/水墨质感。
-        options.fill_style = Some(match style.fill_style {
-            // 实心：排线重叠 3.5×（线宽 ≫ 间距）→ 基本看不见条纹，
-            // 是三者中最"实"的一档；保留极轻的手绘边缘感。
-            SceneFillStyle::Solid => {
-                let gap = (style.stroke_width * 0.5).max(0.6) as f32;
-                options.fill_weight = Some(gap * 3.5);
-                options.hachure_gap = Some(gap);
-                FillStyle::Hachure
-            }
-            // 近乎实心：间距压到线宽 0.4×，线宽再放大 2.6× —— 排线彼此
-            // 深度重叠，远看是一块色面，近看仍留着极细的手绘纹理。
-            SceneFillStyle::Dense => {
-                let gap = (style.stroke_width * 0.4).max(0.5) as f32;
-                options.fill_weight = Some(gap * 2.6);
-                options.hachure_gap = Some(gap);
-                FillStyle::Hachure
-            }
-            SceneFillStyle::Hachure => {
-                options.fill_weight = Some((style.stroke_width as f32 * 0.5).max(0.5));
-                options.hachure_gap = Some((style.stroke_width as f32 * 4.0).max(4.0));
-                FillStyle::Hachure
-            }
-        });
+        // 所有填充统一走已被证明可靠的排线（FillSketch→stroke）管线。
+        // 间距/线宽参数统一由 fill_params 决定；注意 fill_weight 必须在
+        // 绘制阶段以 PaintOverride.width 回传（见 paint_world_geom）——
+        // roughr 生成期不会把线宽烘焙进几何。
+        let (gap, weight) = fill_params(style);
+        options.fill_style = Some(FillStyle::Hachure);
+        options.fill_weight = Some(weight);
+        options.hachure_gap = Some(gap);
+        if let Some(angle) = style.hachure_angle {
+            options.set_hachure_angle(Some(angle as f32));
+        }
         options.disable_multi_stroke_fill = Some(true);
     }
     options
+}
+
+/// Fill hachure parameters per style: (spacing, stroke width) in world
+/// units. Density ordering: Hachure < Dense < Solid; Watercolor's base
+/// wash uses Dense-like coverage (its layer passes override these).
+fn fill_params(style: &ElementStyle) -> (f32, f32) {
+    let sw = style.stroke_width as f32;
+    let (gap, weight) = match style.fill_style {
+        SceneFillStyle::Hachure => ((sw * 4.0).max(4.0), (sw * 0.5).max(0.5)),
+        // 密：线宽 ≈ 0.7× 间距 —— 排线明显更密，但保留白色呼吸感
+        // （coverage ~0.7，介于纹 0.125 与实 3.5 之间）。
+        SceneFillStyle::Dense => {
+            let gap = (sw * 1.6).max(1.6);
+            (gap, gap * 0.7)
+        }
+        // 实：3.5× 深度重叠，近乎纯色。
+        SceneFillStyle::Solid => {
+            let gap = (sw * 0.5).max(0.6);
+            (gap, gap * 3.5)
+        }
+        SceneFillStyle::Watercolor => {
+            let gap = (sw * 1.1).max(1.2);
+            (gap, gap * 1.7)
+        }
+    };
+    // Agent 级细粒度参数逐项覆盖预设派生值（字段为 f64 世界单位）。
+    (
+        style.hachure_gap.map_or(gap, |v| v as f32),
+        style.fill_weight.map_or(weight, |v| v as f32),
+    )
+}
+
+/// Scale a Bézier path around `center` by `k`, then offset by (dx, dy) —
+/// the shadow tucks behind the shape and pokes out only on the offset side.
+fn shadow_transform(
+    bez: &kurbo::BezPath,
+    center: WPoint,
+    dx: f64,
+    dy: f64,
+    k: f64,
+) -> kurbo::BezPath {
+    bez.iter()
+        .map(|el| match el {
+            kurbo::PathEl::MoveTo(p) => kurbo::PathEl::MoveTo(kurbo::Point::new(
+                center.x + (p.x - center.x) * k + dx,
+                center.y + (p.y - center.y) * k + dy,
+            )),
+            kurbo::PathEl::LineTo(p) => kurbo::PathEl::LineTo(kurbo::Point::new(
+                center.x + (p.x - center.x) * k + dx,
+                center.y + (p.y - center.y) * k + dy,
+            )),
+            kurbo::PathEl::QuadTo(c, p) => kurbo::PathEl::QuadTo(
+                kurbo::Point::new(
+                    center.x + (c.x - center.x) * k + dx,
+                    center.y + (c.y - center.y) * k + dy,
+                ),
+                kurbo::Point::new(
+                    center.x + (p.x - center.x) * k + dx,
+                    center.y + (p.y - center.y) * k + dy,
+                ),
+            ),
+            kurbo::PathEl::CurveTo(c1, c2, p) => kurbo::PathEl::CurveTo(
+                kurbo::Point::new(
+                    center.x + (c1.x - center.x) * k + dx,
+                    center.y + (c1.y - center.y) * k + dy,
+                ),
+                kurbo::Point::new(
+                    center.x + (c2.x - center.x) * k + dx,
+                    center.y + (c2.y - center.y) * k + dy,
+                ),
+                kurbo::Point::new(
+                    center.x + (p.x - center.x) * k + dx,
+                    center.y + (p.y - center.y) * k + dy,
+                ),
+            ),
+            other => other.clone(),
+        })
+        .collect()
+}
+
+/// Translate every point of a Bézier path by (dx, dy).
+fn translate_bez(bez: &kurbo::BezPath, dx: f64, dy: f64) -> kurbo::BezPath {
+    bez.iter()
+        .map(|el| match el {
+            kurbo::PathEl::MoveTo(p) => {
+                kurbo::PathEl::MoveTo(kurbo::Point::new(p.x + dx, p.y + dy))
+            }
+            kurbo::PathEl::LineTo(p) => {
+                kurbo::PathEl::LineTo(kurbo::Point::new(p.x + dx, p.y + dy))
+            }
+            kurbo::PathEl::QuadTo(c, p) => kurbo::PathEl::QuadTo(
+                kurbo::Point::new(c.x + dx, c.y + dy),
+                kurbo::Point::new(p.x + dx, p.y + dy),
+            ),
+            kurbo::PathEl::CurveTo(c1, c2, p) => kurbo::PathEl::CurveTo(
+                kurbo::Point::new(c1.x + dx, c1.y + dy),
+                kurbo::Point::new(c2.x + dx, c2.y + dy),
+                kurbo::Point::new(p.x + dx, p.y + dy),
+            ),
+            other => other.clone(),
+        })
+        .collect()
+}
+
+/// Closed Catmull-Rom spline through `pts` as a cubic Bézier path — the
+/// smooth organic outline behind the AI's blob/curve shapes.
+fn closed_catmull_rom_bez(pts: &[WPoint]) -> kurbo::BezPath {
+    let n = pts.len();
+    let mut bez = kurbo::BezPath::new();
+    let at = |i: usize| {
+        let p = pts[i % n];
+        kurbo::Point::new(p.x, p.y)
+    };
+    bez.move_to(at(0));
+    for i in 0..n {
+        let p0 = at((i + n - 1) % n);
+        let p1 = at(i);
+        let p2 = at((i + 1) % n);
+        let p3 = at((i + 2) % n);
+        let c1 = kurbo::Point::new(p1.x + (p2.x - p0.x) / 6.0, p1.y + (p2.y - p0.y) / 6.0);
+        let c2 = kurbo::Point::new(p2.x - (p3.x - p1.x) / 6.0, p2.y - (p3.y - p1.y) / 6.0);
+        bez.curve_to(c1, c2, p2);
+    }
+    bez.close_path();
+    bez
+}
+
+/// Per-channel darkening of a 0xRRGGBB color (watercolor edge pooling).
+fn darken(rgb: u32, factor: f32) -> u32 {
+    let r = (((rgb >> 16) & 0xff) as f32 * factor).round() as u32;
+    let g = (((rgb >> 8) & 0xff) as f32 * factor).round() as u32;
+    let b = ((rgb & 0xff) as f32 * factor).round() as u32;
+    (r << 16) | (g << 8) | b
 }
 
 /// Append the segments of a kurbo BezPath (world coords) to a PathBuilder,
@@ -197,19 +328,142 @@ pub fn paths_for_element(
 fn rough_shape(
     style: &ElementStyle,
     seed: u64,
+    center: WPoint,
     draw: impl Fn(&KurboGenerator) -> rough_piet::KurboDrawable<f64>,
 ) -> WorldGeom {
-    let gen = KurboGenerator::new(options_for(style, seed, false));
+    let fill_on = style.background.is_some();
+    let watercolor = fill_on && style.fill_style == SceneFillStyle::Watercolor;
+    let sw = style.stroke_width as f32;
+
+    // Base pass: outline + the style's fill — except watercolor, whose fill
+    // comes entirely from the layered washes below (stroke-only here).
+    let base_opts = if watercolor {
+        let mut o = options_for(style, seed, false);
+        o.fill = None;
+        o
+    } else {
+        options_for(style, seed, false)
+    };
+    let gen = KurboGenerator::new(base_opts);
     let mut sets = sets_of(&draw(&gen));
-    if style.background.is_some() && style.fill_style == SceneFillStyle::Solid {
-        let mut cross = options_for(style, seed.wrapping_add(1), false);
-        cross.set_hachure_angle(Some(49.0));
-        let gen2 = KurboGenerator::new(cross);
-        sets.extend(
-            sets_of(&draw(&gen2))
-                .into_iter()
-                .filter(|s| s.op_set_type == OpSetType::FillSketch),
-        );
+
+    // Soft shadow: two stacked, offset copies of the shape shrunk slightly
+    // around its center (so the shading tucks behind the outline instead of
+    // spiking out) with jitter disabled — clean lines read as depth, jittery
+    // ones read as scribbles. Fake gaussian: no blur in this pipeline.
+    if let Some(sh) = &style.shadow {
+        for (mult, alpha) in [(0.5, 0.09), (1.0, 0.13)] {
+            let mut o = options_for(style, seed.wrapping_add(61), false);
+            o.fill = Some(srgba(0x1e1e1e, alpha));
+            o.stroke = None;
+            o.roughness = Some(0.0);
+            o.bowing = Some(0.0);
+            o.fill_weight = Some((sw * 0.8).max(0.7));
+            o.hachure_gap = Some((sw * 1.1).max(1.0));
+            let gen_sh = KurboGenerator::new(o);
+            let mut sh_sets = sets_of(&draw(&gen_sh));
+            let k = 1.0 - 0.06 * mult; // 6% shrink per stack step
+            for s in &mut sh_sets {
+                s.ops = shadow_transform(
+                    &s.ops,
+                    center,
+                    sh.dx * mult as f64,
+                    sh.dy * mult as f64,
+                    k,
+                );
+                s.paint = Some(PaintOverride {
+                    color: Some(color_u32(0x1e1e1e, alpha)),
+                    width: Some((sw * 0.8).max(0.7) as f64),
+                });
+            }
+            sets.splice(0..0, sh_sets);
+        }
+    }
+
+    if fill_on {
+        let (_, weight) = fill_params(style);
+        // Honor the generated fill stroke width at paint time — the paint
+        // stage otherwise falls back to a fixed 线宽×0.5 for every op set,
+        // which silently thinned the denser styles.
+        for set in &mut sets {
+            if set.op_set_type == OpSetType::FillSketch {
+                set.paint = Some(PaintOverride {
+                    color: None,
+                    width: Some(weight as f64),
+                });
+            }
+        }
+
+        match style.fill_style {
+            // 实心：交叉第二遍（垂直角度、错开 seed）盖住单遍排线的抖动
+            // 缝隙 —— 单遍手绘线无论多重都会局部露白。
+            SceneFillStyle::Solid => {
+                let mut cross = options_for(style, seed.wrapping_add(1), false);
+                cross.set_hachure_angle(Some(49.0));
+                let gen2 = KurboGenerator::new(cross);
+                sets.extend(
+                    sets_of(&draw(&gen2))
+                        .into_iter()
+                        .filter(|s| s.op_set_type == OpSetType::FillSketch),
+                );
+            }
+            // 水彩：三层不同角度/透明度的淡彩晕染，再加两道逐层加宽、
+            // 逐层变淡的边缘描边（颜色取填充色加深）—— 颜料在纸缘沉积。
+            SceneFillStyle::Watercolor => {
+                let bg = style.background.unwrap_or(0);
+                let op = style.opacity;
+                let base_gap = style
+                    .hachure_gap
+                    .map_or((sw * 1.1).max(1.2) as f64, |v| v);
+                let washes = [
+                    (-41.0, (base_gap * 1.2).max(1.4), 1.7, 0.60, 7u64),
+                    (49.0, (base_gap * 0.8).max(1.0), 1.5, 0.45, 14),
+                    (-8.0, (base_gap * 1.7).max(2.0), 1.2, 0.32, 21),
+                ];
+                for (angle, gap, wf, af, so) in washes {
+                    let gap = gap as f32;
+                    let mut o = options_for(style, seed.wrapping_add(so), false);
+                    o.fill = Some(srgba(bg, op * af));
+                    o.fill_weight = Some(gap * wf);
+                    o.hachure_gap = Some(gap);
+                    o.set_hachure_angle(Some(angle));
+                    let gen2 = KurboGenerator::new(o);
+                    sets.extend(
+                        sets_of(&draw(&gen2))
+                            .into_iter()
+                            .filter(|s| s.op_set_type == OpSetType::FillSketch)
+                            .map(|mut s| {
+                                s.paint = Some(PaintOverride {
+                                    color: Some(color_u32(bg, op * af)),
+                                    width: Some((gap * wf) as f64),
+                                });
+                                s
+                            }),
+                    );
+                }
+                let edges = [(1.8, 0.72, 0.30, 28u64), (2.6, 0.55, 0.16, 35)];
+                for (wf, df, af, so) in edges {
+                    let mut o = options_for(style, seed.wrapping_add(so), false);
+                    o.fill = None;
+                    o.stroke = Some(srgba(darken(bg, df), op * af));
+                    o.stroke_width = Some(sw * wf);
+                    let gen2 = KurboGenerator::new(o);
+                    sets.extend(
+                        sets_of(&draw(&gen2))
+                            .into_iter()
+                            .filter(|s| s.op_set_type == OpSetType::Path)
+                            .map(|mut s| {
+                                s.paint = Some(PaintOverride {
+                                    color: Some(color_u32(darken(bg, df), op * af)),
+                                    width: Some((sw * wf) as f64),
+                                });
+                                s
+                            }),
+                    );
+                }
+            }
+            _ => {}
+        }
     }
     WorldGeom::Rough(sets)
 }
@@ -222,7 +476,9 @@ pub fn world_geometry(el: &Element) -> WorldGeom {
             if b.w < 0.01 || b.h < 0.01 {
                 return WorldGeom::Empty;
             }
-            rough_shape(style, el.seed, |gen| gen.rectangle(b.x, b.y, b.w, b.h))
+            rough_shape(style, el.seed, b.center(), |gen| {
+                gen.rectangle(b.x, b.y, b.w, b.h)
+            })
         }
         ElementKind::Ellipse => {
             if b.w < 0.01 || b.h < 0.01 {
@@ -231,24 +487,38 @@ pub fn world_geometry(el: &Element) -> WorldGeom {
             // roughr's ellipse treats (x, y) as the CENTER and width/height as
             // diameters, but our bounds.x/y is the top-left corner. Translate.
             let center = b.center();
-            rough_shape(style, el.seed, |gen| gen.ellipse(center.x, center.y, b.w, b.h))
+            rough_shape(style, el.seed, center, |gen| {
+                gen.ellipse(center.x, center.y, b.w, b.h)
+            })
         }
         ElementKind::Diamond => {
             if b.w < 0.01 || b.h < 0.01 {
                 return WorldGeom::Empty;
             }
             let points: Vec<_> = diamond_polygon(b).iter().map(|p| to_euclid(*p)).collect();
-            rough_shape(style, el.seed, |gen| gen.polygon(&points))
+            rough_shape(style, el.seed, b.center(), |gen: &KurboGenerator| {
+                gen.polygon(&points)
+            })
         }
         // 封闭多边形（水墨山形/岸块等不规则形状）：roughr polygon，
         // 填充走 options_for 的统一管线（solid → 密排线 FillSketch）。
-        ElementKind::Polygon { .. } => {
+        // smooth = 平滑闭合样条（AI 的有机形态：花瓣/云朵/鹅卵石）。
+        ElementKind::Polygon { smooth, .. } => {
             let points = el.absolute_points();
             if points.len() < 3 {
                 return WorldGeom::Empty;
             }
             let pts: Vec<_> = points.iter().map(|p| to_euclid(*p)).collect();
-            rough_shape(style, el.seed, |gen| gen.polygon(&pts))
+            if *smooth {
+                let bez = closed_catmull_rom_bez(&points);
+                rough_shape(style, el.seed, b.center(), |gen| {
+                    gen.bez_path(bez.clone())
+                })
+            } else {
+                rough_shape(style, el.seed, b.center(), |gen: &KurboGenerator| {
+                gen.polygon(&pts)
+            })
+            }
         }
         // Variable-width ink stroke (from the crate::ink pipeline): fill the
         // ribbon outline instead of stroking a centerline. This arm must sit
@@ -404,17 +674,34 @@ pub fn paint_world_geom(
                         }
                     }
                     OpSetType::FillSketch => {
-                        let mut builder = PathBuilder::stroke(fill_weight_px);
+                        let mut width_px = fill_weight_px;
+                        let mut color = fill_color;
+                        if let Some(p) = &set.paint {
+                            if let Some(w) = p.width {
+                                width_px = camera.scale(w).max(px(0.5));
+                            }
+                            if let Some(c) = p.color {
+                                color = c;
+                            }
+                        }
+                        let mut builder = PathBuilder::stroke(width_px);
                         append_bez_path(&mut builder, &set.ops, camera, canvas_origin);
                         if let Ok(path) = builder.build() {
-                            out.push(ReadyPath {
-                                path,
-                                color: fill_color,
-                            });
+                            out.push(ReadyPath { path, color });
                         }
                     }
                     OpSetType::Path => {
-                        let mut builder = PathBuilder::stroke(stroke_width_px);
+                        let mut width_px = stroke_width_px;
+                        let mut color = stroke_color;
+                        if let Some(p) = &set.paint {
+                            if let Some(w) = p.width {
+                                width_px = camera.scale(w).max(px(0.5));
+                            }
+                            if let Some(c) = p.color {
+                                color = c;
+                            }
+                        }
+                        let mut builder = PathBuilder::stroke(width_px);
                         if dashed {
                             let dash = camera.scale(12.0);
                             let gap = camera.scale(8.0);
@@ -422,10 +709,7 @@ pub fn paint_world_geom(
                         }
                         append_bez_path(&mut builder, &set.ops, camera, canvas_origin);
                         if let Ok(path) = builder.build() {
-                            out.push(ReadyPath {
-                                path,
-                                color: stroke_color,
-                            });
+                            out.push(ReadyPath { path, color });
                         }
                     }
                 }
@@ -860,15 +1144,17 @@ mod solid_fill_tests {
             WorldGeom::Rough(sets) => {
                 // gpui 0.2.2 Windows 上 FillPath（PathBuilder::fill）不可见，
                 // 因此 Solid 统一走 FillSketch（密排线→视觉实心），见 options_for。
-                let kinds: Vec<_> = sets.iter().map(|s| s.op_set_type.clone()).collect();
-                assert!(
-                    kinds.contains(&OpSetType::FillSketch),
-                    "solid ellipse must emit a FillSketch op (dense hachure), got {kinds:?}"
-                );
-                for set in sets
+                // 近实心 = 基础密排 + 交叉第二遍，至少两道 FillSketch。
+                let fill_sets: Vec<_> = sets
                     .iter()
                     .filter(|s| s.op_set_type == OpSetType::FillSketch)
-                {
+                    .collect();
+                assert!(
+                    fill_sets.len() >= 2,
+                    "solid fill must emit base + cross hachure passes, got {}",
+                    fill_sets.len()
+                );
+                for set in &fill_sets {
                     assert!(!set.ops.elements().is_empty(), "FillSketch opset is EMPTY");
                 }
             }
@@ -877,10 +1163,9 @@ mod solid_fill_tests {
         let camera = Camera::default();
         let origin = gpui::point(px(0.0), px(0.0));
         let paths = paths_for_element(&el, &camera, origin);
-        assert_eq!(
-            paths.len(),
-            2,
-            "solid ellipse must paint fill + stroke, got {}",
+        assert!(
+            paths.len() >= 3,
+            "solid ellipse must paint base fill + cross fill + stroke, got {}",
             paths.len()
         );
     }

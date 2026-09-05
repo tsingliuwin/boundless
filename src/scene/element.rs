@@ -172,6 +172,17 @@ pub enum FillStyle {
     /// almost as a flat patch while keeping the hand-drawn texture.
     Dense,
     Solid,
+    /// Watercolor wash: several translucent hachure layers at different
+    /// angles plus darkened edge pooling — soft, layered, hand-painted.
+    Watercolor,
+}
+
+/// Soft hand-drawn shadow under a closed shape: a hachure-shaded copy of
+/// the outline, offset by (dx, dy) and painted translucent dark.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Shadow {
+    pub dx: f64,
+    pub dy: f64,
 }
 
 /// Visual style shared by all elements. Colors are 0xRRGGBB.
@@ -189,6 +200,19 @@ pub struct ElementStyle {
     /// Hachure sketch fill vs solid flat fill (shape backgrounds only).
     #[serde(default)]
     pub fill_style: FillStyle,
+    /// Soft offset shadow under closed shapes. None = no shadow.
+    #[serde(default)]
+    pub shadow: Option<Shadow>,
+    /// Fine-grained fill tuning (agent-level). When set, each overrides the
+    /// fill_style preset's derived value: fill line spacing (world units),
+    /// fill line stroke width (>= 2x the gap reads nearly solid), and line
+    /// angle in degrees (default -41). None = use the preset.
+    #[serde(default)]
+    pub hachure_gap: Option<f64>,
+    #[serde(default)]
+    pub fill_weight: Option<f64>,
+    #[serde(default)]
+    pub hachure_angle: Option<f64>,
 }
 
 impl Default for ElementStyle {
@@ -202,6 +226,10 @@ impl Default for ElementStyle {
             opacity: 1.0,
             line_type: LineType::Straight,
             fill_style: FillStyle::Hachure,
+            shadow: None,
+            hachure_gap: None,
+            fill_weight: None,
+            hachure_angle: None,
         }
     }
 }
@@ -258,6 +286,10 @@ pub enum ElementKind {
     /// stroke pipeline like the other closed shapes.
     Polygon {
         points: Vec<WPoint>,
+        /// Closed smooth spline (Catmull-Rom through the points) instead of
+        /// straight edges — the AI's organic/blob shape (petals, clouds).
+        #[serde(default)]
+        smooth: bool,
     },
     Text {
         text: String,
@@ -470,7 +502,9 @@ impl Element {
             ElementKind::Line { points }
             | ElementKind::Arrow { points, .. }
             | ElementKind::Freedraw { points, .. }
-            | ElementKind::Polygon { points } => points.iter().map(|p| origin + *p).collect(),
+            | ElementKind::Polygon { points, .. } => {
+                points.iter().map(|p| origin + *p).collect()
+            }
             _ => Vec::new(),
         }
     }
@@ -501,7 +535,7 @@ impl Element {
             ElementKind::Line { points }
             | ElementKind::Arrow { points, .. }
             | ElementKind::Freedraw { points, .. }
-            | ElementKind::Polygon { points } => {
+            | ElementKind::Polygon { points, .. } => {
                 for p in points.iter_mut() {
                     p.x *= sx.abs();
                     p.y *= sy.abs();
@@ -537,7 +571,7 @@ impl Element {
         if let ElementKind::Line { points }
         | ElementKind::Arrow { points, .. }
         | ElementKind::Freedraw { points, .. }
-        | ElementKind::Polygon { points } = &mut self.kind
+        | ElementKind::Polygon { points, .. } = &mut self.kind
         {
             for p in points.iter_mut() {
                 *p = old_origin + *p - new_origin;
@@ -556,7 +590,7 @@ impl Element {
             ElementKind::Line { points }
             | ElementKind::Arrow { points, .. }
             | ElementKind::Freedraw { points, .. }
-            | ElementKind::Polygon { points } => match points.get_mut(index) {
+            | ElementKind::Polygon { points, .. } => match points.get_mut(index) {
                 Some(pt) => *pt = p - origin,
                 None => return,
             },

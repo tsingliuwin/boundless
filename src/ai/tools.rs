@@ -936,7 +936,10 @@ pub struct PolygonArgs {
     pub points: Vec<OpPoint>,
     /// Optional visual style. Ink-wash guidance: fill + fill_style="solid"
     /// with opacity 0.35~0.5 for 远山，0.6~0.7 for 近岸；fill_style="dense"
-    /// 为近乎实心的密排填充（比 solid 纹理更细密）。
+    /// 为近乎实心的密排填充；fill_style="watercolor" 为多层晕染 + 边缘
+    /// 墨色堆积的水彩质感（大面积上色/主体的首选，最细腻）。
+    /// 细粒度微调（优先于预设）：hachure_gap（排线间距，2~6）、
+    /// fill_weight（排线线宽，>= 2×间距 近乎实心）、hachure_angle（角度）。
     #[serde(default, deserialize_with = "de_style")]
     pub style: CanvasStyle,
 }
@@ -998,6 +1001,89 @@ impl Tool for PolygonTool {
             }
             let op = CanvasOp::Polygon {
                 points: args.points,
+                smooth: false,
+                style: args.style,
+            };
+            run_canvas_op(&events, id, name, args_json, op, Some(new_element_id())).await
+        }
+    }
+}
+
+// --- Smooth Shape ----------------------------------------------------------
+
+/// Arguments for `draw_smooth_shape`.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct SmoothShapeArgs {
+    /// Control points (≥3) in world coordinates, in drawing order. The shape
+    /// is a closed smooth spline THROUGH these points — place them on the
+    /// outline's extremes (like pushing pins into the silhouette). 4~8
+    /// points read best: petals, clouds, pebbles, leaves, water ripples.
+    pub points: Vec<OpPoint>,
+    /// Optional visual style. Guidance: fill + fill_style="watercolor" for
+    /// the softest hand-painted look; hachure_gap/fill_weight fine-tune the
+    /// texture; shadow=true lifts the shape off the canvas.
+    #[serde(default, deserialize_with = "de_style")]
+    pub style: CanvasStyle,
+}
+
+pub struct SmoothShapeTool {
+    pub events: UnboundedSender<AgentEvent>,
+}
+
+impl Tool for SmoothShapeTool {
+    const NAME: &'static str = "draw_smooth_shape";
+    type Error = ToolError;
+    type Args = SmoothShapeArgs;
+    type Output = String;
+
+    fn definition(&self, _prompt: String) -> impl std::future::Future<Output = ToolDefinition> + Send {
+        let def = tool_def::<SmoothShapeArgs>(
+            Self::NAME,
+            "画一个平滑的封闭曲线形（有机形态的首选：花瓣、云朵、鹅卵石、树叶、水波）。3~8 个控制点勾出轮廓极值点，曲线自动平滑闭合，比 polygon 更柔和细腻。fill+fill_style=watercolor 搭配最佳，可加 shadow 增加立体感。",
+        );
+        async move { def }
+    }
+
+    fn call(
+        &self,
+        args: Self::Args,
+    ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
+        let events = self.events.clone();
+        let name = Self::NAME;
+        async move {
+            let id = next_tool_id(name);
+            let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
+            if args.points.len() < 3 {
+                return fail_tool(
+                    &events,
+                    id,
+                    name,
+                    args_json,
+                    ToolError::invalid_args("平滑曲线形至少需要三个控制点"),
+                )
+                .await;
+            }
+            if args
+                .points
+                .iter()
+                .any(|p| !p.x.is_finite() || !p.y.is_finite())
+            {
+                return fail_tool(
+                    &events,
+                    id,
+                    name,
+                    args_json,
+                    ToolError::invalid_args("坐标必须是有限数值"),
+                )
+                .await;
+            }
+            if let Err(msg) = args.style.validate() {
+                return fail_tool(&events, id, name, args_json, ToolError::invalid_args(msg))
+                    .await;
+            }
+            let op = CanvasOp::Polygon {
+                points: args.points,
+                smooth: true,
                 style: args.style,
             };
             run_canvas_op(&events, id, name, args_json, op, Some(new_element_id())).await
@@ -1473,6 +1559,9 @@ pub fn all_tools(
             events: events.clone(),
         }),
         Box::new(PolygonTool {
+            events: events.clone(),
+        }),
+        Box::new(SmoothShapeTool {
             events: events.clone(),
         }),
         Box::new(MindmapTool {

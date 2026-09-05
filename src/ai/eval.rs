@@ -311,7 +311,7 @@ pub fn apply(
                 text.as_deref(),
             )?;
         }
-        CanvasOp::Polygon { points, style } => {
+        CanvasOp::Polygon { points, smooth, style } => {
             if points.len() < 3 || points.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
                 c.ops_failed += 1;
                 return Err("多边形至少需要三个有限坐标点".to_string());

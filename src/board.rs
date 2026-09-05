@@ -1055,7 +1055,11 @@ impl BoardView {
                 }
                 Ok(format!("已添加椭圆 id={}", &added.to_string()[..8]))
             }
-            CanvasOp::Polygon { points, style } => {
+            CanvasOp::Polygon {
+                points,
+                smooth,
+                style,
+            } => {
                 if points.len() < 3 || points.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
                     return Err(CanvasOpError::invalid_args(
                         "多边形至少需要三个有限坐标点",
@@ -1065,14 +1069,19 @@ impl BoardView {
                     return Err(CanvasOpError::internal("内部错误：缺少元素 ID"));
                 };
                 self.history.record(&self.scene);
+                // 水墨多边形的历史默认是实心填充；op 显式指定 fill_style
+                // 时以 AI 的选择为准。
+                let op_fill_specified = style.fill_style.is_some();
                 let pts: Vec<WPoint> = points.iter().map(|p| WPoint::new(p.x, p.y)).collect();
                 let mut el = Element::from_absolute_points_with_id(
                     id,
-                    |points| ElementKind::Polygon { points },
+                    |points| ElementKind::Polygon { points, smooth },
                     pts,
                     styled(style),
                 );
-                el.style.fill_style = crate::scene::FillStyle::Solid;
+                if !op_fill_specified {
+                    el.style.fill_style = crate::scene::FillStyle::Solid;
+                }
                 let added = self.scene.add(el);
                 #[cfg(debug_assertions)]
                 if let Some(f) = self
@@ -6813,6 +6822,7 @@ impl BoardView {
                     ("纹", crate::scene::FillStyle::Hachure),
                     ("密", crate::scene::FillStyle::Dense),
                     ("实", crate::scene::FillStyle::Solid),
+                    ("彩", crate::scene::FillStyle::Watercolor),
                 ]
                 .into_iter()
                 .enumerate()

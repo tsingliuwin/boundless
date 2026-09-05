@@ -128,7 +128,18 @@ fn fingerprint_into(h: &mut Fnv, el: &Element) {
         crate::scene::FillStyle::Hachure => 0,
         crate::scene::FillStyle::Dense => 1,
         crate::scene::FillStyle::Solid => 2,
+        crate::scene::FillStyle::Watercolor => 3,
     });
+    // 细粒度排线参数参与指纹：agent 调参必须触发重绘。
+    for v in [s.hachure_gap, s.fill_weight, s.hachure_angle] {
+        match v {
+            Some(x) => {
+                h.write_bool(true);
+                h.write_f64(x);
+            }
+            None => h.write_bool(false),
+        }
+    }
     h.write_f64(f64::from(s.opacity));
     match &el.kind {
         ElementKind::Rectangle => h.write_u64(1),
@@ -155,8 +166,9 @@ fn fingerprint_into(h: &mut Fnv, el: &Element) {
                 h.write_f64(*w);
             }
         }
-        ElementKind::Polygon { points } => {
+        ElementKind::Polygon { points, smooth } => {
             h.write_u64(8);
+            h.write_bool(*smooth);
             hash_points(h, points);
         }
         ElementKind::Text {

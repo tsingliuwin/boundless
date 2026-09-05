@@ -50,6 +50,7 @@ pub enum OpFillStyle {
     Hachure,
     Dense,
     Solid,
+    Watercolor,
 }
 
 /// Optional visual style. Every field is optional: when omitted the element
@@ -86,10 +87,31 @@ pub struct CanvasStyle {
     /// Opacity 0.0 .. 1.0. Omit = fully opaque.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub opacity: Option<f32>,
-    /// Fill pattern for shape backgrounds: `hachure` (sketch lines, default)
-    /// or `solid` (flat chalk-paste block). Omit = hachure.
+    /// Fill pattern for shape backgrounds: `hachure` (sketch lines, default),
+    /// `dense` (overlapping lines), `solid` (near-flat block), or
+    /// `watercolor` (layered wash with edge pooling). Omit = hachure.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fill_style: Option<OpFillStyle>,
+    /// Fine-grained fill tuning (overrides the fill_style preset): fill line
+    /// spacing in world units (2~6 reads best). Omit = preset value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hachure_gap: Option<f64>,
+    /// Fill line stroke width in world units; >= 2x the gap reads nearly
+    /// solid. Omit = preset value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fill_weight: Option<f64>,
+    /// Fill line angle in degrees (default -41). Omit = preset value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hachure_angle: Option<f64>,
+    /// Draw a soft hand-drawn hachure shadow under the shape (offset from
+    /// the outline). `false` removes an existing shadow. Omit = keep.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow: Option<bool>,
+    /// Shadow offset from the shape outline, world units. Default 10/12.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow_dx: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow_dy: Option<f64>,
 }
 
 /// Horizontal alignment of a text element's content.
@@ -203,9 +225,13 @@ pub enum CanvasOp {
     Clear,
     /// Closed polygon through the given absolute points (≥3) — irregular
     /// shapes for the ink-wash style (mountains, land masses). The last
-    /// point connects back to the first.
+    /// point connects back to the first. With `smooth` the outline is a
+    /// closed Catmull-Rom spline through the points (organic blobs:
+    /// petals, clouds, pebbles) instead of straight edges.
     Polygon {
         points: Vec<OpPoint>,
+        #[serde(default)]
+        smooth: bool,
         #[serde(default, deserialize_with = "de_style")]
         style: CanvasStyle,
     },
@@ -533,7 +559,30 @@ impl CanvasStyle {
                 OpFillStyle::Hachure => crate::scene::FillStyle::Hachure,
                 OpFillStyle::Dense => crate::scene::FillStyle::Dense,
                 OpFillStyle::Solid => crate::scene::FillStyle::Solid,
+                OpFillStyle::Watercolor => crate::scene::FillStyle::Watercolor,
             };
+        }
+        if let Some(v) = self.hachure_gap {
+            out.hachure_gap = Some(v);
+        }
+        if let Some(v) = self.fill_weight {
+            out.fill_weight = Some(v);
+        }
+        if let Some(v) = self.hachure_angle {
+            out.hachure_angle = Some(v);
+        }
+        match self.shadow {
+            Some(on) => {
+                out.shadow = on.then_some(crate::scene::Shadow {
+                    dx: self.shadow_dx.unwrap_or(10.0),
+                    dy: self.shadow_dy.unwrap_or(12.0),
+                });
+            }
+            None => {
+                if let (Some(dx), Some(dy)) = (self.shadow_dx, self.shadow_dy) {
+                    out.shadow = Some(crate::scene::Shadow { dx, dy });
+                }
+            }
         }
         out
     }
