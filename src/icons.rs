@@ -502,3 +502,27 @@ pub fn explorer(c: Hsla) -> impl IntoElement {
         b.ln(14.0, 12.5);
     })
 }
+
+/// Trash can: lidded bin with two ribs — the delete-page glyph.
+pub fn trash(c: Hsla) -> impl IntoElement {
+    icon(c, |b| {
+        // Lid.
+        b.mv(4.0, 5.5);
+        b.ln(16.0, 5.5);
+        // Handle.
+        b.mv(7.5, 5.5);
+        b.ln(7.5, 3.0);
+        b.ln(12.5, 3.0);
+        b.ln(12.5, 5.5);
+        // Body.
+        b.mv(5.5, 5.5);
+        b.ln(5.5, 16.5);
+        b.ln(14.5, 16.5);
+        b.ln(14.5, 5.5);
+        // Ribs.
+        b.mv(8.5, 8.5);
+        b.ln(8.5, 13.5);
+        b.mv(11.5, 8.5);
+        b.ln(11.5, 13.5);
+    })
+}
