@@ -266,6 +266,14 @@ pub enum CanvasOp {
         #[serde(default, deserialize_with = "de_style")]
         style: CanvasStyle,
     },
+    /// Set the paper-grain material layered over the canvas: ink on textured
+    /// paper instead of vectors on glass. Pairs well with set_canvas_background.
+    SetTexture {
+        /// `grain` (水彩纸细纹) / `kraft` (牛皮纸纤维) / `chalkboard` (黑板
+        /// 粉尘) / `none` (移除材质，恢复纯面). Required.
+        #[serde(default)]
+        texture: Option<Option<crate::scene::PaperTexture>>,
+    },
     /// Set the canvas surface color (the "board"). `None` restores the
     /// default white board. First move for a blackboard poster.
     SetBackground {
@@ -483,6 +491,7 @@ impl CanvasOp {
             CanvasOp::DeleteElement { .. } => "删除",
             CanvasOp::Clear => "清空",
             CanvasOp::SetBackground { .. } => "底色",
+            CanvasOp::SetTexture { .. } => "纸纹",
             CanvasOp::Mindmap { .. } => "思维导图",
             CanvasOp::AddPage { .. } => "页面",
             CanvasOp::DeletePage { .. } => "删页",

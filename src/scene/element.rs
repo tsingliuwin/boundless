@@ -177,6 +177,17 @@ pub enum FillStyle {
     Watercolor,
 }
 
+/// Stroke rendering style for freehand pen strokes: solid ink (default),
+/// grainy pencil, or a dry 飞白 brush with broken strokes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Brush {
+    #[default]
+    Ink,
+    Pencil,
+    DryBrush,
+}
+
 /// Soft hand-drawn shadow under a closed shape: a hachure-shaded copy of
 /// the outline, offset by (dx, dy) and painted translucent dark.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -203,6 +214,9 @@ pub struct ElementStyle {
     /// Soft offset shadow under closed shapes. None = no shadow.
     #[serde(default)]
     pub shadow: Option<Shadow>,
+    /// Pen stroke style (freedraw strokes only). None = solid ink.
+    #[serde(default)]
+    pub brush: Option<Brush>,
     /// Fine-grained fill tuning (agent-level). When set, each overrides the
     /// fill_style preset's derived value: fill line spacing (world units),
     /// fill line stroke width (>= 2x the gap reads nearly solid), and line
@@ -227,6 +241,7 @@ impl Default for ElementStyle {
             line_type: LineType::Straight,
             fill_style: FillStyle::Hachure,
             shadow: None,
+            brush: None,
             hachure_gap: None,
             fill_weight: None,
             hachure_angle: None,

@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::sync::Arc;
 use std::path::{Path, PathBuf};
 
 use gpui::prelude::*;
@@ -16,8 +17,8 @@ use crate::render::rough::{color_u32, paths_for_element, ReadyPath};
 use crate::render::{dot_grid, handle_rects, measure_text, point_handle_rects, ShapedTextLine};
 use crate::scene::{
     pages::PageRatio,
-    Element, ElementId, ElementKind, ElementStyle, LineType, Scene, SceneFile, StrokeStyle,
-    TextAlign, WBounds, WPoint, DEFAULT_FONT_SIZE, LINE_HEIGHT,
+    Brush, Element, ElementId, ElementKind, ElementStyle, LineType, PaperTexture, Scene, SceneFile,
+    StrokeStyle, TextAlign, WBounds, WPoint, DEFAULT_FONT_SIZE, LINE_HEIGHT,
 };
 use crate::settings_page::SettingsPage;
 use crate::ai::store::{list_sessions, rebind_session_boards as store_rebind, SessionMeta};
@@ -254,6 +255,10 @@ pub struct BoardView {
     /// the screen.
     present_chrome_visible: bool,
     present_last_move: Option<std::time::Instant>,
+    /// Paper-grain material over the canvas (渲染为噪点贴图平铺).
+    canvas_texture: Option<PaperTexture>,
+    /// Precomputed 256×256 BGRA noise tiles, one per material.
+    paper_tiles: [Arc<RenderImage>; 3],
     /// Page index to bring the camera to on the next render frame. Set when
     /// the AI **switches pages**: an op landing on a different page than the
     /// AI's previous one moves the camera there (watching each slide being
@@ -396,6 +401,12 @@ impl BoardView {
             presenting: None,
             present_chrome_visible: false,
             present_last_move: None,
+            canvas_texture: None,
+            paper_tiles: [
+                paper_tile(PaperTexture::Grain),
+                paper_tile(PaperTexture::Kraft),
+                paper_tile(PaperTexture::Chalkboard),
+            ],
             pending_page_focus: None,
             ai_focus_page: None,
             page_anim: None,
@@ -1308,6 +1319,25 @@ impl BoardView {
                 }
                 self.pending_measure.push(added);
                 Ok(format!("已添加文本 id={}", &added.to_string()[..8]))
+            }
+            CanvasOp::SetTexture { texture } => {
+                let label = match texture {
+                    Some(Some(t)) => {
+                        self.set_canvas_texture(Some(t), cx);
+                        let name = match t {
+                            crate::scene::PaperTexture::Grain => "水彩纸",
+                            crate::scene::PaperTexture::Kraft => "牛皮纸",
+                            crate::scene::PaperTexture::Chalkboard => "黑板",
+                        };
+                        format!("画布材质：{name}")
+                    }
+                    Some(None) => {
+                        self.set_canvas_texture(None, cx);
+                        "画布材质已移除".to_string()
+                    }
+                    None => "未指定画布材质".to_string(),
+                };
+                Ok(label)
             }
             CanvasOp::SetBackground { color } => {
                 let label = match color {
@@ -2293,6 +2323,7 @@ impl BoardView {
         let file = SceneFile {
             show_grid: self.show_grid,
             background: self.canvas_background,
+            texture: self.canvas_texture,
             pages: self.scene.pages.clone(),
             ..file
         };
@@ -3300,6 +3331,42 @@ impl BoardView {
         self.canvas_background = color;
         self.mark_dirty();
         cx.notify();
+    }
+
+    /// Set the paper-grain material (None = plain surface).
+    pub fn set_canvas_texture(&mut self, texture: Option<PaperTexture>, cx: &mut Context<Self>) {
+        if self.canvas_texture == texture {
+            return;
+        }
+        self.canvas_texture = texture;
+        self.mark_dirty();
+        let label = match texture {
+            Some(PaperTexture::Grain) => "水彩纸",
+            Some(PaperTexture::Kraft) => "牛皮纸",
+            Some(PaperTexture::Chalkboard) => "黑板",
+            None => "无",
+        };
+        self.set_notice(format!("画布材质：{label}"), cx);
+    }
+
+    /// Cycle 无 → 水彩纸 → 牛皮纸 → 黑板 → 无 (zoom-bar button).
+    fn cycle_canvas_texture(&mut self, cx: &mut Context<Self>) {
+        let order = [
+            None,
+            Some(PaperTexture::Grain),
+            Some(PaperTexture::Kraft),
+            Some(PaperTexture::Chalkboard),
+        ];
+        let cur = self.canvas_texture;
+        let next = match self.canvas_texture {
+            None => order[1],
+            Some(t) => {
+                let i = order.iter().position(|o| *o == Some(t)).unwrap_or(0);
+                order[(i + 1) % order.len()]
+            }
+        };
+        let _ = cur;
+        self.set_canvas_texture(next, cx);
     }
 
     // ------------------------------------------------------------------
@@ -5778,9 +5845,37 @@ impl Render for BoardView {
             },
             {
                 let focus = focus.clone();
-                move |_bounds, paint: BoardPaint, window, cx| {
+                move |bounds, paint: BoardPaint, window, cx| {
                     if let Some(q) = paint.background {
                         window.paint_quad(q);
+                    }
+                    // 纸纹材质：纹理铺在底色之上、网格与内容之下 ——
+                    // 纸是画的一部分。
+                    let view = this.read(cx);
+                    if let Some(kind) = view.canvas_texture {
+                        let tile = &view.paper_tiles[match kind {
+                            PaperTexture::Grain => 0,
+                            PaperTexture::Kraft => 1,
+                            PaperTexture::Chalkboard => 2,
+                        }];
+                        let ts = px(256.0);
+                        let cols = ((bounds.size.width / ts).ceil()) as i32 + 1;
+                        let rows = ((bounds.size.height / ts).ceil()) as i32 + 1;
+                        for r in 0..rows {
+                            for c in 0..cols {
+                                let origin = point(
+                                    bounds.origin.x + px(c as f32 * 256.0),
+                                    bounds.origin.y + px(r as f32 * 256.0),
+                                );
+                                let _ = window.paint_image(
+                                    Bounds::new(origin, size(ts, ts)),
+                                    gpui::Corners::all(px(0.0)),
+                                    tile.clone(),
+                                    0,
+                                    false,
+                                );
+                            }
+                        }
                     }
                     for q in paint.grid {
                         window.paint_quad(q);
@@ -6853,6 +6948,50 @@ impl BoardView {
                 }
                 bar = bar.child(fs_row);
             }
+
+            // 笔刷（钢笔工具或选中笔迹时）：钢笔（实心墨迹）/ 铅笔
+            // （颗粒细线）/ 飞白（断续干笔）。画完一笔工具会自动回到
+            // 选择模式，所以"选中笔迹"也必须能看到笔刷行。
+            // 笔刷（常驻）：钢笔（实心墨迹）/ 铅笔（颗粒细线）/ 飞白
+            // （断续干笔）。作用于选中的笔迹；无选中时作为后续笔迹的
+            // 预设。常驻显示，避免各类状态下忽隐忽现。
+            {
+                let mut br_row = div().flex().flex_row().gap_1();
+                for (ix, (label, br)) in [
+                    ("钢笔", None),
+                    ("铅笔", Some(crate::scene::Brush::Pencil)),
+                    ("飞白", Some(crate::scene::Brush::DryBrush)),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let weak = weak.clone();
+                    let active = self.style.brush == br;
+                    br_row = br_row.child(
+                        div()
+                            .id(gpui::ElementId::named_usize("brush", ix))
+                            .px_1p5()
+                            .h_5()
+                            .rounded_sm()
+                            .border_1()
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_xs()
+                            .child(label)
+                            .when(active, |d| d.border_color(rgb(SELECTION_COLOR)).border_2())
+                            .when(!active, |d| d.border_color(rgb(0xcccccc)))
+                            .on_click(move |_, _, cx| {
+                                weak.update(cx, |this, cx| {
+                                    this.apply_style_to_selection(|s| s.brush = br, cx)
+                                })
+                                .ok();
+                            }),
+                    );
+                }
+                bar = bar.child(br_row);
+            }
         }
 
         // Text options: font size presets + font family + alignment, shown
@@ -7637,6 +7776,13 @@ impl BoardView {
         const INSET: f32 = 12.0;
         let panel_width = self.ai_panel_width(cx);
         let panel_open = self.ai_panel.is_some();
+        let weak_tex = weak.clone();
+        let tex_label = match self.canvas_texture {
+            Some(PaperTexture::Grain) => "水彩",
+            Some(PaperTexture::Kraft) => "牛皮",
+            Some(PaperTexture::Chalkboard) => "黑板",
+            _ => "无",
+        };
 
         div()
             .absolute()
@@ -7646,6 +7792,15 @@ impl BoardView {
             .flex()
             .child(
                 bar_container()
+                    .child(
+                        bar_button(tex_label, self.canvas_texture.is_some()).on_click(
+                            move |_, _, cx| {
+                                weak_tex
+                                    .update(cx, |this, cx| this.cycle_canvas_texture(cx))
+                                    .ok();
+                            },
+                        ),
+                    )
                     .child(bar_button("−", false).on_click(move |_, _, cx| {
                         weak_out.update(cx, |this, cx| this.zoom_by(0.8, cx)).ok();
                     }))
@@ -8085,4 +8240,67 @@ mod time_tests {
         // %-m / %-d: no leading zeros on month or day.
         assert!(!line.contains("年0"), "{line}");
     }
+}
+
+
+/// Procedural paper-grain tile: 256×256 BGRA speckle, one variant per
+/// material. Deterministic (xorshift) so the grain is stable across runs.
+fn paper_tile(kind: PaperTexture) -> std::sync::Arc<RenderImage> {
+    const N: usize = 256;
+    let mut seed: u32 = match kind {
+        PaperTexture::Grain => 0x1D3F,
+        PaperTexture::Kraft => 0x5E17,
+        PaperTexture::Chalkboard => 0x9E37,
+    };
+    let mut rand = move || -> u32 {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    let mut buf = vec![0u8; N * N * 4];
+    for i in 0..(N * N) {
+        let v = rand();
+        let (r, g, b, a): (u8, u8, u8, u8) = match kind {
+            // 水彩纸：极细的明暗颗粒
+            PaperTexture::Grain => {
+                let dark = v & 1 == 0;
+                let lum = if dark { 0x40 } else { 0xf2 };
+                (lum, lum, lum, ((v >> 8) % 13) as u8)
+            }
+            // 牛皮纸：暖色纤维，横向成行
+            PaperTexture::Kraft => {
+                let row = i / N;
+                let boost: f32 = if row % 3 == 0 { 2.0 } else { 1.0 };
+                let a = ((v >> 7) as f32 % 30.0 * boost) as u8;
+                (0x5a, 0x40, 0x22, a)
+            }
+            // 黑板：白色粉笔粉尘
+            PaperTexture::Chalkboard => {
+                let lum = 0xe6;
+                let a = if v % 11 == 0 { ((v >> 8) % 34) as u8 } else { 0 };
+                (lum, lum, lum, a)
+            }
+        };
+        let o = i * 4;
+        buf[o] = b;
+        buf[o + 1] = g;
+        buf[o + 2] = r;
+        buf[o + 3] = a;
+    }
+    let image = image::RgbaImage::from_raw(N as u32, N as u32, buf)
+        .expect("paper tile buffer size");
+    std::sync::Arc::new(RenderImage::new(vec![image::Frame::new(image)]))
+}
+
+
+fn pen_brush_visible(board: &BoardView) -> bool {
+    board.tool == ActiveTool::Pen
+        || board.temp_pen
+        || board.selection.iter().any(|id| {
+            board
+                .scene
+                .get(*id)
+                .is_some_and(|e| matches!(e.kind, ElementKind::Freedraw { .. }))
+        })
 }

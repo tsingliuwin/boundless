@@ -53,6 +53,8 @@ pub struct VirtualElement {
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct VirtualCanvas {
     pub background: Option<u32>,
+    /// Paper-grain material (mirror of the board setting for evaluation).
+    pub texture: Option<crate::scene::PaperTexture>,
     pub elements: Vec<VirtualElement>,
     /// Slide pages created via `AddPage` (scene/pages.rs rects).
     pub pages: Vec<crate::scene::pages::Page>,
@@ -211,6 +213,13 @@ pub fn apply(
                 Some(c) => format!("画布底色已设为 #{c:06x}"),
                 None => "画布底色已恢复白色".to_string(),
             };
+        }
+        CanvasOp::SetTexture { texture } => {
+            if let Some(Some(t)) = texture {
+                c.texture = Some(*t);
+            }
+            c.ops_applied += 1;
+            msg = "画布纸纹已更新".to_string();
         }
         CanvasOp::Clear => {
             c.elements.clear();

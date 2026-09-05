@@ -171,6 +171,19 @@ fn default_false() -> bool {
     false
 }
 
+/// Paper-grain material layered over the canvas: makes drawings read as
+/// ink on textured paper instead of vectors on glass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PaperTexture {
+    /// 水彩纸：fine dark+light speckle.
+    Grain,
+    /// 牛皮纸：warm fibrous grain.
+    Kraft,
+    /// 黑板：chalk-dust speckle (reads best on dark surfaces).
+    Chalkboard,
+}
+
 /// On-disk scene format (`.boundless`, JSON).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SceneFile {
@@ -192,6 +205,9 @@ pub struct SceneFile {
     /// serde-defaulted so pre-pages files load unchanged.
     #[serde(default)]
     pub pages: Vec<pages::Page>,
+    /// Paper-grain material over the canvas. None = plain surface.
+    #[serde(default)]
+    pub texture: Option<PaperTexture>,
 }
 
 impl SceneFile {
@@ -204,6 +220,7 @@ impl SceneFile {
             show_grid: false,
             background: None,
             pages: scene.pages.clone(),
+            texture: None,
         }
     }
 

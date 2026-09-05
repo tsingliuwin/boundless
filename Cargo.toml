@@ -8,6 +8,7 @@ description = "A boundless Excalidraw-style whiteboard built on GPUI, with a rig
 gpui = "0.2.2"
 ropey = "1"
 serde = { version = "1", features = ["derive"] }
+image = "0.25"
 serde_json = "1"
 rough_piet = "0.13"
 roughr = "0.12"

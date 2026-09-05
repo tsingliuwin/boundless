@@ -811,6 +811,73 @@ impl Tool for ClearCanvasTool {
     }
 }
 
+// --- Set Paper Texture -----------------------------------------------------
+
+/// Arguments for `set_paper_texture`.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct SetPaperTextureArgs {
+    /// `grain` (水彩纸细纹) / `kraft` (牛皮纸纤维) / `chalkboard` (黑板粉尘)
+    /// / `none` (移除材质). Required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub texture: Option<String>,
+}
+
+pub struct SetPaperTextureTool {
+    pub events: UnboundedSender<AgentEvent>,
+}
+
+impl Tool for SetPaperTextureTool {
+    const NAME: &'static str = "set_paper_texture";
+    type Error = ToolError;
+    type Args = SetPaperTextureArgs;
+    type Output = String;
+
+    fn definition(&self, _prompt: String) -> impl std::future::Future<Output = ToolDefinition> + Send {
+        let def = tool_def::<SetPaperTextureArgs>(
+            Self::NAME,
+            "给画布叠加纸纹材质（细腻质感的关键一步）：grain=水彩纸细纹、kraft=牛皮纸纤维、chalkboard=黑板粉尘、none=移除。与 set_canvas_background 搭配使用。",
+        );
+        async move { def }
+    }
+
+    fn call(
+        &self,
+        args: Self::Args,
+    ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
+        let events = self.events.clone();
+        let name = Self::NAME;
+        async move {
+            let id = next_tool_id(name);
+            let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
+            let texture = match args.texture.as_deref() {
+                Some("grain") => Some(Some(crate::scene::PaperTexture::Grain)),
+                Some("kraft") => Some(Some(crate::scene::PaperTexture::Kraft)),
+                Some("chalkboard") => Some(Some(crate::scene::PaperTexture::Chalkboard)),
+                Some("none") => Some(None),
+                _ => {
+                    return fail_tool(
+                        &events,
+                        id,
+                        name,
+                        args_json,
+                        ToolError::invalid_args("texture 需要 grain/kraft/chalkboard/none 之一"),
+                    )
+                    .await;
+                }
+            };
+            run_canvas_op(
+                &events,
+                id,
+                name,
+                args_json,
+                CanvasOp::SetTexture { texture },
+                None,
+            )
+            .await
+        }
+    }
+}
+
 // --- Set Canvas Background --------------------------------------------------
 
 /// Arguments for `set_canvas_background`.
@@ -1556,6 +1623,9 @@ pub fn all_tools(
             events: events.clone(),
         }),
         Box::new(SetBackgroundTool {
+            events: events.clone(),
+        }),
+        Box::new(SetPaperTextureTool {
             events: events.clone(),
         }),
         Box::new(PolygonTool {

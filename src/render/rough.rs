@@ -65,9 +65,17 @@ pub enum WorldGeom {
     /// lines, arrows.
     Rough(Vec<RoughOpSet>),
     /// Legacy freedraw: jittered sample polylines, one per rough pass.
-    Sampled(Vec<Vec<WPoint>>),
+    /// Also used by the pencil/dry-brush stroke styles (per-pass paint).
+    Sampled(Vec<SampledPass>),
     /// Ink freedraw: closed world-space outline polygon (ribbon or dot).
     Outline(Vec<WPoint>),
+}
+
+/// One stroke pass of a sampled (non-roughr) polyline.
+#[derive(Debug)]
+pub struct SampledPass {
+    pub points: Vec<WPoint>,
+    pub paint: Option<PaintOverride>,
 }
 
 /// Convert a 0xRRGGBB color + opacity into an Hsla.
@@ -590,7 +598,71 @@ pub fn world_geometry(el: &Element) -> WorldGeom {
                     };
                     passes.push(samples.iter().map(offset_fn).collect());
                 }
-                WorldGeom::Sampled(passes)
+                // 笔刷变体：铅笔 = 细颗粒多道半透明线；飞白 = 断续干笔。
+                let sampled: Vec<SampledPass> = match style.brush {
+                    Some(crate::scene::Brush::Pencil) => {
+                        let wf = (style.stroke_width as f64 * 0.3).max(0.5);
+                        let color = color_u32(style.stroke, style.opacity * 0.6);
+                        passes
+                            .into_iter()
+                            .map(|points| SampledPass {
+                                points,
+                                paint: Some(PaintOverride {
+                                    color: Some(color),
+                                    width: Some(wf),
+                                }),
+                            })
+                            .collect()
+                    }
+                    Some(crate::scene::Brush::DryBrush) => {
+                        let wf = (style.stroke_width as f64 * 0.5).max(0.6);
+                        let color = color_u32(style.stroke, style.opacity * 0.85);
+                        let mut runs: Vec<SampledPass> = Vec::new();
+                        for points in passes {
+                            // 一条细的连续底线 + 断续的主笔触（确定性断点）
+                            let under = SampledPass {
+                                points: points.clone(),
+                                paint: Some(PaintOverride {
+                                    color: Some(color_u32(style.stroke, style.opacity * 0.45)),
+                                    width: Some((style.stroke_width as f64 * 0.22).max(0.4)),
+                                }),
+                            };
+                            runs.push(under);
+                            let mut run: Vec<WPoint> = Vec::new();
+                            for (i, p) in points.iter().enumerate() {
+                                let keep = ((i + el.seed as usize) % 9) < 6 || i == 0;
+                                if keep {
+                                    run.push(*p);
+                                } else if run.len() > 1 {
+                                    runs.push(SampledPass {
+                                        points: std::mem::take(&mut run),
+                                        paint: Some(PaintOverride {
+                                            color: Some(color),
+                                            width: Some(wf),
+                                        }),
+                                    });
+                                } else {
+                                    run.clear();
+                                }
+                            }
+                            if run.len() > 1 {
+                                runs.push(SampledPass {
+                                    points: run,
+                                    paint: Some(PaintOverride {
+                                        color: Some(color),
+                                        width: Some(wf),
+                                    }),
+                                });
+                            }
+                        }
+                        runs
+                    }
+                    _ => passes
+                        .into_iter()
+                        .map(|points| SampledPass { points, paint: None })
+                        .collect(),
+                };
+                WorldGeom::Sampled(sampled)
             } else {
                 let gen = KurboGenerator::new(options_for(style, el.seed, false));
                 let euclid_points: Vec<_> = points.iter().map(|p| to_euclid(*p)).collect();
@@ -717,19 +789,26 @@ pub fn paint_world_geom(
         }
         WorldGeom::Sampled(passes) => {
             for pass in passes {
-                let Some(first) = pass.first() else {
+                let Some(first) = pass.points.first() else {
                     continue;
                 };
-                let mut builder = PathBuilder::stroke(stroke_width_px);
+                let mut width_px = stroke_width_px;
+                let mut color = stroke_color;
+                if let Some(p) = &pass.paint {
+                    if let Some(w) = p.width {
+                        width_px = camera.scale(w).max(px(0.5));
+                    }
+                    if let Some(c) = p.color {
+                        color = c;
+                    }
+                }
+                let mut builder = PathBuilder::stroke(width_px);
                 builder.move_to(camera.world_to_screen(*first, canvas_origin));
-                for p in pass.iter().skip(1) {
+                for p in pass.points.iter().skip(1) {
                     builder.line_to(camera.world_to_screen(*p, canvas_origin));
                 }
                 if let Ok(path) = builder.build() {
-                    out.push(ReadyPath {
-                        path,
-                        color: stroke_color,
-                    });
+                    out.push(ReadyPath { path, color });
                 }
             }
         }
