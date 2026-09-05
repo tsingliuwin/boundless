@@ -161,13 +161,16 @@ pub enum LineType {
 }
 
 /// How shape backgrounds are filled: hachure sketch lines (the classic
-/// Excalidraw look, default) or a solid flat block (chalk-paste panels on a
-/// blackboard poster).
+/// Excalidraw look, default), dense overlapping hachure (near-solid), or a
+/// solid flat block (chalk-paste panels on a blackboard poster).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FillStyle {
     #[default]
     Hachure,
+    /// Ultra-dense hachure: the strokes overlap so much the fill reads
+    /// almost as a flat patch while keeping the hand-drawn texture.
+    Dense,
     Solid,
 }
 

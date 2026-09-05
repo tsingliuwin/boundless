@@ -126,11 +126,19 @@ fn options_for(style: &ElementStyle, seed: u64, is_freedraw: bool) -> Options {
         // - solid：密排线（间距 = 线宽），线宽 ≥ 间距 → 视觉实心色块，
         //   且细纹理恰好契合粉笔/水墨质感。
         options.fill_style = Some(match style.fill_style {
-            // 线宽 ≥ 2× 间距：相邻排线重叠过半 → 视觉实心、无条纹
-            // （半透明叠色的重叠处会有轻微加深，恰似墨色堆积）。
+            // 实心：排线重叠 3.5×（线宽 ≫ 间距）→ 基本看不见条纹，
+            // 是三者中最"实"的一档；保留极轻的手绘边缘感。
             SceneFillStyle::Solid => {
-                let gap = (style.stroke_width * 0.75).max(0.6) as f32;
-                options.fill_weight = Some(gap * 2.2);
+                let gap = (style.stroke_width * 0.5).max(0.6) as f32;
+                options.fill_weight = Some(gap * 3.5);
+                options.hachure_gap = Some(gap);
+                FillStyle::Hachure
+            }
+            // 近乎实心：间距压到线宽 0.4×，线宽再放大 2.6× —— 排线彼此
+            // 深度重叠，远看是一块色面，近看仍留着极细的手绘纹理。
+            SceneFillStyle::Dense => {
+                let gap = (style.stroke_width * 0.4).max(0.5) as f32;
+                options.fill_weight = Some(gap * 2.6);
                 options.hachure_gap = Some(gap);
                 FillStyle::Hachure
             }
@@ -182,6 +190,30 @@ pub fn paths_for_element(
 /// Compute the world-space geometry of one element. Pure and deterministic —
 /// the cache key is the element fingerprint, so this runs only when the
 /// element (or its style/seed) actually changed.
+/// Build the rough geometry for a closed shape. When the style is the
+/// near-solid 实 fill, a second cross-hatch pass (perpendicular hachure
+/// angle) is merged in: single-pass hand-drawn hachure always has jittered
+/// white seams, and only a crossing pass covers them reliably.
+fn rough_shape(
+    style: &ElementStyle,
+    seed: u64,
+    draw: impl Fn(&KurboGenerator) -> rough_piet::KurboDrawable<f64>,
+) -> WorldGeom {
+    let gen = KurboGenerator::new(options_for(style, seed, false));
+    let mut sets = sets_of(&draw(&gen));
+    if style.background.is_some() && style.fill_style == SceneFillStyle::Solid {
+        let mut cross = options_for(style, seed.wrapping_add(1), false);
+        cross.set_hachure_angle(Some(49.0));
+        let gen2 = KurboGenerator::new(cross);
+        sets.extend(
+            sets_of(&draw(&gen2))
+                .into_iter()
+                .filter(|s| s.op_set_type == OpSetType::FillSketch),
+        );
+    }
+    WorldGeom::Rough(sets)
+}
+
 pub fn world_geometry(el: &Element) -> WorldGeom {
     let style = &el.style;
     let b = &el.bounds;
@@ -190,26 +222,23 @@ pub fn world_geometry(el: &Element) -> WorldGeom {
             if b.w < 0.01 || b.h < 0.01 {
                 return WorldGeom::Empty;
             }
-            let gen = KurboGenerator::new(options_for(style, el.seed, false));
-            WorldGeom::Rough(sets_of(&gen.rectangle(b.x, b.y, b.w, b.h)))
+            rough_shape(style, el.seed, |gen| gen.rectangle(b.x, b.y, b.w, b.h))
         }
         ElementKind::Ellipse => {
             if b.w < 0.01 || b.h < 0.01 {
                 return WorldGeom::Empty;
             }
-            let gen = KurboGenerator::new(options_for(style, el.seed, false));
             // roughr's ellipse treats (x, y) as the CENTER and width/height as
             // diameters, but our bounds.x/y is the top-left corner. Translate.
             let center = b.center();
-            WorldGeom::Rough(sets_of(&gen.ellipse(center.x, center.y, b.w, b.h)))
+            rough_shape(style, el.seed, |gen| gen.ellipse(center.x, center.y, b.w, b.h))
         }
         ElementKind::Diamond => {
             if b.w < 0.01 || b.h < 0.01 {
                 return WorldGeom::Empty;
             }
-            let gen = KurboGenerator::new(options_for(style, el.seed, false));
             let points: Vec<_> = diamond_polygon(b).iter().map(|p| to_euclid(*p)).collect();
-            WorldGeom::Rough(sets_of(&gen.polygon(&points)))
+            rough_shape(style, el.seed, |gen| gen.polygon(&points))
         }
         // 封闭多边形（水墨山形/岸块等不规则形状）：roughr polygon，
         // 填充走 options_for 的统一管线（solid → 密排线 FillSketch）。
@@ -218,9 +247,8 @@ pub fn world_geometry(el: &Element) -> WorldGeom {
             if points.len() < 3 {
                 return WorldGeom::Empty;
             }
-            let gen = KurboGenerator::new(options_for(style, el.seed, false));
             let pts: Vec<_> = points.iter().map(|p| to_euclid(*p)).collect();
-            WorldGeom::Rough(sets_of(&gen.polygon(&pts)))
+            rough_shape(style, el.seed, |gen| gen.polygon(&pts))
         }
         // Variable-width ink stroke (from the crate::ink pipeline): fill the
         // ribbon outline instead of stroking a centerline. This arm must sit

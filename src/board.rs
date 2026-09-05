@@ -6595,6 +6595,22 @@ impl BoardView {
             .child(bar)
     }
 
+    /// The fill style shared by every selected element, when the selection is
+    /// non-empty and uniform. None = mixed selection or nothing selected —
+    /// the style bar falls back to the board's last-used preset.
+    fn selection_fill_style(&self) -> Option<crate::scene::FillStyle> {
+        if self.selection.is_empty() {
+            return None;
+        }
+        let mut it = self.selection.iter().filter_map(|id| {
+            self.scene
+                .get(*id)
+                .map(|el| el.style.fill_style)
+        });
+        let first = it.next()?;
+        it.all(|fs| fs == first).then_some(first)
+    }
+
     fn render_style_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let weak = cx.weak_entity();
         let text_tool = self.tool == ActiveTool::Text;
@@ -6731,19 +6747,23 @@ impl BoardView {
             }
             bar = bar.child(row);
 
-            // 填充样式：排线（hachure 手绘线）vs 实心（色块）。选中或预设
-            // 均可切换，作用于 shape 的 background 填充。
+            // 填充样式：排线（hachure 手绘线）/ 密排（近乎实心）/ 实心
+            // （色块）。选中或预设均可切换，作用于 shape 的 background 填充。
+            // 高亮跟随**所选形状**的实际填充（整组一致时），没有选择时才
+            // 回退到"最近使用"的预设样式。
             if show_shape_options {
                 let mut fs_row = div().flex().flex_row().gap_1();
+                let active_fill = self.selection_fill_style().unwrap_or(self.style.fill_style);
                 for (ix, (label, fs)) in [
                     ("纹", crate::scene::FillStyle::Hachure),
+                    ("密", crate::scene::FillStyle::Dense),
                     ("实", crate::scene::FillStyle::Solid),
                 ]
                 .into_iter()
                 .enumerate()
                 {
                     let weak = weak.clone();
-                    let active = self.style.fill_style == fs;
+                    let active = active_fill == fs;
                     fs_row = fs_row.child(
                         div()
                             .id(gpui::ElementId::named_usize("fill-style", ix))

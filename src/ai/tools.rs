@@ -935,7 +935,8 @@ pub struct PolygonArgs {
     /// with an irregular ridgeline reads best.
     pub points: Vec<OpPoint>,
     /// Optional visual style. Ink-wash guidance: fill + fill_style="solid"
-    /// with opacity 0.35~0.5 for 远山，0.6~0.7 for 近岸.
+    /// with opacity 0.35~0.5 for 远山，0.6~0.7 for 近岸；fill_style="dense"
+    /// 为近乎实心的密排填充（比 solid 纹理更细密）。
     #[serde(default, deserialize_with = "de_style")]
     pub style: CanvasStyle,
 }
@@ -953,7 +954,7 @@ impl Tool for PolygonTool {
     fn definition(&self, _prompt: String) -> impl std::future::Future<Output = ToolDefinition> + Send {
         let def = tool_def::<PolygonArgs>(
             Self::NAME,
-            "画一个封闭多边形（≥3 个顶点，末点自动连回首点）。不规则形状的首选：水墨的远山、近岸、坡地都用它（6~10 个顶点勾出起伏轮廓，fill+fill_style=solid 半透明填充）。",
+            "画一个封闭多边形（≥3 个顶点，末点自动连回首点）。不规则形状的首选：水墨的远山、近岸、坡地都用它（6~10 个顶点勾出起伏轮廓，fill+fill_style=solid 半透明填充；fill_style=dense 为近乎实心的密排填充）。",
         );
         async move { def }
     }

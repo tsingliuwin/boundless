@@ -40,13 +40,15 @@ pub enum OpStrokeStyle {
     Dashed,
 }
 
-/// How shape backgrounds are filled: hachure sketch lines (default) or a
-/// solid flat block — the "chalk paste" panels of a blackboard poster.
+/// How shape backgrounds are filled: hachure sketch lines (default), dense
+/// overlapping hachure (near-solid), or a solid flat block — the "chalk
+/// paste" panels of a blackboard poster.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OpFillStyle {
     #[default]
     Hachure,
+    Dense,
     Solid,
 }
 
@@ -529,6 +531,7 @@ impl CanvasStyle {
         if let Some(fill_style) = self.fill_style {
             out.fill_style = match fill_style {
                 OpFillStyle::Hachure => crate::scene::FillStyle::Hachure,
+                OpFillStyle::Dense => crate::scene::FillStyle::Dense,
                 OpFillStyle::Solid => crate::scene::FillStyle::Solid,
             };
         }

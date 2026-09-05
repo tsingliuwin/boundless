@@ -123,6 +123,12 @@ fn fingerprint_into(h: &mut Fnv, el: &Element) {
     h.write_f64(f64::from(s.roughness));
     h.write_bool(s.stroke_style == crate::scene::StrokeStyle::Dashed);
     h.write_bool(s.line_type == LineType::Curved);
+    // 排线密度参数（间距/线宽）由 fill_style 决定——切换 纹/密/实 必须重绘。
+    h.write_u64(match s.fill_style {
+        crate::scene::FillStyle::Hachure => 0,
+        crate::scene::FillStyle::Dense => 1,
+        crate::scene::FillStyle::Solid => 2,
+    });
     h.write_f64(f64::from(s.opacity));
     match &el.kind {
         ElementKind::Rectangle => h.write_u64(1),
