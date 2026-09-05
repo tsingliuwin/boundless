@@ -21,3 +21,4 @@ shot-*.png
 # key; minisign.pub is only needed to bake the pubkey into the app.
 minisign.key
 minisign.pub
+__pycache__/
