@@ -58,7 +58,11 @@ fn app_state_path() -> PathBuf {
 #[derive(Clone, Debug)]
 pub enum Node {
     /// A subdirectory of the workspace (never the data dir).
-    Folder { name: String, rel: String, children: Vec<Node> },
+    Folder {
+        name: String,
+        rel: String,
+        children: Vec<Node>,
+    },
     /// A `.boundless` board file. `name` is the file stem (display name),
     /// `rel` the workspace-relative path with `/` separators.
     Board { name: String, rel: String },
@@ -246,7 +250,11 @@ impl Workspace {
             };
             if path.is_dir() {
                 let children = self.scan_dir(&path, &rel);
-                folders.push(Node::Folder { name, rel, children });
+                folders.push(Node::Folder {
+                    name,
+                    rel,
+                    children,
+                });
             } else if path.extension().and_then(|e| e.to_str()) == Some(BOARD_EXT) {
                 let name = path
                     .file_stem()

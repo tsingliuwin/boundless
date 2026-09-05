@@ -101,8 +101,14 @@ impl Skill {
 
 /// Built-in skill files, compiled in (the label must match the frontmatter).
 const BUILTIN_SOURCES: &[(&str, &str)] = &[
-    ("blackboard-poster", include_str!("../../skills/blackboard-poster/SKILL.md")),
-    ("ink-wash-landscape", include_str!("../../skills/ink-wash-landscape/SKILL.md")),
+    (
+        "blackboard-poster",
+        include_str!("../../skills/blackboard-poster/SKILL.md"),
+    ),
+    (
+        "ink-wash-landscape",
+        include_str!("../../skills/ink-wash-landscape/SKILL.md"),
+    ),
     ("mindmap", include_str!("../../skills/mindmap/SKILL.md")),
     ("slides", include_str!("../../skills/slides/SKILL.md")),
 ];
@@ -181,7 +187,10 @@ pub fn catalog() -> String {
             if s.display_name.is_empty() {
                 format!("- **{}**：{}\n", s.name, s.description)
             } else {
-                format!("- **{}**（{}）：{}\n", s.name, s.display_name, s.description)
+                format!(
+                    "- **{}**（{}）：{}\n",
+                    s.name, s.display_name, s.description
+                )
             }
         })
         .collect()

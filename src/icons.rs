@@ -474,7 +474,7 @@ pub fn pencil(c: Hsla) -> impl IntoElement {
         b.ln(15.7, 8.9); // cap, perpendicular to the barrel
         b.ln(5.8, 18.8); // lower edge back down
         b.cp(); // close at the tip
-        // Ferrule: the wood/eraser boundary line.
+                // Ferrule: the wood/eraser boundary line.
         b.mv(6.3, 13.7);
         b.ln(8.6, 16.0);
     })

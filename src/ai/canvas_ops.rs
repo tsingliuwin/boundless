@@ -379,9 +379,7 @@ pub fn is_gaudy_fill(c: u32) -> bool {
 /// against.
 pub fn parse_color_hex(s: &str) -> Result<u32, String> {
     let err = || {
-        format!(
-            "无法识别的颜色 \"{s}\"：请用 0xRRGGBB 整数，或 \"#RRGGBB\" / \"0xRRGGBB\" 字符串"
-        )
+        format!("无法识别的颜色 \"{s}\"：请用 0xRRGGBB 整数，或 \"#RRGGBB\" / \"0xRRGGBB\" 字符串")
     };
     let t = s.trim();
     let t = t.strip_prefix('#').unwrap_or(t);
@@ -441,9 +439,9 @@ where
                 ))
             }
         }
-        Some(serde_json::Value::String(s)) => {
-            parse_color_hex(&s).map(Some).map_err(serde::de::Error::custom)
-        }
+        Some(serde_json::Value::String(s)) => parse_color_hex(&s)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
         Some(other) => Err(serde::de::Error::custom(format!(
             "颜色必须是 0xRRGGBB 整数或十六进制字符串，收到 {other}"
         ))),
@@ -677,9 +675,8 @@ mod tests {
         // schema with the *string* "0xE7F0FF" — the bare u32 deserializer
         // rejected the whole tool call and the model gave up on fills.
         for form in ["15200511", "\"0xE7F0FF\"", "\"#E7F0FF\"", "\"e7f0ff\""] {
-            let style: CanvasStyle =
-                serde_json::from_str(&format!("{{\"fill\":{form}}}"))
-                    .unwrap_or_else(|e| panic!("form {form}: {e}"));
+            let style: CanvasStyle = serde_json::from_str(&format!("{{\"fill\":{form}}}"))
+                .unwrap_or_else(|e| panic!("form {form}: {e}"));
             assert_eq!(style.fill, Some(0xE7_F0_FF), "form {form}");
         }
     }

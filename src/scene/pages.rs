@@ -10,8 +10,8 @@
 //! Pure data + layout math, no GPUI — unit tests below lock the invariants
 //! (ratio parsing, gap-free horizontal growth, no overlap).
 
-use serde::{Deserialize, Serialize};
 use crate::scene::WBounds;
+use serde::{Deserialize, Serialize};
 
 /// Gap between consecutive pages, world units. Wide enough that the
 /// neighbors' content never bleeds into a page's exact-fit presentation view.
@@ -229,11 +229,21 @@ mod tests {
     #[test]
     fn titled_pages_keep_the_title() {
         let mut pages: Vec<Page> = Vec::new();
-        let (p, n) = push_page(&mut pages, Some("  封面  ".into()), PageRatio::Ratio16_9, PageEffect::Slide);
+        let (p, n) = push_page(
+            &mut pages,
+            Some("  封面  ".into()),
+            PageRatio::Ratio16_9,
+            PageEffect::Slide,
+        );
         assert_eq!(p.title, "封面");
         assert_eq!(n, 1);
         // Blank titles fall back to the numbered default.
-        let (p, n) = push_page(&mut pages, Some("  ".into()), PageRatio::Ratio16_9, PageEffect::Slide);
+        let (p, n) = push_page(
+            &mut pages,
+            Some("  ".into()),
+            PageRatio::Ratio16_9,
+            PageEffect::Slide,
+        );
         assert_eq!(p.title, "第 2 页");
         assert_eq!(n, 2);
     }

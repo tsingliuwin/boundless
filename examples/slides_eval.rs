@@ -55,7 +55,11 @@ fn run() -> anyhow::Result<()> {
         String::new(),
         boundless::ai::skills::ActiveSkill::new(),
     )?;
-    println!("模型: {} — 考题[PPT {}]: {prompt}", settings.model, ratio.label());
+    println!(
+        "模型: {} — 考题[PPT {}]: {prompt}",
+        settings.model,
+        ratio.label()
+    );
 
     let log_path = boundless::ai::log::begin_run(&prompt, &settings.model);
 

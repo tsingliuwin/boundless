@@ -179,7 +179,9 @@ pub enum FillStyle {
 
 /// Stroke rendering style for freehand pen strokes: solid ink (default),
 /// grainy pencil, or a dry 飞白 brush with broken strokes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Brush {
     #[default]
@@ -517,9 +519,7 @@ impl Element {
             ElementKind::Line { points }
             | ElementKind::Arrow { points, .. }
             | ElementKind::Freedraw { points, .. }
-            | ElementKind::Polygon { points, .. } => {
-                points.iter().map(|p| origin + *p).collect()
-            }
+            | ElementKind::Polygon { points, .. } => points.iter().map(|p| origin + *p).collect(),
             _ => Vec::new(),
         }
     }
@@ -681,8 +681,7 @@ impl Element {
             // 封闭多边形：内部可点选 + 边缘可精确命中（与矩形一致）。
             ElementKind::Polygon { .. } => {
                 let abs = self.absolute_points();
-                point_in_polygon(p, &abs)
-                    || distance_to_polygon(p, &abs, true) <= stroke_tol
+                point_in_polygon(p, &abs) || distance_to_polygon(p, &abs, true) <= stroke_tol
             }
             // Closed shapes: the whole bounding area is hit-testable (so a
             // click anywhere on the shape selects/moves it), regardless of

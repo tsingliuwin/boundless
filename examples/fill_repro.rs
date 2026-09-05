@@ -39,10 +39,7 @@ impl gpui::Render for FillRepro {
                         let mut pts: Vec<Point<Pixels>> = Vec::new();
                         for i in 0..=n {
                             let t = i as f32 / n as f32 * std::f32::consts::TAU;
-                            pts.push(point(
-                                px(cc + rrx * t.cos()),
-                                px(ccy + rry * t.sin()),
-                            ));
+                            pts.push(point(px(cc + rrx * t.cos()), px(ccy + rry * t.sin())));
                         }
                         if reverse {
                             pts.reverse();

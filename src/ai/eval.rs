@@ -320,7 +320,11 @@ pub fn apply(
                 text.as_deref(),
             )?;
         }
-        CanvasOp::Polygon { points, smooth, style } => {
+        CanvasOp::Polygon {
+            points,
+            smooth,
+            style,
+        } => {
             if points.len() < 3 || points.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
                 c.ops_failed += 1;
                 return Err("多边形至少需要三个有限坐标点".to_string());
@@ -345,12 +349,7 @@ pub fn apply(
                 stroke: style.stroke.unwrap_or(0x1e1e1e),
                 fill: style.fill,
                 opacity: f64::from(style.opacity.unwrap_or(1.0)),
-                points: Some(
-                    points
-                        .iter()
-                        .map(|p| [p.x, p.y])
-                        .collect(),
-                ),
+                points: Some(points.iter().map(|p| [p.x, p.y]).collect()),
             });
             c.ops_applied += 1;
             msg = format!("已添加多边形 id={id8}");
@@ -491,8 +490,7 @@ pub fn apply(
         }
         CanvasOp::Mindmap { root, cx, cy } => {
             let input = crate::scene::mindmap::MindmapNodeInput::from(root);
-            let center =
-                crate::scene::WPoint::new(cx.unwrap_or(800.0), cy.unwrap_or(500.0));
+            let center = crate::scene::WPoint::new(cx.unwrap_or(800.0), cy.unwrap_or(500.0));
             let layout = crate::scene::mindmap::layout(&input, center);
             let root_id = assigned_id
                 .map(str::to_string)
@@ -500,10 +498,26 @@ pub fn apply(
             let root8 = root_id[..root_id.len().min(8)].to_string();
             // Links first (z-order mirrors the board: nodes paint on top).
             for link in &layout.links {
-                let min_x = link.points.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
-                let min_y = link.points.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
-                let max_x = link.points.iter().map(|p| p.x).fold(f64::NEG_INFINITY, f64::max);
-                let max_y = link.points.iter().map(|p| p.y).fold(f64::NEG_INFINITY, f64::max);
+                let min_x = link
+                    .points
+                    .iter()
+                    .map(|p| p.x)
+                    .fold(f64::INFINITY, f64::min);
+                let min_y = link
+                    .points
+                    .iter()
+                    .map(|p| p.y)
+                    .fold(f64::INFINITY, f64::min);
+                let max_x = link
+                    .points
+                    .iter()
+                    .map(|p| p.x)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let max_y = link
+                    .points
+                    .iter()
+                    .map(|p| p.y)
+                    .fold(f64::NEG_INFINITY, f64::max);
                 c.elements.push(VirtualElement {
                     id: format!("l{}", c.elements.len()),
                     kind: "line",
@@ -565,10 +579,7 @@ pub fn apply(
                 });
             }
             c.ops_applied += 1;
-            msg = format!(
-                "已添加思维导图（{} 个节点）id={root8}",
-                layout.nodes.len()
-            );
+            msg = format!("已添加思维导图（{} 个节点）id={root8}", layout.nodes.len());
         }
         CanvasOp::AddPage {
             title,
@@ -1870,7 +1881,15 @@ pub fn evaluate_slides(
             let ar = p.w / p.h;
             (ar - expected_ar).abs() / expected_ar > 0.02
         })
-        .map(|(i, p)| format!("第{}页 {:.2}:{}.expected {}", i + 1, p.w, p.h, expected.label()))
+        .map(|(i, p)| {
+            format!(
+                "第{}页 {:.2}:{}.expected {}",
+                i + 1,
+                p.w,
+                p.h,
+                expected.label()
+            )
+        })
         .collect();
     checks.push(check(
         format!("页面比例 = {}", expected.label()),
@@ -1898,9 +1917,7 @@ pub fn evaluate_slides(
         if inside.len() < 2 {
             empty_pages.push(format!("第{}页({}元素)", i + 1, inside.len()));
         }
-        let has_text = inside
-            .iter()
-            .any(|e| matches!(e.kind, "text" | "label"));
+        let has_text = inside.iter().any(|e| matches!(e.kind, "text" | "label"));
         if !has_text {
             textless_pages.push(format!("第{}页", i + 1));
         }
@@ -2017,8 +2034,18 @@ pub fn evaluate_slides(
                     overlaps.push(format!(
                         "第{}页「{}」×「{}」",
                         i + 1,
-                        t1.text.as_deref().unwrap_or("?").chars().take(5).collect::<String>(),
-                        t2.text.as_deref().unwrap_or("?").chars().take(5).collect::<String>(),
+                        t1.text
+                            .as_deref()
+                            .unwrap_or("?")
+                            .chars()
+                            .take(5)
+                            .collect::<String>(),
+                        t2.text
+                            .as_deref()
+                            .unwrap_or("?")
+                            .chars()
+                            .take(5)
+                            .collect::<String>(),
                     ));
                 }
             }
@@ -2038,14 +2065,12 @@ pub fn evaluate_slides(
     let gaudy: Vec<String> = canvas
         .elements
         .iter()
-        .filter(|e| e.fill.map(crate::ai::canvas_ops::is_gaudy_fill).unwrap_or(false))
-        .map(|e| {
-            format!(
-                "{} #{:06x}",
-                e.kind,
-                e.fill.unwrap_or(0)
-            )
+        .filter(|e| {
+            e.fill
+                .map(crate::ai::canvas_ops::is_gaudy_fill)
+                .unwrap_or(false)
         })
+        .map(|e| format!("{} #{:06x}", e.kind, e.fill.unwrap_or(0)))
         .collect();
     checks.push(check(
         "无刺眼高饱和填充（洋红/纯红/荧光色）",
@@ -2095,8 +2120,7 @@ pub fn evaluate_slides(
         canvas.ops_failed == 0,
         format!("失败 {} 次", canvas.ops_failed),
     ));
-    let budget = SLIDES_BUDGET_BASE
-        + SLIDES_BUDGET_PER_PAGE * canvas.pages.len().max(min_pages);
+    let budget = SLIDES_BUDGET_BASE + SLIDES_BUDGET_PER_PAGE * canvas.pages.len().max(min_pages);
     let total = total_tool_calls.max(canvas.ops_applied + canvas.ops_failed);
     checks.push(check(
         format!("工具调用 ≤ {budget}（按页数缩放）"),
@@ -2119,14 +2143,17 @@ mod slides_tests {
             CanvasOp::AddPage {
                 title: Some(title.into()),
                 ratio: Some(ratio.into()),
-            effect: None,
+                effect: None,
             },
             None,
         )
     }
 
-    fn text_op(page: &crate::scene::pages::Page, dy: f64, text: &str) -> (CanvasOp, Option<String>)
-    {
+    fn text_op(
+        page: &crate::scene::pages::Page,
+        dy: f64,
+        text: &str,
+    ) -> (CanvasOp, Option<String>) {
         (
             CanvasOp::Text {
                 x: page.x + 100.0,
@@ -2163,11 +2190,7 @@ mod slides_tests {
         let ops = sample_deck(5, "16:9");
         let canvas = replay(&ops);
         let report = evaluate_slides(&canvas, true, ops.len(), 5, PageRatio::Ratio16_9);
-        assert!(
-            report.passed,
-            "deck must pass:\n{}",
-            report.to_text()
-        );
+        assert!(report.passed, "deck must pass:\n{}", report.to_text());
     }
 
     #[test]
@@ -2175,7 +2198,10 @@ mod slides_tests {
         let ops = sample_deck(3, "16:9");
         let canvas = replay(&ops);
         let report = evaluate_slides(&canvas, true, ops.len(), 5, PageRatio::Ratio16_9);
-        assert!(report.checks.iter().any(|c| c.name.contains("页数") && !c.passed));
+        assert!(report
+            .checks
+            .iter()
+            .any(|c| c.name.contains("页数") && !c.passed));
     }
 
     #[test]
@@ -2461,7 +2487,14 @@ mod mindmap_tests {
     }
 
     fn mindmap_op(root: OpMindmapNode) -> (CanvasOp, Option<String>) {
-        (CanvasOp::Mindmap { root, cx: None, cy: None }, Some("aaa00001".into()))
+        (
+            CanvasOp::Mindmap {
+                root,
+                cx: None,
+                cy: None,
+            },
+            Some("aaa00001".into()),
+        )
     }
 
     #[test]
@@ -2667,7 +2700,8 @@ mod mindmap_tests {
     fn overlong_label_fails_text_discipline() {
         // Same tree but one node label is a whole sentence (> 24 chars).
         let mut tree = sample_tree();
-        tree.children[0].children[0].text = "这是一个远远超过二十四个字的啰里啰嗦的要点描述它应当被判定为不合格".into();
+        tree.children[0].children[0].text =
+            "这是一个远远超过二十四个字的啰里啰嗦的要点描述它应当被判定为不合格".into();
         let canvas = replay(&vec![mindmap_op(tree)]);
         let report = evaluate_mindmap(&canvas, true, 1);
         assert!(

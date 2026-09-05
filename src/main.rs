@@ -22,7 +22,11 @@ use gpui_component::Root;
 pub fn append_exit_diag(line: &str) {
     use std::io::Write;
     let path = boundless::ai::store::data_dir().join("panic.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         let _ = f.write_all(line.as_bytes());
     }
 }
@@ -222,18 +226,11 @@ fn main() {
                     window.on_window_should_close(cx, |_, cx| {
                         // Flush an autosave-pending board before quitting so
                         // the last tick's edits can't be lost.
-                        cx.update_global::<boundless::board::ActiveBoardHandle, _>(
-                            |handle, cx| {
-                                handle
-                                    .0
-                                    .update(cx, |board, _cx| board.save_if_dirty())
-                                    .ok();
-                            },
-                        );
+                        cx.update_global::<boundless::board::ActiveBoardHandle, _>(|handle, cx| {
+                            handle.0.update(cx, |board, _cx| board.save_if_dirty()).ok();
+                        });
                         eprintln!("[exit-diag] window should_close requested -> quitting");
-                        boundless::ai::log::log_error(
-                            "window should_close requested -> quitting",
-                        );
+                        boundless::ai::log::log_error("window should_close requested -> quitting");
                         cx.quit();
                         true
                     });

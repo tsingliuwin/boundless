@@ -169,13 +169,15 @@ impl AiPanel {
         let mut subscriptions = Vec::new();
         // Enter (without Shift) in the chat input sends the message.
         for input in [&input, &compact_input] {
-            subscriptions.push(cx.subscribe(input, |this, _entity, event: &InputEvent, cx| {
-                if let InputEvent::PressEnter { secondary } = event {
-                    if !secondary {
-                        this.send_message(cx);
+            subscriptions.push(
+                cx.subscribe(input, |this, _entity, event: &InputEvent, cx| {
+                    if let InputEvent::PressEnter { secondary } = event {
+                        if !secondary {
+                            this.send_message(cx);
+                        }
                     }
-                }
-            }));
+                }),
+            );
         }
 
         // Load stored sessions for this board; resume the most recent one if
@@ -249,11 +251,7 @@ impl AiPanel {
             return;
         }
         // Read the prompt from whichever input the visible mode uses.
-        let text = self
-            .active_input()
-            .read(cx)
-            .value()
-            .to_string();
+        let text = self.active_input().read(cx).value().to_string();
         let text = text.trim().to_string();
         if text.is_empty() {
             return;
@@ -859,24 +857,22 @@ impl Render for AiPanel {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child("AI 创作助手"),
             )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_1()
                     .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap_1()
-                            .child(
-                                // Collapse back to the compact bottom bar.
-                                panel_button("收起", false).on_click(cx.listener(
-                                    |this, _, window, cx| {
-                                        this.set_compact(true, window, cx)
-                                    },
-                                )),
-                            )
-                            .child(
-                                panel_button("新建", false)
-                                    .on_click(cx.listener(|this, _, _, cx| this.clear_chat(cx))),
-                            ),
-                    );
+                        // Collapse back to the compact bottom bar.
+                        panel_button("收起", false).on_click(
+                            cx.listener(|this, _, window, cx| this.set_compact(true, window, cx)),
+                        ),
+                    )
+                    .child(
+                        panel_button("新建", false)
+                            .on_click(cx.listener(|this, _, _, cx| this.clear_chat(cx))),
+                    ),
+            );
 
         // Slim dismissible notice bar (session IO failures etc.), directly
         // under the header. Click to dismiss.
@@ -1195,10 +1191,9 @@ impl AiPanel {
             } else {
                 seg = seg.hover(|s| s.bg(rgb(0xefeeec))).text_color(rgb(0x555555));
             }
-            control =
-                control.child(seg.on_click(cx.listener(move |this, _, _, cx| {
-                    this.set_reasoning(level, cx);
-                })));
+            control = control.child(seg.on_click(cx.listener(move |this, _, _, cx| {
+                this.set_reasoning(level, cx);
+            })));
         }
         control
     }
@@ -1310,9 +1305,9 @@ impl AiPanel {
             .justify_center()
             .cursor_pointer()
             .when(streaming, |d| {
-                d.bg(rgb(0x3d3d3d)).hover(|s| s.bg(rgb(0x2f2f2f))).child(
-                    div().w_3().h_3().rounded_sm().bg(rgb(0xe3e3e3)),
-                )
+                d.bg(rgb(0x3d3d3d))
+                    .hover(|s| s.bg(rgb(0x2f2f2f)))
+                    .child(div().w_3().h_3().rounded_sm().bg(rgb(0xe3e3e3)))
             })
             .when(!streaming, |d| {
                 d.bg(rgb(0x1a5fd7))
@@ -1964,7 +1959,7 @@ impl ToolOp {
             ToolOp::Clear => rgb(0xc92a2a),  // red
             ToolOp::Query => rgb(0x888888),  // gray
             ToolOp::Config => rgb(0x1a5fd7),
-            ToolOp::Skill => rgb(0x7048e8),  // violet: scenario-skill loading
+            ToolOp::Skill => rgb(0x7048e8), // violet: scenario-skill loading
             ToolOp::Other => rgb(0x1a5fd7),
         }
     }
@@ -2438,11 +2433,11 @@ fn tool_call_detail(name: &str, args: &serde_json::Value) -> String {
                 .get("title")
                 .and_then(|v| v.as_str())
                 .unwrap_or("未命名");
-            let ratio = obj
-                .get("ratio")
+            let ratio = obj.get("ratio").and_then(|v| v.as_str()).unwrap_or("16:9");
+            let effect = obj
+                .get("effect")
                 .and_then(|v| v.as_str())
-                .unwrap_or("16:9");
-            let effect = obj.get("effect").and_then(|v| v.as_str()).unwrap_or("slide");
+                .unwrap_or("slide");
             format!("「{title}」（{ratio} · {effect}）")
         }
         _ => String::new(),

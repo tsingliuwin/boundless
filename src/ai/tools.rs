@@ -832,7 +832,10 @@ impl Tool for SetPaperTextureTool {
     type Args = SetPaperTextureArgs;
     type Output = String;
 
-    fn definition(&self, _prompt: String) -> impl std::future::Future<Output = ToolDefinition> + Send {
+    fn definition(
+        &self,
+        _prompt: String,
+    ) -> impl std::future::Future<Output = ToolDefinition> + Send {
         let def = tool_def::<SetPaperTextureArgs>(
             Self::NAME,
             "给画布叠加纸纹材质（细腻质感的关键一步）：grain=水彩纸细纹、kraft=牛皮纸纤维、chalkboard=黑板粉尘、none=移除。与 set_canvas_background 搭配使用。",
@@ -1021,7 +1024,10 @@ impl Tool for PolygonTool {
     type Args = PolygonArgs;
     type Output = String;
 
-    fn definition(&self, _prompt: String) -> impl std::future::Future<Output = ToolDefinition> + Send {
+    fn definition(
+        &self,
+        _prompt: String,
+    ) -> impl std::future::Future<Output = ToolDefinition> + Send {
         let def = tool_def::<PolygonArgs>(
             Self::NAME,
             "画一个封闭多边形（≥3 个顶点，末点自动连回首点）。不规则形状的首选：水墨的远山、近岸、坡地都用它（6~10 个顶点勾出起伏轮廓，fill+fill_style=solid 半透明填充；fill_style=dense 为近乎实心的密排填充）。",
@@ -1063,8 +1069,7 @@ impl Tool for PolygonTool {
                 .await;
             }
             if let Err(msg) = args.style.validate() {
-                return fail_tool(&events, id, name, args_json, ToolError::invalid_args(msg))
-                    .await;
+                return fail_tool(&events, id, name, args_json, ToolError::invalid_args(msg)).await;
             }
             let op = CanvasOp::Polygon {
                 points: args.points,
@@ -1103,7 +1108,10 @@ impl Tool for SmoothShapeTool {
     type Args = SmoothShapeArgs;
     type Output = String;
 
-    fn definition(&self, _prompt: String) -> impl std::future::Future<Output = ToolDefinition> + Send {
+    fn definition(
+        &self,
+        _prompt: String,
+    ) -> impl std::future::Future<Output = ToolDefinition> + Send {
         let def = tool_def::<SmoothShapeArgs>(
             Self::NAME,
             "画一个平滑的封闭曲线形（有机形态的首选：花瓣、云朵、鹅卵石、树叶、水波）。3~8 个控制点勾出轮廓极值点，曲线自动平滑闭合，比 polygon 更柔和细腻。fill+fill_style=watercolor 搭配最佳，可加 shadow 增加立体感。",
@@ -1145,8 +1153,7 @@ impl Tool for SmoothShapeTool {
                 .await;
             }
             if let Err(msg) = args.style.validate() {
-                return fail_tool(&events, id, name, args_json, ToolError::invalid_args(msg))
-                    .await;
+                return fail_tool(&events, id, name, args_json, ToolError::invalid_args(msg)).await;
             }
             let op = CanvasOp::Polygon {
                 points: args.points,
@@ -1189,9 +1196,7 @@ fn validate_mindmap_text(node: &OpMindmapNode) -> Result<(), ToolError> {
         return Err(ToolError::invalid_args("节点文字不能为空"));
     }
     if t.contains('\n') {
-        return Err(ToolError::invalid_args(
-            "节点文字必须是单行（不能含换行）",
-        ));
+        return Err(ToolError::invalid_args("节点文字必须是单行（不能含换行）"));
     }
     if t.chars().count() > MINDMAP_MAX_TEXT {
         return Err(ToolError::invalid_args(format!(
@@ -1334,8 +1339,10 @@ impl Tool for UseSkillTool {
                     } else {
                         format!("{}（{}）", skill.name, skill.display_name)
                     };
-                    let result =
-                        format!("已加载技能「{title}」v{}的构图规范，后续绘制必须严格遵循：\n\n{}", skill.version, skill.body);
+                    let result = format!(
+                        "已加载技能「{title}」v{}的构图规范，后续绘制必须严格遵循：\n\n{}",
+                        skill.version, skill.body
+                    );
                     let _ = events.unbounded_send(AgentEvent::ToolResult {
                         id,
                         result: result.clone(),
@@ -1499,7 +1506,9 @@ impl Tool for DeletePageTool {
         async move {
             let id = next_tool_id(name);
             let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
-            let op = CanvasOp::DeletePage { number: args.number };
+            let op = CanvasOp::DeletePage {
+                number: args.number,
+            };
             run_canvas_op(&events, id, name, args_json, op, None).await
         }
     }
@@ -1780,9 +1789,12 @@ mod tests {
                 children: vec![],
             });
         }
-        assert_eq!(crate::scene::mindmap::count_nodes(
-            &crate::scene::mindmap::MindmapNodeInput::from(&root)
-        ), 41);
+        assert_eq!(
+            crate::scene::mindmap::count_nodes(&crate::scene::mindmap::MindmapNodeInput::from(
+                &root
+            )),
+            41
+        );
         assert!(validate_mindmap(&mindmap_args(root)).is_err());
     }
 

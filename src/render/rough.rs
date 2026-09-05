@@ -372,13 +372,8 @@ fn rough_shape(
             let mut sh_sets = sets_of(&draw(&gen_sh));
             let k = 1.0 - 0.06 * mult; // 6% shrink per stack step
             for s in &mut sh_sets {
-                s.ops = shadow_transform(
-                    &s.ops,
-                    center,
-                    sh.dx * mult as f64,
-                    sh.dy * mult as f64,
-                    k,
-                );
+                s.ops =
+                    shadow_transform(&s.ops, center, sh.dx * mult as f64, sh.dy * mult as f64, k);
                 s.paint = Some(PaintOverride {
                     color: Some(color_u32(0x1e1e1e, alpha)),
                     width: Some((sw * 0.8).max(0.7) as f64),
@@ -420,9 +415,7 @@ fn rough_shape(
             SceneFillStyle::Watercolor => {
                 let bg = style.background.unwrap_or(0);
                 let op = style.opacity;
-                let base_gap = style
-                    .hachure_gap
-                    .map_or((sw * 1.1).max(1.2) as f64, |v| v);
+                let base_gap = style.hachure_gap.map_or((sw * 1.1).max(1.2) as f64, |v| v);
                 let washes = [
                     (-41.0, (base_gap * 1.2).max(1.4), 1.7, 0.60, 7u64),
                     (49.0, (base_gap * 0.8).max(1.0), 1.5, 0.45, 14),
@@ -519,13 +512,11 @@ pub fn world_geometry(el: &Element) -> WorldGeom {
             let pts: Vec<_> = points.iter().map(|p| to_euclid(*p)).collect();
             if *smooth {
                 let bez = closed_catmull_rom_bez(&points);
-                rough_shape(style, el.seed, b.center(), |gen| {
-                    gen.bez_path(bez.clone())
-                })
+                rough_shape(style, el.seed, b.center(), |gen| gen.bez_path(bez.clone()))
             } else {
                 rough_shape(style, el.seed, b.center(), |gen: &KurboGenerator| {
-                gen.polygon(&pts)
-            })
+                    gen.polygon(&pts)
+                })
             }
         }
         // Variable-width ink stroke (from the crate::ink pipeline): fill the
@@ -659,7 +650,10 @@ pub fn world_geometry(el: &Element) -> WorldGeom {
                     }
                     _ => passes
                         .into_iter()
-                        .map(|points| SampledPass { points, paint: None })
+                        .map(|points| SampledPass {
+                            points,
+                            paint: None,
+                        })
                         .collect(),
                 };
                 WorldGeom::Sampled(sampled)

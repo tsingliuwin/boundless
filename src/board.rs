@@ -3,25 +3,24 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
-use std::sync::Arc;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::*;
 
 use crate::ai::canvas_ops::{CanvasOp, CanvasOpError, CanvasOpOutcome, CanvasStyle};
 use crate::ai::panel::AiPanel;
+use crate::ai::store::{list_sessions, rebind_session_boards as store_rebind, SessionMeta};
 use crate::camera::Camera;
 use crate::history::History;
 use crate::render::rough::{color_u32, paths_for_element, ReadyPath};
 use crate::render::{dot_grid, handle_rects, measure_text, point_handle_rects, ShapedTextLine};
 use crate::scene::{
-    pages::PageRatio,
-    Brush, Element, ElementId, ElementKind, ElementStyle, LineType, PaperTexture, Scene, SceneFile,
-    StrokeStyle, TextAlign, WBounds, WPoint, DEFAULT_FONT_SIZE, LINE_HEIGHT,
+    pages::PageRatio, Brush, Element, ElementId, ElementKind, ElementStyle, LineType, PaperTexture,
+    Scene, SceneFile, StrokeStyle, TextAlign, WBounds, WPoint, DEFAULT_FONT_SIZE, LINE_HEIGHT,
 };
 use crate::settings_page::SettingsPage;
-use crate::ai::store::{list_sessions, rebind_session_boards as store_rebind, SessionMeta};
 use crate::text::{utf16_to_utf8, utf8_to_utf16, TextEditSession};
 use crate::tools::{ActiveTool, DragState, PointTarget};
 use crate::workspace::{self, Workspace};
@@ -473,14 +472,12 @@ impl BoardView {
         // write it out every 1.5s (the file is always writeable — no dialog
         // path). Detached; the update fails and the loop exits when the
         // window closes.
-        let autosave = cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(1500))
-                    .await;
-                if this.update(cx, |this, cx| this.autosave_tick(cx)).is_err() {
-                    return;
-                }
+        let autosave = cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(1500))
+                .await;
+            if this.update(cx, |this, cx| this.autosave_tick(cx)).is_err() {
+                return;
             }
         });
         autosave.detach();
@@ -1072,9 +1069,7 @@ impl BoardView {
                 style,
             } => {
                 if points.len() < 3 || points.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
-                    return Err(CanvasOpError::invalid_args(
-                        "多边形至少需要三个有限坐标点",
-                    ));
+                    return Err(CanvasOpError::invalid_args("多边形至少需要三个有限坐标点"));
                 }
                 let Some(id) = pre_assigned_id else {
                     return Err(CanvasOpError::internal("内部错误：缺少元素 ID"));
@@ -1393,12 +1388,7 @@ impl BoardView {
                     };
                     style.fill_style = crate::scene::FillStyle::Solid;
                     let el = if i == 0 {
-                        Element::new_with_id(
-                            root_id,
-                            ElementKind::Rectangle,
-                            spec.bounds,
-                            style,
-                        )
+                        Element::new_with_id(root_id, ElementKind::Rectangle, spec.bounds, style)
                     } else {
                         Element::new(ElementKind::Rectangle, spec.bounds, style)
                     };
@@ -1431,7 +1421,10 @@ impl BoardView {
                     }
                     None => PageRatio::default(),
                 };
-                let eff = match effect.as_deref().map(crate::scene::pages::PageEffect::parse) {
+                let eff = match effect
+                    .as_deref()
+                    .map(crate::scene::pages::PageEffect::parse)
+                {
                     Some(Some(e)) => e,
                     Some(None) => {
                         return Err(CanvasOpError::invalid_args(
@@ -1441,12 +1434,8 @@ impl BoardView {
                     None => crate::scene::pages::PageEffect::default(),
                 };
                 let (rect, title, number) = {
-                    let (p, n) = crate::scene::pages::push_page(
-                        &mut self.scene.pages,
-                        title,
-                        r,
-                        eff,
-                    );
+                    let (p, n) =
+                        crate::scene::pages::push_page(&mut self.scene.pages, title, r, eff);
                     (p.bounds(), p.title.clone(), n)
                 };
                 // Follow camera: the AI switched to the new page. Deferred to
@@ -1973,7 +1962,8 @@ impl BoardView {
         } else {
             self.camera.pan_by_screen(px(-panel_width / 2.0), px(0.0));
         }
-        self.workspace.set_chat_prefs(self.ai_panel.is_some(), compact);
+        self.workspace
+            .set_chat_prefs(self.ai_panel.is_some(), compact);
         cx.notify();
     }
 
@@ -2410,7 +2400,8 @@ impl BoardView {
         cx.spawn(async move |this, cx| {
             let dialog = rfd::FileDialog::new().add_filter("Boundless 场景", &["boundless"]);
             if let Some(path) = dialog.pick_file() {
-                this.update(cx, |this, cx| this.open_board_inner(path, cx)).ok();
+                this.update(cx, |this, cx| this.open_board_inner(path, cx))
+                    .ok();
             }
         })
         .detach();
@@ -2445,12 +2436,7 @@ impl BoardView {
     /// Start a brand-new conversation for the given board (explorer ＋
     /// button): open the board if needed, surface the AI panel, and reset the
     /// panel to a fresh session bound to that board.
-    pub fn new_session_for(
-        &mut self,
-        rel: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn new_session_for(&mut self, rel: String, window: &mut Window, cx: &mut Context<Self>) {
         if self.switch_refused(cx) {
             return;
         }
@@ -2607,7 +2593,10 @@ impl BoardView {
         if let Some(panel) = &self.ai_panel {
             panel.update(cx, |panel, cx| panel.set_active_board(None, cx));
         }
-        self.set_notice(format!("工作区已切换至 {}", self.workspace.root().display()), cx);
+        self.set_notice(
+            format!("工作区已切换至 {}", self.workspace.root().display()),
+            cx,
+        );
         cx.notify();
     }
 
@@ -2704,11 +2693,7 @@ impl BoardView {
     }
 
     /// Create a subfolder under `folder_rel` (None = workspace root).
-    pub fn create_folder_in(
-        &mut self,
-        folder_rel: Option<String>,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn create_folder_in(&mut self, folder_rel: Option<String>, cx: &mut Context<Self>) {
         match self.workspace.create_folder(folder_rel.as_deref()) {
             Ok(_) => self.rescan_explorer(),
             Err(e) => self.set_notice(format!("创建文件夹失败: {e}"), cx),
@@ -2835,12 +2820,10 @@ impl BoardView {
                     }
                 }
                 if affects_active {
-                    let new_active = if renaming.is_folder && active_rel.as_deref() != Some(renaming.rel.as_str())
+                    let new_active = if renaming.is_folder
+                        && active_rel.as_deref() != Some(renaming.rel.as_str())
                     {
-                        format!(
-                            "{new_rel}{}",
-                            &active_rel.unwrap()[renaming.rel.len()..]
-                        )
+                        format!("{new_rel}{}", &active_rel.unwrap()[renaming.rel.len()..])
                     } else {
                         new_rel.clone()
                     };
@@ -2907,16 +2890,20 @@ impl BoardView {
                     .flex()
                     .flex_row()
                     .gap_1()
-                    .child(explorer_mini_button("explorer-new-board", "＋白板").on_click(
-                        cx.listener(|this, _, window, cx| {
-                            this.create_board_in(None, window, cx);
-                        }),
-                    ))
-                    .child(explorer_mini_button("explorer-new-folder", "＋文件夹").on_click(
-                        cx.listener(|this, _, _, cx| {
-                            this.create_folder_in(None, cx);
-                        }),
-                    )),
+                    .child(
+                        explorer_mini_button("explorer-new-board", "＋白板").on_click(cx.listener(
+                            |this, _, window, cx| {
+                                this.create_board_in(None, window, cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        explorer_mini_button("explorer-new-folder", "＋文件夹").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.create_folder_in(None, cx);
+                            }),
+                        ),
+                    ),
             );
 
         // Footer: where the workspace (and its .boundless data) lives.
@@ -2926,10 +2913,11 @@ impl BoardView {
             .border_t_1()
             .border_color(rgb(0xe3e2df))
             .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0x999999))
-                    .child(div().truncate().child(format!("{}", self.workspace.root().display()))),
+                div().text_xs().text_color(rgb(0x999999)).child(
+                    div()
+                        .truncate()
+                        .child(format!("{}", self.workspace.root().display())),
+                ),
             );
 
         div()
@@ -2966,7 +2954,11 @@ impl BoardView {
         let indent = px(6.0 + 14.0 * depth as f32);
         let renaming_rel = self.renaming.as_ref().map(|r| r.rel.clone());
         match node {
-            workspace::Node::Folder { name, rel, children } => {
+            workspace::Node::Folder {
+                name,
+                rel,
+                children,
+            } => {
                 let expanded = self.explorer_expanded.contains(rel);
                 let rel_toggle = rel.clone();
                 let rel_add = rel.clone();
@@ -3188,13 +3180,11 @@ impl BoardView {
                 if renaming_this {
                     row = row
                         .bg(rgb(0xffffff))
-                        .child(
-                            Icon::new(IconName::File).text_color(if is_active {
-                                rgb(0x1a5fd7)
-                            } else {
-                                rgb(0x777777)
-                            }),
-                        )
+                        .child(Icon::new(IconName::File).text_color(if is_active {
+                            rgb(0x1a5fd7)
+                        } else {
+                            rgb(0x777777)
+                        }))
                         .child(
                             div().flex_1().min_w_0().h_6().child(
                                 Input::new(&self.explorer_rename_input)
@@ -3207,31 +3197,28 @@ impl BoardView {
                     if is_active {
                         row = row.bg(rgb(0xdce8ff)).text_color(rgb(0x1a5fd7));
                     } else {
-                        row = row
-                            .text_color(rgb(0x3b3b3b))
-                            .hover(|s| s.bg(rgb(0xefeeec)));
+                        row = row.text_color(rgb(0x3b3b3b)).hover(|s| s.bg(rgb(0xefeeec)));
                     }
-                    row = row
-                        .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                            // Like folders, a single click toggles the level;
-                            // double-click opens the board (a session row also
-                            // opens board + session in one hit). Boards with
-                            // no sessions open on a single click — there's
-                            // nothing to toggle.
-                            let double_click = match event {
-                                ClickEvent::Mouse(click) => click.up.click_count > 1,
-                                ClickEvent::Keyboard(_) => false,
-                            };
-                            if has_sessions && !double_click {
-                                if !this.explorer_expanded.remove(&rel_open) {
-                                    this.explorer_expanded.insert(rel_open.clone());
-                                }
-                                cx.notify();
-                            } else {
-                                let path = this.workspace.root().join(&rel_open);
-                                this.open_board(path, window, cx);
+                    row = row.on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        // Like folders, a single click toggles the level;
+                        // double-click opens the board (a session row also
+                        // opens board + session in one hit). Boards with
+                        // no sessions open on a single click — there's
+                        // nothing to toggle.
+                        let double_click = match event {
+                            ClickEvent::Mouse(click) => click.up.click_count > 1,
+                            ClickEvent::Keyboard(_) => false,
+                        };
+                        if has_sessions && !double_click {
+                            if !this.explorer_expanded.remove(&rel_open) {
+                                this.explorer_expanded.insert(rel_open.clone());
                             }
-                        }));
+                            cx.notify();
+                        } else {
+                            let path = this.workspace.root().join(&rel_open);
+                            this.open_board(path, window, cx);
+                        }
+                    }));
                     // Chevron gutter — boards without sessions get a blank
                     // spacer so every icon column stays aligned.
                     match chevron {
@@ -3239,13 +3226,11 @@ impl BoardView {
                         None => row = row.child(div().w_4()),
                     }
                     row = row
-                        .child(
-                            Icon::new(IconName::File).text_color(if is_active {
-                                rgb(0x1a5fd7)
-                            } else {
-                                rgb(0x777777)
-                            }),
-                        )
+                        .child(Icon::new(IconName::File).text_color(if is_active {
+                            rgb(0x1a5fd7)
+                        } else {
+                            rgb(0x777777)
+                        }))
                         .child(div().flex_1().truncate().child(name.clone()));
                     // Row actions show only while the pointer is on the row,
                     // keeping the resting tree quiet.
@@ -3257,63 +3242,52 @@ impl BoardView {
                 // The session level under the board.
                 if sessions_expanded {
                     for session in &sessions {
-                            let sid = session.id.clone();
-                            let preview = session.preview.clone();
-                            let rel_session = rel.clone();
-                            let is_current = is_active
-                                && current_session.as_deref() == Some(sid.as_str());
-                            out.push(
-                                div()
-                                    .id(SharedString::from(format!(
-                                        "explorer-session::{rel}::{sid}"
-                                    )))
-                                    .h_6()
-                                    // Aligned with the parent board's file
-                                    // icon column — the bot icon itself
-                                    // marks the level, no extra indent.
-                                    .pl(indent + px(20.0))
-                                    .pr_1()
-                                    .rounded_md()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_1()
-                                    .text_xs()
-                                    .cursor_pointer()
-                                    .when(is_current, |d| d.text_color(rgb(0x1a5fd7)))
-                                    .when(!is_current, |d| {
-                                        d.text_color(rgb(0x666666))
-                                    })
-                                    .hover(|s| s.bg(rgb(0xefeeec)))
-                                    .on_click(cx.listener(
-                                        move |this, _, window, cx| {
-                                            this.open_session(
-                                                rel_session.clone(),
-                                                sid.clone(),
-                                                window,
-                                                cx,
-                                            );
-                                        },
-                                    ))
-                                    .child(
-                                        Icon::new(IconName::Bot).text_color(if is_current {
-                                            rgb(0x1a5fd7)
-                                        } else {
-                                            rgb(0x999999)
-                                        }),
-                                    )
-                                    .child(div().flex_1().truncate().child(preview))
-                                    // Count sits apart in a lighter shade so
-                                    // the preview text stays the anchor.
-                                    .child(
-                                        div()
-                                            .flex_shrink_0()
-                                            .text_color(rgb(0xbbbbbb))
-                                            .child(format!("{}条", session.count)),
-                                    )
-                                    .into_any_element(),
-                            );
-                        }
+                        let sid = session.id.clone();
+                        let preview = session.preview.clone();
+                        let rel_session = rel.clone();
+                        let is_current =
+                            is_active && current_session.as_deref() == Some(sid.as_str());
+                        out.push(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "explorer-session::{rel}::{sid}"
+                                )))
+                                .h_6()
+                                // Aligned with the parent board's file
+                                // icon column — the bot icon itself
+                                // marks the level, no extra indent.
+                                .pl(indent + px(20.0))
+                                .pr_1()
+                                .rounded_md()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_1()
+                                .text_xs()
+                                .cursor_pointer()
+                                .when(is_current, |d| d.text_color(rgb(0x1a5fd7)))
+                                .when(!is_current, |d| d.text_color(rgb(0x666666)))
+                                .hover(|s| s.bg(rgb(0xefeeec)))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_session(rel_session.clone(), sid.clone(), window, cx);
+                                }))
+                                .child(Icon::new(IconName::Bot).text_color(if is_current {
+                                    rgb(0x1a5fd7)
+                                } else {
+                                    rgb(0x999999)
+                                }))
+                                .child(div().flex_1().truncate().child(preview))
+                                // Count sits apart in a lighter shade so
+                                // the preview text stays the anchor.
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_color(rgb(0xbbbbbb))
+                                        .child(format!("{}条", session.count)),
+                                )
+                                .into_any_element(),
+                        );
+                    }
                 }
             }
         }
@@ -3415,23 +3389,20 @@ impl BoardView {
             dur_ms,
         });
         cx.notify();
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(16))
-                    .await;
-                let mut running = false;
-                this.update(cx, |this, cx| {
-                    if let Some(anim) = &this.page_anim {
-                        running =
-                            anim.started.elapsed().as_millis() < anim.dur_ms as u128 + 2;
-                        cx.notify();
-                    }
-                })
-                .ok();
-                if !running {
-                    break;
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(16))
+                .await;
+            let mut running = false;
+            this.update(cx, |this, cx| {
+                if let Some(anim) = &this.page_anim {
+                    running = anim.started.elapsed().as_millis() < anim.dur_ms as u128 + 2;
+                    cx.notify();
                 }
+            })
+            .ok();
+            if !running {
+                break;
             }
         })
         .detach();
@@ -3449,7 +3420,12 @@ impl BoardView {
         if presenting {
             self.presenting = Some(i);
             // The page being entered owns its transition.
-            let effect = self.scene.pages.get(i).map(|p| p.effect).unwrap_or_default();
+            let effect = self
+                .scene
+                .pages
+                .get(i)
+                .map(|p| p.effect)
+                .unwrap_or_default();
             match effect {
                 crate::scene::pages::PageEffect::Fade => {
                     self.enter_fade_page(i, cx);
@@ -3538,30 +3514,28 @@ impl BoardView {
         // Auto-hide watcher: while presenting, fade the page controls out
         // after a short pointer idle; any move re-shows them
         // (bump_present_chrome). Exits the loop when the show ends.
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(400))
-                    .await;
-                let keep = this.update(cx, |this, cx| {
-                    if this.presenting.is_none() {
-                        return false;
-                    }
-                    let idle = this
-                        .present_last_move
-                        .map_or(true, |t| t.elapsed() >= std::time::Duration::from_millis(2500));
-                    if idle && this.present_chrome_visible {
-                        this.present_chrome_visible = false;
-                        cx.notify();
-                    } else if !idle && !this.present_chrome_visible {
-                        this.present_chrome_visible = true;
-                        cx.notify();
-                    }
-                    true
-                });
-                if !matches!(keep, Ok(true)) {
-                    break;
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(400))
+                .await;
+            let keep = this.update(cx, |this, cx| {
+                if this.presenting.is_none() {
+                    return false;
                 }
+                let idle = this.present_last_move.map_or(true, |t| {
+                    t.elapsed() >= std::time::Duration::from_millis(2500)
+                });
+                if idle && this.present_chrome_visible {
+                    this.present_chrome_visible = false;
+                    cx.notify();
+                } else if !idle && !this.present_chrome_visible {
+                    this.present_chrome_visible = true;
+                    cx.notify();
+                }
+                true
+            });
+            if !matches!(keep, Ok(true)) {
+                break;
             }
         })
         .detach();
@@ -3579,8 +3553,12 @@ impl BoardView {
                     this.present_debut = false;
                     if let Some(i) = this.presenting {
                         // The first page's effect is the show opener.
-                        let effect =
-                            this.scene.pages.get(i).map(|p| p.effect).unwrap_or_default();
+                        let effect = this
+                            .scene
+                            .pages
+                            .get(i)
+                            .map(|p| p.effect)
+                            .unwrap_or_default();
                         match effect {
                             crate::scene::pages::PageEffect::Slide => {
                                 if let Some(to) = this.page_exact_camera(i, cx) {
@@ -3654,7 +3632,11 @@ impl BoardView {
         self.scene.pages.remove(i);
         // Keep the presenting index valid (page flip clamps on next use).
         if let Some(p) = self.presenting {
-            self.presenting = Some(if i < p { p - 1 } else { p.min(self.scene.pages.len().saturating_sub(1)) });
+            self.presenting = Some(if i < p {
+                p - 1
+            } else {
+                p.min(self.scene.pages.len().saturating_sub(1))
+            });
         }
         self.mark_dirty();
         self.set_notice(format!("已删除页面「{title}」（页内元素保留在画布上）"), cx);
@@ -3685,7 +3667,10 @@ impl BoardView {
         self.mark_dirty();
         let vp = self.viewport_bounds(cx);
         self.camera.zoom_to_fit(rect, vp.size);
-        self.set_notice(format!("已添加第 {number} 页「{title}」（{}）", ratio.label()), cx);
+        self.set_notice(
+            format!("已添加第 {number} 页「{title}」（{}）", ratio.label()),
+            cx,
+        );
         cx.notify();
     }
 
@@ -5269,10 +5254,10 @@ impl BoardView {
             // Border strips in world units so the frame zooms with content.
             const T: f64 = 2.5;
             let strips = [
-                WBounds::new(p.x, p.y, p.w, T),                     // top
-                WBounds::new(p.x, p.y + p.h - T, p.w, T),           // bottom
-                WBounds::new(p.x, p.y, T, p.h),                     // left
-                WBounds::new(p.x + p.w - T, p.y, T, p.h),           // right
+                WBounds::new(p.x, p.y, p.w, T),           // top
+                WBounds::new(p.x, p.y + p.h - T, p.w, T), // bottom
+                WBounds::new(p.x, p.y, T, p.h),           // left
+                WBounds::new(p.x + p.w - T, p.y, T, p.h), // right
             ];
             for s in strips {
                 page_frames.push(gpui::fill(
@@ -5687,15 +5672,14 @@ impl Render for BoardView {
         // refit (which is skipped while an anim is in flight, so the two
         // never fight); on completion the present-fit bookkeeping syncs.
         if let Some(anim) = self.page_anim {
-            let t = (anim.started.elapsed().as_millis() as f64 / anim.dur_ms as f64)
-                .clamp(0.0, 1.0);
+            let t =
+                (anim.started.elapsed().as_millis() as f64 / anim.dur_ms as f64).clamp(0.0, 1.0);
             if t >= 1.0 {
                 self.camera = anim.to;
                 self.page_anim = None;
                 if self.presenting.is_some() {
                     let vp = self.viewport_bounds(cx);
-                    self.last_present_fit =
-                        Some((vp.size.width.to_f64(), vp.size.height.to_f64()));
+                    self.last_present_fit = Some((vp.size.width.to_f64(), vp.size.height.to_f64()));
                 }
             } else {
                 let e = t * t * (3.0 - 2.0 * t); // smoothstep
@@ -6023,22 +6007,14 @@ impl Render for BoardView {
             .on_action(cx.listener(|this, _: &CheckForUpdates, _window, cx| {
                 this.check_for_updates(cx, false)
             }))
-            .on_action(
-                cx.listener(|this, _: &GotoPrevPage, _window, cx| this.goto_prev_page(cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &GotoNextPage, _window, cx| this.goto_next_page(cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &PresentStart, window, cx| {
-                    this.start_presenting(window, cx);
-                }),
-            )
-            .on_action(
-                cx.listener(|this, _: &PresentExit, window, cx| {
-                    this.exit_presenting(window, cx);
-                }),
-            )
+            .on_action(cx.listener(|this, _: &GotoPrevPage, _window, cx| this.goto_prev_page(cx)))
+            .on_action(cx.listener(|this, _: &GotoNextPage, _window, cx| this.goto_next_page(cx)))
+            .on_action(cx.listener(|this, _: &PresentStart, window, cx| {
+                this.start_presenting(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &PresentExit, window, cx| {
+                this.exit_presenting(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 this.open_settings(window, cx);
             }))
@@ -6086,8 +6062,7 @@ impl Render for BoardView {
                         };
                         let d = match self.fade_veil {
                             Some(v) => {
-                                let o =
-                                    v.opacity_at(std::time::Instant::now()).unwrap_or(0.0);
+                                let o = v.opacity_at(std::time::Instant::now()).unwrap_or(0.0);
                                 if o > 0.001 {
                                     d.child(div().absolute().inset_0().bg(gpui::black().opacity(o)))
                                 } else {
@@ -6107,16 +6082,12 @@ impl Render for BoardView {
                             .child(self.render_notice_bar())
                             .children(self.render_update_banner(cx))
                             .children(self.render_context_menu(cx))
-                            .when(self.explorer_open, |d| {
-                                d.child(self.render_explorer(cx))
-                            })
+                            .when(self.explorer_open, |d| d.child(self.render_explorer(cx)))
                             .children(self.ai_panel.clone())
                             // Settings page paints above every other chrome
                             // (AI panel included) — it's a full-area page.
-                            .when(self.settings_open, |d| {
-                                d.child(self.settings_page.clone())
-                            })
-                    })
+                            .when(self.settings_open, |d| d.child(self.settings_page.clone()))
+                    }),
             )
             // Dropdown overlay rendered last so it paints above the canvas.
             .when_some(menubar_dropdown, |d, dd| d.child(dd))
@@ -6337,7 +6308,8 @@ fn group_sessions_by_board() -> HashMap<String, Vec<SessionMeta>> {
 }
 
 /// Small text button for the explorer header (＋白板 / ＋文件夹).
-fn explorer_mini_button(id: &'static str, label: &'static str) -> Stateful<Div> {    div()
+fn explorer_mini_button(id: &'static str, label: &'static str) -> Stateful<Div> {
+    div()
         .id(id)
         .h_6()
         .px_2()
@@ -6761,11 +6733,10 @@ impl BoardView {
         if self.selection.is_empty() {
             return None;
         }
-        let mut it = self.selection.iter().filter_map(|id| {
-            self.scene
-                .get(*id)
-                .map(|el| el.style.fill_style)
-        });
+        let mut it = self
+            .selection
+            .iter()
+            .filter_map(|id| self.scene.get(*id).map(|el| el.style.fill_style));
         let first = it.next()?;
         it.all(|fs| fs == first).then_some(first)
     }
@@ -6905,8 +6876,9 @@ impl BoardView {
                 }));
             }
             bar = bar.child(row);
+        }
 
-            // 填充样式：排线（hachure 手绘线）/ 密排（近乎实心）/ 实心
+        // 填充样式：排线（hachure 手绘线）/ 密排（近乎实心）/ 实心
             // （色块）。选中或预设均可切换，作用于 shape 的 background 填充。
             // 高亮跟随**所选形状**的实际填充（整组一致时），没有选择时才
             // 回退到"最近使用"的预设样式。
@@ -6991,7 +6963,6 @@ impl BoardView {
                     );
                 }
                 bar = bar.child(br_row);
-            }
         }
 
         // Text options: font size presets + font family + alignment, shown
@@ -7230,9 +7201,7 @@ impl BoardView {
             .absolute()
             .left_3()
             // Keep the style bar clear of the left explorer panel.
-            .when(self.explorer_open, |d| {
-                d.left(px(Self::EXPLORER_W + 12.0))
-            })
+            .when(self.explorer_open, |d| d.left(px(Self::EXPLORER_W + 12.0)))
             .top_24()
             .flex()
             .when(show, |d| d.child(bar));
@@ -7917,9 +7886,7 @@ impl BoardView {
             .bottom_3()
             .left_3()
             // Keep the page bar clear of the left explorer panel.
-            .when(self.explorer_open, |d| {
-                d.left(px(Self::EXPLORER_W + 12.0))
-            })
+            .when(self.explorer_open, |d| d.left(px(Self::EXPLORER_W + 12.0)))
             .when(total == 0, |d| {
                 // No pages yet: the bar is just "add page" — flip controls
                 // and the page counter only make sense once pages exist.
@@ -7948,7 +7915,9 @@ impl BoardView {
                             .text_color(icon_color(false)),
                     )
                     .on_click(move |_, _, cx| {
-                        weak_prev.update(cx, |this, cx| this.goto_prev_page(cx)).ok();
+                        weak_prev
+                            .update(cx, |this, cx| this.goto_prev_page(cx))
+                            .ok();
                     }),
                 )
                 .child(
@@ -7968,7 +7937,9 @@ impl BoardView {
                             .text_color(icon_color(false)),
                     )
                     .on_click(move |_, _, cx| {
-                        weak_next.update(cx, |this, cx| this.goto_next_page(cx)).ok();
+                        weak_next
+                            .update(cx, |this, cx| this.goto_next_page(cx))
+                            .ok();
                     }),
                 )
                 .child(bar_button("▶", false).on_click(move |_, window, cx| {
@@ -7985,18 +7956,19 @@ impl BoardView {
                             .text_color(icon_color(false)),
                     )
                     .on_click(move |_, _, cx| {
-                        weak_add.update(cx, |this, cx| this.add_page_manual(cx)).ok();
+                        weak_add
+                            .update(cx, |this, cx| this.add_page_manual(cx))
+                            .ok();
                     }),
                 )
                 .child(
-                    bar_icon_button(
-                        "page-del",
-                        false,
-                        ic::trash(icon_color(false)),
-                    )
-                    .on_click(move |_, _, cx| {
-                        weak_del.update(cx, |this, cx| this.delete_current_page(cx)).ok();
-                    }),
+                    bar_icon_button("page-del", false, ic::trash(icon_color(false))).on_click(
+                        move |_, _, cx| {
+                            weak_del
+                                .update(cx, |this, cx| this.delete_current_page(cx))
+                                .ok();
+                        },
+                    ),
                 )
             })
     }
@@ -8091,7 +8063,8 @@ impl BoardView {
         }
     }
 
-    fn render_notice_bar(&self) -> impl IntoElement {        let mut text = String::new();
+    fn render_notice_bar(&self) -> impl IntoElement {
+        let mut text = String::new();
         if let Some(path) = &self.file_path {
             text.push_str(
                 path.file_name()
@@ -8115,9 +8088,7 @@ impl BoardView {
             // Stack above the page bar (which owns the bottom-left corner).
             .bottom(px(56.0))
             .left_3()
-            .when(self.explorer_open, |d| {
-                d.left(px(Self::EXPLORER_W + 12.0))
-            })
+            .when(self.explorer_open, |d| d.left(px(Self::EXPLORER_W + 12.0)))
             .text_xs()
             .text_color(rgb(0x888888))
             .child(text)
@@ -8235,13 +8206,15 @@ mod time_tests {
     fn now_line_has_expected_shape() {
         let line = now_line();
         assert!(line.starts_with("当前时间："), "{line}");
-        assert!(line.contains("年") && line.contains("月") && line.contains("日"), "{line}");
+        assert!(
+            line.contains("年") && line.contains("月") && line.contains("日"),
+            "{line}"
+        );
         assert!(line.contains("星期"), "{line}");
         // %-m / %-d: no leading zeros on month or day.
         assert!(!line.contains("年0"), "{line}");
     }
 }
-
 
 /// Procedural paper-grain tile: 256×256 BGRA speckle, one variant per
 /// material. Deterministic (xorshift) so the grain is stable across runs.
@@ -8278,7 +8251,11 @@ fn paper_tile(kind: PaperTexture) -> std::sync::Arc<RenderImage> {
             // 黑板：白色粉笔粉尘
             PaperTexture::Chalkboard => {
                 let lum = 0xe6;
-                let a = if v % 11 == 0 { ((v >> 8) % 34) as u8 } else { 0 };
+                let a = if v % 11 == 0 {
+                    ((v >> 8) % 34) as u8
+                } else {
+                    0
+                };
                 (lum, lum, lum, a)
             }
         };
@@ -8288,11 +8265,10 @@ fn paper_tile(kind: PaperTexture) -> std::sync::Arc<RenderImage> {
         buf[o + 2] = r;
         buf[o + 3] = a;
     }
-    let image = image::RgbaImage::from_raw(N as u32, N as u32, buf)
-        .expect("paper tile buffer size");
+    let image =
+        image::RgbaImage::from_raw(N as u32, N as u32, buf).expect("paper tile buffer size");
     std::sync::Arc::new(RenderImage::new(vec![image::Frame::new(image)]))
 }
-
 
 fn pen_brush_visible(board: &BoardView) -> bool {
     board.tool == ActiveTool::Pen

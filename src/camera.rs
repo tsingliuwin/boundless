@@ -85,7 +85,11 @@ impl Camera {
     /// Fit the world rect exactly (no margin): the rect fills the viewport
     /// edge to edge. The presentation view for one slide page — neighbors sit
     /// beyond the page gap, so nothing else leaks into the frame.
-    pub fn zoom_to_rect_exact(&mut self, bounds: crate::scene::WBounds, viewport: gpui::Size<Pixels>) {
+    pub fn zoom_to_rect_exact(
+        &mut self,
+        bounds: crate::scene::WBounds,
+        viewport: gpui::Size<Pixels>,
+    ) {
         if bounds.w <= 0.0 || bounds.h <= 0.0 {
             return;
         }

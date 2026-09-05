@@ -108,7 +108,13 @@ fn is_cjk(c: char) -> bool {
 /// factors are cheaper than a wrapped line.
 pub fn estimate_text_width(text: &str, font_size: f64) -> f64 {
     text.chars()
-        .map(|c| if is_cjk(c) { font_size * 1.1 } else { font_size * 0.62 })
+        .map(|c| {
+            if is_cjk(c) {
+                font_size * 1.1
+            } else {
+                font_size * 0.62
+            }
+        })
         .sum()
 }
 
@@ -119,7 +125,10 @@ pub fn estimate_text_width(text: &str, font_size: f64) -> f64 {
 fn node_size(text: &str, level: usize, scale: f64) -> (f64, f64) {
     let fs = font_size_for_level(level) * scale;
     let w = estimate_text_width(text, fs) + PAD_X * 2.0 * scale + 6.0 * scale;
-    (w.max(fs * 2.0), fs * crate::scene::LINE_HEIGHT + PAD_Y * scale)
+    (
+        w.max(fs * 2.0),
+        fs * crate::scene::LINE_HEIGHT + PAD_Y * scale,
+    )
 }
 
 /// A laid-out node: box, level, and branch colors (the root carries its own).
@@ -221,11 +230,8 @@ fn layout_at(root: &MindmapNodeInput, center: WPoint, scale: f64) -> MindmapLayo
             left_weight += w;
         }
     }
-    let right: Vec<(&MindmapNodeInput, usize)> = right
-        .into_iter()
-        .enumerate()
-        .map(|(i, c)| (c, i))
-        .collect();
+    let right: Vec<(&MindmapNodeInput, usize)> =
+        right.into_iter().enumerate().map(|(i, c)| (c, i)).collect();
     let left: Vec<(&MindmapNodeInput, usize)> = left
         .into_iter()
         .enumerate()
@@ -235,15 +241,27 @@ fn layout_at(root: &MindmapNodeInput, center: WPoint, scale: f64) -> MindmapLayo
     // Right wing: children column starts right of the root box.
     let mut right_bounds = Vec::new();
     layout_wing(
-        &right, 1.0, root_bounds.right() + hgap, center.y, scale,
-        &mut nodes, &mut links, &mut right_bounds,
+        &right,
+        1.0,
+        root_bounds.right() + hgap,
+        center.y,
+        scale,
+        &mut nodes,
+        &mut links,
+        &mut right_bounds,
     );
     // Left wing mirrored: its widest column ends at the root's left edge.
     let left_w = wing_width(&left, scale);
     let mut left_bounds = Vec::new();
     layout_wing(
-        &left, -1.0, root_bounds.x - hgap - left_w, center.y, scale,
-        &mut nodes, &mut links, &mut left_bounds,
+        &left,
+        -1.0,
+        root_bounds.x - hgap - left_w,
+        center.y,
+        scale,
+        &mut nodes,
+        &mut links,
+        &mut left_bounds,
     );
 
     // Root links: exits track each branch's height along the root's side
@@ -340,18 +358,9 @@ fn layout_at(root: &MindmapNodeInput, center: WPoint, scale: f64) -> MindmapLayo
 fn s_curve(start: WPoint, end: WPoint) -> Vec<WPoint> {
     let mx = (start.x + end.x) / 2.0;
     if (start.y - end.y).abs() < 1e-9 {
-        return vec![
-            start,
-            WPoint::new(mx, start.y),
-            end,
-        ];
+        return vec![start, WPoint::new(mx, start.y), end];
     }
-    vec![
-        start,
-        WPoint::new(mx, start.y),
-        WPoint::new(mx, end.y),
-        end,
-    ]
+    vec![start, WPoint::new(mx, start.y), WPoint::new(mx, end.y), end]
 }
 
 /// Link exit points along a node's vertical edge: each exit tracks its
@@ -472,9 +481,7 @@ fn layout_wing(
     let mut y = center_y - total_h / 2.0;
     for (i, (sub, branch)) in wing.iter().enumerate() {
         let h = heights[i];
-        let b = place_subtree(
-            sub, 1, *branch, dir, x, y, y + h, scale, nodes, links,
-        );
+        let b = place_subtree(sub, 1, *branch, dir, x, y, y + h, scale, nodes, links);
         wing_bounds.push(b);
         y += h + vgap;
     }
@@ -529,8 +536,8 @@ fn place_subtree(
         .iter()
         .map(|c| subtree_height(c, level + 1, scale))
         .collect();
-    let child_total: f64 = child_heights.iter().sum::<f64>()
-        + (node.children.len() as f64 - 1.0) * vgap;
+    let child_total: f64 =
+        child_heights.iter().sum::<f64>() + (node.children.len() as f64 - 1.0) * vgap;
     let band_center = (band_top + band_bottom) / 2.0;
     let child_top = (band_center - child_total / 2.0)
         .max(band_top)
@@ -559,16 +566,19 @@ fn place_subtree(
     let cy = (first.y + first.h / 2.0 + last.y + last.h / 2.0) / 2.0;
     let bounds = WBounds::new(x.min(x + dir * w), cy - h / 2.0, w, h);
     // One exit per child, tracking its height along this node's edge.
-    let child_cys: Vec<f64> = child_bounds
-        .iter()
-        .map(|cb| cb.y + cb.h / 2.0)
-        .collect();
+    let child_cys: Vec<f64> = child_bounds.iter().map(|cb| cb.y + cb.h / 2.0).collect();
     let ys = exit_ys(&bounds, &child_cys);
     for (i, cb) in child_bounds.iter().enumerate() {
         let (start, end) = if dir > 0.0 {
-            (WPoint::new(bounds.right(), ys[i]), WPoint::new(cb.x, child_cys[i]))
+            (
+                WPoint::new(bounds.right(), ys[i]),
+                WPoint::new(cb.x, child_cys[i]),
+            )
         } else {
-            (WPoint::new(bounds.x, ys[i]), WPoint::new(cb.right(), child_cys[i]))
+            (
+                WPoint::new(bounds.x, ys[i]),
+                WPoint::new(cb.right(), child_cys[i]),
+            )
         };
         links.push(LinkSpec {
             points: s_curve(start, end),
@@ -669,8 +679,14 @@ mod tests {
     fn branches_split_both_sides() {
         let l = layout(&sample_tree(), WPoint::new(800.0, 500.0));
         let root_cx = l.nodes[0].center().x;
-        let right = l.nodes[1..].iter().filter(|n| n.center().x > root_cx).count();
-        let left = l.nodes[1..].iter().filter(|n| n.center().x < root_cx).count();
+        let right = l.nodes[1..]
+            .iter()
+            .filter(|n| n.center().x > root_cx)
+            .count();
+        let left = l.nodes[1..]
+            .iter()
+            .filter(|n| n.center().x < root_cx)
+            .count();
         assert!(right >= 4, "right wing too small: {right}");
         assert!(left >= 4, "left wing too small: {left}");
     }
@@ -684,7 +700,10 @@ mod tests {
             // in-range child (horizontal link).
             assert!(link.points.len() == 4 || link.points.len() == 3);
             let (a, b) = (link.points[0], *link.points.last().unwrap());
-            assert!((a.x - b.x).abs() >= HGAP - 1.0, "link too short: {a:?}→{b:?}");
+            assert!(
+                (a.x - b.x).abs() >= HGAP - 1.0,
+                "link too short: {a:?}→{b:?}"
+            );
         }
     }
 
@@ -693,8 +712,14 @@ mod tests {
         let l = layout(&sample_tree(), WPoint::new(800.0, 500.0));
         for i in 0..l.links.len() {
             for j in i + 1..l.links.len() {
-                let a = (&l.links[i].points[0], &l.links[i].points[l.links[i].points.len() - 1]);
-                let b = (&l.links[j].points[0], &l.links[j].points[l.links[j].points.len() - 1]);
+                let a = (
+                    &l.links[i].points[0],
+                    &l.links[i].points[l.links[i].points.len() - 1],
+                );
+                let b = (
+                    &l.links[j].points[0],
+                    &l.links[j].points[l.links[j].points.len() - 1],
+                );
                 // T-junctions and shared endpoints are legitimate (bundled
                 // trunks); only interior×interior passages count.
                 assert!(

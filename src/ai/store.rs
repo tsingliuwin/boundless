@@ -117,8 +117,12 @@ fn append_message_in(
         let header = SessionHeader {
             board: board.to_string(),
         };
-        writeln!(file, "{}", serde_json::to_string(&header).context("序列化会话头失败")?)
-            .context("写入会话头失败")?;
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&header).context("序列化会话头失败")?
+        )
+        .context("写入会话头失败")?;
     }
     let line = serde_json::to_string(msg).context("序列化消息失败")?;
     writeln!(file, "{line}").context("写入会话文件失败")?;
@@ -366,8 +370,13 @@ mod tests {
         // A session started with a board open: header on first append,
         // binding survives reload, header line is not a message.
         let id = create_session();
-        append_message_in(&dir, &id, &ChatMessage::user("你好"), Some("docs/计划.boundless"))
-            .unwrap();
+        append_message_in(
+            &dir,
+            &id,
+            &ChatMessage::user("你好"),
+            Some("docs/计划.boundless"),
+        )
+        .unwrap();
         append_message_in(&dir, &id, &ChatMessage::assistant("好的"), None).unwrap();
         let sessions = list_sessions_in(&dir);
         assert_eq!(sessions.len(), 1);
@@ -388,10 +397,21 @@ mod tests {
     fn rebind_session_boards_updates_headers() {
         let dir = temp_chat_dir();
         let a = create_session();
-        append_message_in(&dir, &a, &ChatMessage::user("第一条"), Some("旧文件夹/板.boundless"))
-            .unwrap();
+        append_message_in(
+            &dir,
+            &a,
+            &ChatMessage::user("第一条"),
+            Some("旧文件夹/板.boundless"),
+        )
+        .unwrap();
         let b = create_session();
-        append_message_in(&dir, &b, &ChatMessage::user("第二条"), Some("别处.boundless")).unwrap();
+        append_message_in(
+            &dir,
+            &b,
+            &ChatMessage::user("第二条"),
+            Some("别处.boundless"),
+        )
+        .unwrap();
 
         // Folder rename with prefix: matching sessions (and only those)
         // follow the new path.
@@ -407,7 +427,12 @@ mod tests {
         assert_eq!(msgs[0].content, "第一条");
 
         // Exact board rename.
-        rebind_session_boards_in(&dir, "新文件夹/板.boundless", "新文件夹/改名.boundless", false);
+        rebind_session_boards_in(
+            &dir,
+            "新文件夹/板.boundless",
+            "新文件夹/改名.boundless",
+            false,
+        );
         let sessions = list_sessions_in(&dir);
         let sa = sessions.iter().find(|s| s.id == a).unwrap();
         assert_eq!(sa.board.as_deref(), Some("新文件夹/改名.boundless"));

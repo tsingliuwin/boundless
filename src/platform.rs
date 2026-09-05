@@ -315,7 +315,11 @@ unsafe extern "system" fn unhandled_exception_filter(
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_default()
         .join("native-crash.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         use std::io::Write;
         let _ = f.write_all(line.as_bytes());
     }

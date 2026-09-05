@@ -10,6 +10,8 @@ fn main() {
         let rc = "assets/icon.rc";
         println!("cargo:rerun-if-changed={rc}");
         println!("cargo:rerun-if-changed=assets/icon.ico");
-        embed_resource::compile(rc, embed_resource::NONE).manifest_optional().ok();
+        embed_resource::compile(rc, embed_resource::NONE)
+            .manifest_optional()
+            .ok();
     }
 }
