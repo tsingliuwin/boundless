@@ -10,10 +10,10 @@
 
 use boundless::board::{
     ArrowTool, BoardView, BringForward, BringToFront, CancelOp, CheckForUpdates, DeleteSelection,
-    DiamondTool, EllipseTool, EraserTool, GotoNextPage, GotoPrevPage, HandTool, LineTool,
-    OpenScene, OpenSettings, PenTool, PresentExit, PresentStart, Quit, RectTool, Redo, SaveScene,
-    SelectTool, SendBackward, SendToBack, TextTool, ToggleAi, ToggleExplorer, Undo, ZoomIn,
-    ZoomOut, ZoomReset,
+    DiamondTool, EllipseTool, EraserTool, GotoNextPage, GotoPrevPage, HandTool, InsertImage,
+    LineTool, OpenScene, OpenSettings, PasteImage, PenTool, PresentExit, PresentStart, Quit,
+    RectTool, Redo, SaveScene, SelectTool, SendBackward, SendToBack, TextTool, ToggleAi,
+    ToggleExplorer, Undo, ZoomIn, ZoomOut, ZoomReset,
 };
 use gpui::*;
 use gpui_component::Root;
@@ -128,6 +128,11 @@ fn main() {
                 KeyBinding::new("ctrl-y", Redo, Some("Board")),
                 KeyBinding::new("ctrl-s", SaveScene, Some("Board")),
                 KeyBinding::new("ctrl-o", OpenScene, Some("Board")),
+                // 插入图片：文件对话框。粘贴（cmd-v / ctrl-v）在剪贴板是
+                // 图片时也能嵌入；两者都限定 CANVAS 上下文，不影响输入框。
+                KeyBinding::new("ctrl-i", InsertImage, Some(CANVAS)),
+                KeyBinding::new("cmd-v", PasteImage, Some(CANVAS)),
+                KeyBinding::new("ctrl-v", PasteImage, Some(CANVAS)),
                 KeyBinding::new("delete", DeleteSelection, Some(CANVAS)),
                 KeyBinding::new("backspace", DeleteSelection, Some(CANVAS)),
                 KeyBinding::new("escape", CancelOp, Some(CANVAS)),
@@ -188,6 +193,7 @@ fn main() {
                     items: vec![
                         MenuItem::action("打开场景…", OpenScene),
                         MenuItem::action("保存场景", SaveScene),
+                        MenuItem::action("插入图片…", InsertImage),
                     ],
                 },
                 Menu {

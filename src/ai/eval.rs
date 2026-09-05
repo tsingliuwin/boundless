@@ -354,6 +354,43 @@ pub fn apply(
             c.ops_applied += 1;
             msg = format!("已添加多边形 id={id8}");
         }
+        CanvasOp::AddImage {
+            path,
+            x,
+            y,
+            width,
+        } => {
+            // The virtual canvas can't decode pixels; it reserves the layout
+            // box so later ops (and overlap checks) see the image. Height
+            // guesses 4:3 unless the file's real dimensions are readable.
+            let (iw, ih) = image::image_dimensions(std::path::Path::new(path))
+                .map(|(w, h)| (w.max(1) as f64, h.max(1) as f64))
+                .unwrap_or((4.0, 3.0));
+            let w = width.unwrap_or(320.0).clamp(20.0, 4000.0);
+            let h = w * ih / iw;
+            let x = x.unwrap_or(800.0 - w / 2.0);
+            let y = y.unwrap_or(500.0 - h / 2.0);
+            let id = assigned_id
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("img{}", c.elements.len()));
+            let id8 = id[..id.len().min(8)].to_string();
+            c.elements.push(VirtualElement {
+                id,
+                kind: "image",
+                x,
+                y,
+                w,
+                h,
+                text: None,
+                font_size: 0.0,
+                stroke: 0x1e1e1e,
+                fill: None,
+                opacity: 1.0,
+                points: None,
+            });
+            c.ops_applied += 1;
+            msg = format!("已添加图片 id={id8}");
+        }
         CanvasOp::Diamond {
             x,
             y,

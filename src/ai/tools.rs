@@ -1087,6 +1087,79 @@ impl Tool for PolygonTool {
 
 // --- Smooth Shape ----------------------------------------------------------
 
+/// Arguments for the add-image tool.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct AddImageArgs {
+    /// Absolute path of the image file (PNG/JPEG/GIF/WebP/BMP). The file is
+    /// copied into the workspace asset store — the board keeps working even
+    /// if the original is moved or deleted.
+    pub path: String,
+    /// Left edge in world coordinates. Omit = centered on the current view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x: Option<f64>,
+    /// Top edge in world coordinates. Omit = centered on the current view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<f64>,
+    /// Display width in world units (20~4000); height follows the aspect
+    /// ratio. Omit = 320.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<f64>,
+}
+
+/// Embed a raster image onto the canvas (插画 / 照片 / 贴图素材).
+pub struct AddImageTool {
+    pub events: UnboundedSender<AgentEvent>,
+}
+
+impl Tool for AddImageTool {
+    const NAME: &'static str = "add_image";
+    type Error = ToolError;
+    type Args = AddImageArgs;
+    type Output = String;
+
+    fn definition(
+        &self,
+        _prompt: String,
+    ) -> impl std::future::Future<Output = ToolDefinition> + Send {
+        let def = tool_def::<AddImageArgs>(
+            Self::NAME,
+            "把一张图片嵌入画布（PNG/JPEG/GIF/WebP/BMP）。给出文件绝对路径；width 控制显示宽度（高度按比例自动求出）。适合插画、照片、贴图素材。",
+        );
+        async move { def }
+    }
+
+    fn call(
+        &self,
+        args: Self::Args,
+    ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
+        let events = self.events.clone();
+        let name = Self::NAME;
+        async move {
+            let id = next_tool_id(name);
+            let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
+            if let Some(w) = args.width {
+                if !(20.0..=4000.0).contains(&w) {
+                    return fail_tool(
+                        &events,
+                        id,
+                        name,
+                        args_json,
+                        ToolError::invalid_args("width 需在 20~4000 之间"),
+                    )
+                    .await;
+                }
+            }
+            let op = CanvasOp::AddImage {
+                path: args.path,
+                x: args.x,
+                y: args.y,
+                width: args.width,
+            };
+            run_canvas_op(&events, id, name, args_json, op, Some(new_element_id())).await
+        }
+    }
+}
+
 /// Arguments for `draw_smooth_shape`.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SmoothShapeArgs {
@@ -1642,6 +1715,9 @@ pub fn all_tools(
             events: events.clone(),
         }),
         Box::new(PolygonTool {
+            events: events.clone(),
+        }),
+        Box::new(AddImageTool {
             events: events.clone(),
         }),
         Box::new(SmoothShapeTool {

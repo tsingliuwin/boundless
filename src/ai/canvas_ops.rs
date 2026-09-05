@@ -109,6 +109,14 @@ pub struct CanvasStyle {
     /// Fill line angle in degrees (default -41). Omit = preset value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hachure_angle: Option<f64>,
+    /// 飞白断续密度：主笔保留的采样点比例 0.05~0.95。越小越破碎（枯笔
+    /// 飞白），越大越连贯。Omit = 0.67（9 点保 6）。仅对飞白笔迹生效。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dry_density: Option<f64>,
+    /// 飞白主笔宽度系数（× stroke_width）0.2~2.0。Omit = 0.5。仅对飞白
+    /// 笔迹生效。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dry_width: Option<f64>,
     /// Draw a soft hand-drawn hachure shadow under the shape (offset from
     /// the outline). `false` removes an existing shadow. Omit = keep.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -227,6 +235,26 @@ pub enum CanvasOp {
     },
     /// Delete an element by id (also removes its bound label, if any).
     DeleteElement { id: String },
+    /// Embed a raster image (PNG/JPEG/GIF/WebP/BMP) onto the canvas. The
+    /// file is COPIED into the workspace asset store, so later moves or
+    /// deletes of the original never break the board. Height derives from
+    /// the image's aspect ratio; the tool result reports the final box.
+    AddImage {
+        /// Absolute path of the image file on disk. Required.
+        path: String,
+        /// Left edge in world coordinates. Omit = horizontally centered on
+        /// the current view.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        x: Option<f64>,
+        /// Top edge in world coordinates. Omit = vertically centered on the
+        /// current view.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        y: Option<f64>,
+        /// Display width in world units (20~4000). Height follows the
+        /// aspect ratio. Omit = 320.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        width: Option<f64>,
+    },
     /// Delete every element on the canvas (clear it for a fresh start).
     Clear,
     /// Closed polygon through the given absolute points (≥3) — irregular
@@ -490,6 +518,7 @@ impl CanvasOp {
             CanvasOp::Line { .. } => "直线",
             CanvasOp::Arrow { .. } => "箭头",
             CanvasOp::Polygon { .. } => "多边形",
+            CanvasOp::AddImage { .. } => "图片",
             CanvasOp::Text { .. } => "文本",
             CanvasOp::UpdateElement { .. } => "修改",
             CanvasOp::DeleteElement { .. } => "删除",
@@ -536,6 +565,20 @@ impl CanvasStyle {
                         "fill #{c:06x} 是高饱和刺眼色，已拒绝。大面积填充请用主色的浅色调（蓝 0xE7F0FF / 绿 0xE6F4EA / 紫 0xEDE6FD），或白底 + 主色描边；洋红、纯红、荧光色禁止用作填充"
                     ));
                 }
+            }
+        }
+        if let Some(v) = self.dry_density {
+            if !(0.05..=0.95).contains(&v) {
+                return Err(format!(
+                    "dry_density {v} 超出范围 0.05~0.95（主笔保留比例）"
+                ));
+            }
+        }
+        if let Some(v) = self.dry_width {
+            if !(0.2..=2.0).contains(&v) {
+                return Err(format!(
+                    "dry_width {v} 超出范围 0.2~2.0（× stroke_width）"
+                ));
             }
         }
         Ok(())
@@ -591,6 +634,12 @@ impl CanvasStyle {
         }
         if let Some(v) = self.hachure_angle {
             out.hachure_angle = Some(v);
+        }
+        if let Some(v) = self.dry_density {
+            out.dry_density = Some(v);
+        }
+        if let Some(v) = self.dry_width {
+            out.dry_width = Some(v);
         }
         match self.shadow {
             Some(on) => {

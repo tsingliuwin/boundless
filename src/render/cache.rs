@@ -138,7 +138,13 @@ fn fingerprint_into(h: &mut Fnv, el: &Element) {
         Some(crate::scene::Brush::Pencil) => 2,
         Some(crate::scene::Brush::DryBrush) => 3,
     });
-    for v in [s.hachure_gap, s.fill_weight, s.hachure_angle] {
+    for v in [
+        s.hachure_gap,
+        s.fill_weight,
+        s.hachure_angle,
+        s.dry_density,
+        s.dry_width,
+    ] {
         match v {
             Some(x) => {
                 h.write_bool(true);
@@ -177,6 +183,10 @@ fn fingerprint_into(h: &mut Fnv, el: &Element) {
             h.write_u64(8);
             h.write_bool(*smooth);
             hash_points(h, points);
+        }
+        ElementKind::Image { asset } => {
+            h.write_u64(9);
+            h.write_str(asset);
         }
         ElementKind::Text {
             text,

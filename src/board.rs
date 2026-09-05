@@ -69,6 +69,10 @@ actions!(
         PresentExit,
         OpenSettings,
         ToggleExplorer,
+        /// 插入图片：打开文件对话框选择 PNG/JPEG 等并嵌入当前画布。
+        InsertImage,
+        /// 粘贴：剪贴板为图片时嵌入画布；为图片文件路径时嵌入该文件。
+        PasteImage,
     ]
 );
 
@@ -258,6 +262,10 @@ pub struct BoardView {
     canvas_texture: Option<PaperTexture>,
     /// Precomputed 256×256 BGRA noise tiles, one per material.
     paper_tiles: [Arc<RenderImage>; 3],
+    /// Decoded image elements, keyed by asset file name. Filled lazily at
+    /// paint time (first paint decodes synchronously; afterwards it's a map
+    /// hit). RefCell: build_paint only has &self.
+    image_cache: std::cell::RefCell<HashMap<String, Arc<RenderImage>>>,
     /// Page index to bring the camera to on the next render frame. Set when
     /// the AI **switches pages**: an op landing on a different page than the
     /// AI's previous one moves the camera there (watching each slide being
@@ -406,6 +414,7 @@ impl BoardView {
                 paper_tile(PaperTexture::Kraft),
                 paper_tile(PaperTexture::Chalkboard),
             ],
+            image_cache: std::cell::RefCell::new(HashMap::new()),
             pending_page_focus: None,
             ai_focus_page: None,
             page_anim: None,
@@ -1106,6 +1115,52 @@ impl BoardView {
                 }
                 Ok(format!("已添加多边形 id={}", &added.to_string()[..8]))
             }
+            CanvasOp::AddImage {
+                path,
+                x,
+                y,
+                width,
+            } => {
+                let p = std::path::PathBuf::from(&path);
+                let bytes = std::fs::read(&p).map_err(|e| {
+                    CanvasOpError::invalid_args(format!("读取图片失败 {}: {e}", p.display()))
+                })?;
+                let decoded = image::load_from_memory(&bytes)
+                    .map_err(|e| CanvasOpError::invalid_args(format!("图片解码失败: {e}")))?;
+                let (iw, ih) =
+                    (decoded.width().max(1) as f64, decoded.height().max(1) as f64);
+                let ext = p
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("png")
+                    .to_string();
+                let asset = self.store_image_asset(&bytes, &ext).map_err(|e| {
+                    CanvasOpError::internal(format!("写入图片资源失败: {e}"))
+                })?;
+                let w = width.unwrap_or(320.0).clamp(20.0, 4000.0);
+                let h = w * ih / iw;
+                let vis = self.visible_world_bounds();
+                let x = x.unwrap_or(vis.center().x - w / 2.0);
+                let y = y.unwrap_or(vis.center().y - h / 2.0);
+                self.history.record(&self.scene);
+                let el = Element::new_with_id(
+                    pre_assigned_id.unwrap_or_else(uuid::Uuid::new_v4),
+                    ElementKind::Image { asset },
+                    WBounds::new(x, y, w, h),
+                    ElementStyle::default(),
+                );
+                let added = self.scene.add(el);
+                Ok(format!(
+                    "已添加图片 id={} 显示 {}×{} 世界单位（原始 {}×{}px），位置 ({:.0},{:.0})",
+                    &added.to_string()[..8],
+                    w as i64,
+                    h as i64,
+                    iw as i64,
+                    ih as i64,
+                    x,
+                    y
+                ))
+            }
             CanvasOp::Diamond {
                 x,
                 y,
@@ -1750,6 +1805,7 @@ impl BoardView {
                     ElementKind::Text { text, .. } => ("text", Some(text.clone())),
                     ElementKind::Freedraw { .. } => ("freedraw", None),
                     ElementKind::Polygon { .. } => ("polygon", None),
+                    ElementKind::Image { asset } => ("image", Some(asset.clone())),
                 };
                 ElementSnapshot {
                     id: el.id.to_string()[..8].to_string(),
@@ -2361,6 +2417,173 @@ impl BoardView {
     /// workspace is the save location by design; moving/renaming files
     /// happens in the OS, and the classic 打开 dialog still accepts any
     /// path for opening.
+    // ------------------------------------------------------------------
+    // embedded images (图片元素：粘贴 / 插入文件 / agent add_image 共用)
+    // ------------------------------------------------------------------
+
+    /// Workspace asset store for embedded images: `<root>/.boundless/assets/`.
+    fn asset_dir(&self) -> PathBuf {
+        self.workspace.data_dir().join("assets")
+    }
+
+    /// Decode + cache an asset by file name. The first paint of an asset
+    /// decodes synchronously; afterwards it's a cache hit.
+    fn load_image_asset(&self, name: &str) -> Option<Arc<RenderImage>> {
+        if let Some(img) = self.image_cache.borrow().get(name) {
+            return Some(img.clone());
+        }
+        let bytes = std::fs::read(self.asset_dir().join(name)).ok()?;
+        // RenderImage frames are RGBA; image::open covers png/jpeg/gif/webp.
+        let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+        let render = Arc::new(RenderImage::new(vec![image::Frame::new(img)]));
+        self.image_cache
+            .borrow_mut()
+            .insert(name.to_string(), render.clone());
+        Some(render)
+    }
+
+    /// Store raw image bytes in the asset store under a fresh unique name
+    /// (`img-<uuid>.<ext>`), so the board survives moving/deleting the
+    /// original file.
+    fn store_image_asset(&self, bytes: &[u8], ext: &str) -> std::io::Result<String> {
+        let dir = self.asset_dir();
+        std::fs::create_dir_all(&dir)?;
+        let name = format!("img-{}.{}", uuid::Uuid::new_v4(), ext.trim_start_matches('.'));
+        std::fs::write(dir.join(&name), bytes)?;
+        Ok(name)
+    }
+
+    /// Embed an image from raw bytes: stores the asset and adds an Image
+    /// element centered in the current viewport, scaled down (aspect kept)
+    /// to at most ~45% of the visible world extent, never upscaled.
+    fn insert_image_bytes(
+        &mut self,
+        bytes: &[u8],
+        ext: &str,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<ElementId> {
+        let decoded =
+            image::load_from_memory(bytes).map_err(|e| anyhow::anyhow!("图片解码失败: {e}"))?;
+        let (iw, ih) = (decoded.width().max(1) as f64, decoded.height().max(1) as f64);
+        let asset = self
+            .store_image_asset(bytes, ext)
+            .map_err(|e| anyhow::anyhow!("写入图片资源失败: {e}"))?;
+
+        let vis = self.visible_world_bounds();
+        let k = ((vis.w * 0.45) / iw).min((vis.h * 0.45) / ih).min(1.0);
+        let (w, h) = (iw * k, ih * k);
+        let x = vis.center().x - w / 2.0;
+        let y = vis.center().y - h / 2.0;
+
+        self.history.record(&self.scene);
+        let el = Element::new(
+            ElementKind::Image { asset },
+            WBounds::new(x, y, w, h),
+            ElementStyle::default(),
+        );
+        let id = el.id;
+        self.scene.add(el);
+        self.selection = vec![id];
+        self.mark_dirty();
+        cx.notify();
+        Ok(id)
+    }
+
+    /// Insert from a file on disk (文件对话框与 agent add_image 共用)。
+    fn insert_image_file(&mut self, path: &Path, cx: &mut Context<Self>) -> anyhow::Result<ElementId> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| anyhow::anyhow!("读取图片失败 {}: {e}", path.display()))?;
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("png")
+            .to_string();
+        self.insert_image_bytes(&bytes, &ext, cx)
+    }
+
+    /// World-space rect of the visible canvas (with a small margin), shared
+    /// by zoom-reset fitting and image insertion placement.
+    fn visible_world_bounds(&self) -> WBounds {
+        let origin = self.canvas_origin();
+        let vp = self.canvas_bounds.size;
+        let tl = self.camera.screen_to_world(point(origin.x, origin.y), origin);
+        let br = self
+            .camera
+            .screen_to_world(point(origin.x + vp.width, origin.y + vp.height), origin);
+        WBounds::from_corners(tl, br)
+    }
+
+    /// 插入图片：文件对话框选择后嵌入当前画布。
+    fn insert_image_via_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_editing(window, cx);
+        // Same rule as `open`: the picker runs in a detached task so the
+        // modal loop never pumps tasks while an entity borrow is held.
+        cx.spawn(async move |this, cx| {
+            let dialog = rfd::FileDialog::new().add_filter(
+                "图片",
+                &["png", "jpg", "jpeg", "gif", "webp", "bmp"],
+            );
+            if let Some(path) = dialog.pick_file() {
+                this.update(cx, |this, cx| {
+                    if let Err(e) = this.insert_image_file(&path, cx) {
+                        eprintln!("[image] 插入失败: {e}");
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// 粘贴：剪贴板是图片（截图/复制的图像）时嵌入画布；是文本且恰好是
+    /// 一个存在的图片文件路径时，嵌入该文件。其余情况忽略（文本粘贴属于
+    /// 文本编辑器）。
+    fn paste_image(&mut self, cx: &mut Context<Self>) {
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+        for entry in item.entries() {
+            match entry {
+                ClipboardEntry::Image(img) => {
+                    let ext = match img.format {
+                        ImageFormat::Png => "png",
+                        ImageFormat::Jpeg => "jpg",
+                        ImageFormat::Gif => "gif",
+                        ImageFormat::Webp => "webp",
+                        ImageFormat::Bmp => "bmp",
+                        _ => "png",
+                    };
+                    if let Err(e) = self.insert_image_bytes(&img.bytes, ext, cx) {
+                        eprintln!("[image] 粘贴失败: {e}");
+                    }
+                    return;
+                }
+                ClipboardEntry::String(s) => {
+                    let t = s.text().trim();
+                    if !t.is_empty() && t.starts_with('/') {
+                        let path = PathBuf::from(t);
+                        let is_img = path
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .map(|e| {
+                                matches!(
+                                    e.to_ascii_lowercase().as_str(),
+                                    "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+                                )
+                            })
+                            .unwrap_or(false);
+                        if is_img && path.is_file() {
+                            if let Err(e) = self.insert_image_file(&path, cx) {
+                                eprintln!("[image] 粘贴失败: {e}");
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn save(&mut self, cx: &mut Context<Self>) {
         let path = match self.file_path.clone() {
             Some(path) => path,
@@ -5200,11 +5423,21 @@ struct BoardPaint {
     page_frames: Vec<PaintQuad>,
     page_labels: Vec<TextPaintItem>,
     paths: Vec<ReadyPath>,
+    /// Embedded images (Image elements), painted under the vector paths.
+    images: Vec<ImagePaintItem>,
     texts: Vec<TextPaintItem>,
     editing: Option<EditingPaint>,
     selection_outline: Option<PaintQuad>,
     handles: Vec<PaintQuad>,
     marquee: Option<PaintQuad>,
+}
+
+/// One image element ready to paint: screen-space display rect + the decoded
+/// asset. The image fills the rect exactly (aspect is baked into the
+/// element's world bounds at insert time).
+struct ImagePaintItem {
+    bounds: Bounds<Pixels>,
+    image: Arc<RenderImage>,
 }
 
 impl BoardView {
@@ -5301,6 +5534,7 @@ impl BoardView {
 
         let editing_id = self.editing.as_ref().map(|e| e.element_id);
         let mut paths = Vec::new();
+        let mut images = Vec::new();
         let mut texts = Vec::new();
 
         for el in &self.scene.elements {
@@ -5345,6 +5579,25 @@ impl BoardView {
                         bounds: screen_bounds,
                         background: bg,
                     });
+                }
+                ElementKind::Image { asset } => {
+                    // Decode lazily (first paint of a given asset); failures
+                    // degrade to a skipped element rather than blocking paint.
+                    if let Some(img) = self.load_image_asset(asset) {
+                        let screen_origin = self
+                            .camera
+                            .world_to_screen(WPoint::new(el.bounds.x, el.bounds.y), origin);
+                        images.push(ImagePaintItem {
+                            bounds: Bounds {
+                                origin: screen_origin,
+                                size: size(
+                                    self.camera.scale(el.bounds.w.max(0.5)),
+                                    self.camera.scale(el.bounds.h.max(0.5)),
+                                ),
+                            },
+                            image: img,
+                        });
+                    }
                 }
                 _ => {
                     let geom = self.render_cache.geometry(el);
@@ -5501,6 +5754,7 @@ impl BoardView {
             page_frames,
             page_labels,
             paths,
+            images,
             texts,
             editing,
             selection_outline,
@@ -5870,6 +6124,17 @@ impl Render for BoardView {
                     for item in &paint.page_labels {
                         paint_text_item(item, window, cx);
                     }
+                    // Embedded images: under the vector ink (a flat layer —
+                    // z-order actions reorder images among themselves only).
+                    for item in &paint.images {
+                        let _ = window.paint_image(
+                            item.bounds,
+                            gpui::Corners::all(px(0.0)),
+                            item.image.clone(),
+                            0,
+                            false,
+                        );
+                    }
                     for rp in paint.paths {
                         window.paint_path(rp.path, rp.color);
                     }
@@ -6020,6 +6285,12 @@ impl Render for BoardView {
             }))
             .on_action(cx.listener(|this, _: &ToggleExplorer, _window, cx| {
                 this.toggle_explorer(cx);
+            }))
+            .on_action(cx.listener(|this, _: &InsertImage, window, cx| {
+                this.insert_image_via_dialog(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &PasteImage, _window, cx| {
+                this.paste_image(cx);
             }))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_left_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_down))
@@ -6644,6 +6915,18 @@ impl BoardView {
             );
         }
 
+        // 插入图片（非工具：点击弹出文件对话框，图片作为元素嵌入画布）。
+        let weak_img = weak.clone();
+        bar = bar.child(
+            bar_icon_button("图片", false, ic::image(icon_color(false))).on_click(
+                move |_, window, cx| {
+                    weak_img
+                        .update(cx, |this, cx| this.insert_image_via_dialog(window, cx))
+                        .ok();
+                },
+            ),
+        );
+
         let weak_undo = weak.clone();
         let weak_redo = weak.clone();
         let weak_save = weak.clone();
@@ -7244,6 +7527,7 @@ impl BoardView {
             ElementKind::Text { .. } => "文本",
             ElementKind::Freedraw { .. } => "手绘",
             ElementKind::Polygon { .. } => "多边形",
+            ElementKind::Image { .. } => "图片",
         };
         let short_id = &el_ref.id.to_string()[..8];
         let b = &el_ref.bounds;

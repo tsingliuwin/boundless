@@ -222,16 +222,22 @@ pub struct ElementStyle {
     /// Pen stroke style (freedraw strokes only). None = solid ink.
     #[serde(default)]
     pub brush: Option<Brush>,
-    /// Fine-grained fill tuning (agent-level). When set, each overrides the
-    /// fill_style preset's derived value: fill line spacing (world units),
-    /// fill line stroke width (>= 2x the gap reads nearly solid), and line
-    /// angle in degrees (default -41). None = use the preset.
+    /// Agent 级细粒度填充参数。当设置时逐项覆盖 fill_style 预设的派生值：
+    /// 排线间距（世界单位）、排线线宽（>= 2× 间距近乎实心）、排线角度
+    /// （默认 -41）。None = 用预设。
     #[serde(default)]
     pub hachure_gap: Option<f64>,
     #[serde(default)]
     pub fill_weight: Option<f64>,
     #[serde(default)]
     pub hachure_angle: Option<f64>,
+    /// 飞白（DryBrush）微调：断续密度 = 主笔保留的采样点比例
+    /// （0.05~0.95，默认 0.67 —— 9 点保 6），主笔宽度系数（默认 0.5×
+    /// stroke_width）。None = 用预设。仅对 brush = DryBrush 的笔迹生效。
+    #[serde(default)]
+    pub dry_density: Option<f64>,
+    #[serde(default)]
+    pub dry_width: Option<f64>,
 }
 
 impl Default for ElementStyle {
@@ -250,6 +256,8 @@ impl Default for ElementStyle {
             hachure_gap: None,
             fill_weight: None,
             hachure_angle: None,
+            dry_density: None,
+            dry_width: None,
         }
     }
 }
@@ -310,6 +318,15 @@ pub enum ElementKind {
         /// straight edges — the AI's organic/blob shape (petals, clouds).
         #[serde(default)]
         smooth: bool,
+    },
+    /// Embedded raster image (PNG/JPEG/…). `asset` is the file name inside
+    /// the workspace asset store (`<root>/.boundless/assets/`) — the bytes
+    /// are copied there on insert so the board survives moving/deleting the
+    /// original file. `bounds` is the display rect; the image fills it
+    /// (aspect ratio is baked into bounds at insert time).
+    Image {
+        /// Asset file name, e.g. `img-<uuid>.png`.
+        asset: String,
     },
     Text {
         text: String,
@@ -723,6 +740,7 @@ impl Element {
                 distance_to_polygon(p, &pts, false) <= stroke_tol
             }
             ElementKind::Text { .. } => self.bounds.inflate(tol, tol).contains(p),
+            ElementKind::Image { .. } => self.bounds.inflate(tol, tol).contains(p),
         }
     }
 
