@@ -75,6 +75,8 @@ pub struct AiPanel {
     notice: Option<String>,
     /// Current reasoning-effort selection, mirrored to settings on send.
     reasoning: ReasoningLevel,
+    /// Whether the compact bar's reasoning-level picker popup is open.
+    reasoning_popup_open: bool,
     /// When true, the chat input is cleared at the next render (InputState's
     /// set_value needs a Window, which is only available in render / event
     /// handlers that receive one).
@@ -194,6 +196,7 @@ impl AiPanel {
         Self {
             board,
             reasoning: settings.reasoning_effort,
+            reasoning_popup_open: false,
             settings,
             compact,
             active_board,
@@ -989,7 +992,7 @@ impl Render for AiPanel {
         // gpui-component's Button.
         let streaming_now = streaming;
         let model_name = self.settings.model.clone();
-        let reasoning_control = self.reasoning_control(false, cx);
+        let reasoning_control = self.reasoning_control(cx);
 
         // Send/stop icon button (gpui-component Button).
         let send_btn = Button::new("send-btn")
@@ -1159,23 +1162,18 @@ impl Render for AiPanel {
 }
 
 impl AiPanel {
-    /// Reasoning-effort selector (低/中/高). `ghost` renders the borderless
-    /// pill-text style used in the compact bar — the bar is already a pill,
-    /// so the boxed segmented control reads as clutter there; the docked
-    /// toolbar keeps the boxed style.
-    fn reasoning_control(&self, ghost: bool, cx: &mut Context<Self>) -> Div {
+    /// Reasoning-effort segmented control (低/中/高) for the docked panel's
+    /// toolbar. The compact bar uses the popup picker instead
+    /// ([`Self::render_reasoning_picker`]).
+    fn reasoning_control(&self, cx: &mut Context<Self>) -> Div {
         let current_reasoning = self.reasoning;
-        let mut control = if ghost {
-            div().flex().flex_row().items_center().gap_0p5()
-        } else {
-            div()
-                .flex()
-                .flex_row()
-                .rounded_md()
-                .overflow_hidden()
-                .border_1()
-                .border_color(rgb(0xd6d4d0))
-        };
+        let mut control = div()
+            .flex()
+            .flex_row()
+            .rounded_md()
+            .overflow_hidden()
+            .border_1()
+            .border_color(rgb(0xd6d4d0));
         for (i, level) in [
             ReasoningLevel::Low,
             ReasoningLevel::Medium,
@@ -1187,26 +1185,15 @@ impl AiPanel {
             let active = level == current_reasoning;
             let mut seg = div()
                 .id(("reasoning", i))
-                .cursor_pointer()
+                .px_2()
+                .py_1()
                 .text_xs()
+                .cursor_pointer()
                 .child(level.label());
-            if ghost {
-                seg = seg.px_1p5().py_0p5().rounded_full();
-                if active {
-                    seg = seg
-                        .bg(rgb(0xe8f0fe))
-                        .text_color(rgb(0x1a5fd7))
-                        .font_weight(FontWeight::SEMIBOLD);
-                } else {
-                    seg = seg.hover(|s| s.bg(rgb(0xf0efec))).text_color(rgb(0x999999));
-                }
+            if active {
+                seg = seg.bg(rgb(0x1a5fd7)).text_color(rgb(0xffffff));
             } else {
-                seg = seg.px_2().py_1();
-                if active {
-                    seg = seg.bg(rgb(0x1a5fd7)).text_color(rgb(0xffffff));
-                } else {
-                    seg = seg.hover(|s| s.bg(rgb(0xefeeec))).text_color(rgb(0x555555));
-                }
+                seg = seg.hover(|s| s.bg(rgb(0xefeeec))).text_color(rgb(0x555555));
             }
             control =
                 control.child(seg.on_click(cx.listener(move |this, _, _, cx| {
@@ -1216,34 +1203,122 @@ impl AiPanel {
         control
     }
 
+    /// The compact bar's reasoning control: one button showing only the
+    /// current level; clicking opens a small picker above it. The picker is
+    /// a child of the button so `on_mouse_down_out` can close it on any
+    /// outside click, while clicks on the button itself just toggle.
+    fn render_reasoning_picker(&mut self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let current_reasoning = self.reasoning;
+        let mut button = div()
+            .id("reasoning-picker")
+            .relative()
+            .h_7()
+            .px_2()
+            .rounded_md()
+            .flex()
+            .items_center()
+            .text_xs()
+            .text_color(rgb(0x555555))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(0xf0efec)))
+            .child(self.reasoning.label())
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.reasoning_popup_open = !this.reasoning_popup_open;
+                cx.notify();
+            }));
+
+        if self.reasoning_popup_open {
+            let mut rows = div()
+                .absolute()
+                .bottom_full()
+                .right_0()
+                .mb_1p5()
+                .w_12()
+                .bg(rgb(0xffffff))
+                .border_1()
+                .border_color(rgb(0xe3e2df))
+                .rounded_md()
+                .shadow_lg()
+                .p_1()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                // Clicks on the card itself (padding) don't fall through.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                // Any mouse-down outside the card closes the picker.
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.reasoning_popup_open = false;
+                    cx.notify();
+                }));
+            for (i, level) in [
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let active = level == current_reasoning;
+                let mut row = div()
+                    .id(("reasoning-opt", i))
+                    .px_1()
+                    .py_1()
+                    .text_center()
+                    .rounded_sm()
+                    .text_xs()
+                    .cursor_pointer()
+                    .child(level.label());
+                if active {
+                    row = row.bg(rgb(0xe8f0fe)).text_color(rgb(0x1a5fd7));
+                } else {
+                    row = row.hover(|s| s.bg(rgb(0xf0efec))).text_color(rgb(0x555555));
+                }
+                // Select on mouse-down (not click): the popup unmounts on
+                // selection, which would swallow the click's up event.
+                rows = rows.child(row.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.reasoning_popup_open = false;
+                        this.set_reasoning(level, cx);
+                    }),
+                ));
+            }
+            button = button.child(rows);
+        }
+        button
+    }
+
     /// The compact conversation form: a floating bottom-center input bar with
     /// a single status line above it (streaming tail / tool in flight / last
     /// reply / error). The agent's actions unfold on the canvas — watching
     /// the board is the point; the full transcript lives one toggle away.
     fn render_compact(&mut self, cx: &mut Context<Self>) -> Div {
         let streaming = self.streaming.is_some();
-        let reasoning_control = self.reasoning_control(true, cx);
+        let reasoning_control = self.render_reasoning_picker(cx);
 
-        // Send/stop: the bar's single accent — a filled circle. Turns red
-        // while streaming so "stop" reads at a glance.
+        // Send/stop: rounded-square per the reference style. Idle = accent
+        // blue with an up-arrow; streaming = dark with a light square as the
+        // stop glyph.
         let send_btn = div()
             .id("send-btn-compact")
             .w_7()
             .h_7()
-            .rounded_full()
+            .rounded_lg()
             .flex()
             .items_center()
             .justify_center()
             .cursor_pointer()
             .when(streaming, |d| {
-                d.bg(rgb(0xc92a2a))
-                    .text_color(rgb(0xffffff))
-                    .hover(|s| s.bg(rgb(0xb02525)))
+                d.bg(rgb(0x3d3d3d)).hover(|s| s.bg(rgb(0x2f2f2f))).child(
+                    div().w_3().h_3().rounded_sm().bg(rgb(0xe3e3e3)),
+                )
             })
             .when(!streaming, |d| {
                 d.bg(rgb(0x1a5fd7))
                     .text_color(rgb(0xffffff))
                     .hover(|s| s.bg(rgb(0x1550b3)))
+                    .child(Icon::new(IconName::ArrowUp).size_4())
             })
             .on_click(cx.listener(move |this, _, _window, cx| {
                 if streaming {
@@ -1251,13 +1326,7 @@ impl AiPanel {
                 } else {
                     this.send_message(cx);
                 }
-            }))
-            .child(Icon::new(if streaming {
-                IconName::Close
-            } else {
-                IconName::ArrowUp
-            })
-            .size_4());
+            }));
 
         // Expand back to the docked chat panel (the mic-icon slot in the
         // reference layout).
