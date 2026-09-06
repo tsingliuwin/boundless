@@ -1591,6 +1591,564 @@ impl Tool for DeletePageTool {
     }
 }
 
+// --- Save Template -----------------------------------------------------------
+
+/// Arguments for `save_template`.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct SaveTemplateArgs {
+    /// 模板名（如角色名「小明」），之后 stamp_template 用它引用。同名覆盖。
+    pub name: String,
+    /// 模板类别：character（角色）/ scene（场景）/ prop（道具）。
+    pub kind: String,
+    /// 组成模板的元素 id 列表（draw_* 返回的 8 位短 id）。
+    pub ids: Vec<String>,
+    /// true = 保存后从画布删除这些元素（推荐：页面外画好角色 → 收进模板库
+    /// → 用 stamp_template 盖章到每一格）。默认 false。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_source: Option<bool>,
+}
+
+pub struct SaveTemplateTool {
+    pub events: UnboundedSender<AgentEvent>,
+    pub snapshot: Arc<Mutex<Vec<ElementSnapshot>>>,
+    pub templates_dir: std::path::PathBuf,
+}
+
+impl Tool for SaveTemplateTool {
+    const NAME: &'static str = "save_template";
+    type Error = ToolError;
+    type Args = SaveTemplateArgs;
+    type Output = String;
+
+    fn definition(
+        &self,
+        _prompt: String,
+    ) -> impl std::future::Future<Output = ToolDefinition> + Send {
+        let def = tool_def::<SaveTemplateArgs>(
+            Self::NAME,
+            "把已画好的一组元素保存为可复用模板（角色/场景/道具）。漫画等多格创作里，同一角色先画一次存模板，之后每格都用 stamp_template 盖章，保证人物与场景一致。",
+        );
+        async move { def }
+    }
+
+    fn call(
+        &self,
+        args: Self::Args,
+    ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
+        let events = self.events.clone();
+        let snapshot = self.snapshot.clone();
+        let templates_dir = self.templates_dir.clone();
+        let name = Self::NAME;
+        async move {
+            let id = next_tool_id(name);
+            let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
+            // 边界校验：名字、类别、id 列表（对快照快速失败，主线程再权威复核）。
+            let clean = match crate::scene::templates::sanitize_name(&args.name) {
+                Ok(n) => n,
+                Err(e) => return fail_tool(&events, id, name, args_json, ToolError::invalid_args(e)).await,
+            };
+            let kind = match crate::scene::templates::TemplateKind::parse(&args.kind) {
+                Some(k) => k,
+                None => {
+                    return fail_tool(
+                        &events,
+                        id,
+                        name,
+                        args_json,
+                        ToolError::invalid_args("kind 需要 character / scene / prop 之一"),
+                    )
+                    .await
+                }
+            };
+            if args.ids.is_empty() || args.ids.len() > 60 {
+                return fail_tool(
+                    &events,
+                    id,
+                    name,
+                    args_json,
+                    ToolError::invalid_args("ids 需要 1~60 个元素 id"),
+                )
+                .await;
+            }
+            // 对快照快速失败；guard 在块内释放，fail_tool 的 await 不得
+            // 持锁跨 await（future 必须 Send）。
+            let missing: Vec<String> = {
+                let snap = snapshot.lock().unwrap_or_else(|e| e.into_inner());
+                args.ids
+                    .iter()
+                    .filter(|i| !snapshot_has_id(&snap, i))
+                    .cloned()
+                    .collect()
+            };
+            if let Some(first) = missing.first() {
+                return fail_tool(
+                    &events,
+                    id,
+                    name,
+                    args_json,
+                    ToolError::not_found(format!("找不到元素 id={first}")),
+                )
+                .await;
+            }
+            let _ = events.unbounded_send(AgentEvent::ToolCall {
+                id: id.clone(),
+                name: name.to_string(),
+                args: args_json,
+            });
+            let (tx, rx) = futures::channel::oneshot::channel();
+            let delete_source = args.delete_source.unwrap_or(false);
+            let _ = events.unbounded_send(AgentEvent::ExtractElements {
+                ids: args.ids.clone(),
+                delete_source,
+                reply: tx,
+            });
+            let elements = match rx
+                .await
+                .unwrap_or_else(|_| Err(CanvasOpError::internal("元素提取被取消（应用已关闭）")))
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = events.unbounded_send(AgentEvent::ToolResult {
+                        id,
+                        result: e.message.clone(),
+                        is_error: true,
+                    });
+                    return Err(ToolError::from_op(e));
+                }
+            };
+            let template = crate::scene::templates::ComicTemplate {
+                name: clean.clone(),
+                kind,
+                elements,
+            };
+            // 汇总包围盒用于回报尺寸。
+            let mut bbox: Option<crate::scene::WBounds> = None;
+            for el in &template.elements {
+                bbox = Some(match bbox {
+                    Some(u) => u.union(&el.bounds),
+                    None => el.bounds,
+                });
+            }
+            let (w, h) = bbox.map(|b| (b.w, b.h)).unwrap_or((0.0, 0.0));
+            match crate::scene::templates::save(&templates_dir, &template) {
+                Ok(_) => {
+                    let msg = format!(
+                        "已保存模板「{clean}」（{}，{} 个元素，{:.0}×{:.0}）。之后每格都用 stamp_template(\"{clean}\", x, y) 复用它，不要重画。",
+                        kind.label(),
+                        template.elements.len(),
+                        w,
+                        h
+                    );
+                    let _ = events.unbounded_send(AgentEvent::ToolResult {
+                        id,
+                        result: msg.clone(),
+                        is_error: false,
+                    });
+                    Ok(msg)
+                }
+                Err(e) => {
+                    let _ = events.unbounded_send(AgentEvent::ToolResult {
+                        id,
+                        result: e.clone(),
+                        is_error: true,
+                    });
+                    Err(ToolError {
+                        code: CanvasOpErrorCode::Internal,
+                        message: e,
+                    })
+                }
+            }
+        }
+    }
+}
+
+// --- Stamp Template ----------------------------------------------------------
+
+/// Arguments for `stamp_template`.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct StampTemplateArgs {
+    /// 模板名（save_template 保存时用的名字，list_templates 可查）。
+    pub name: String,
+    /// 模板包围盒左上角要落到的世界坐标 X。
+    pub x: f64,
+    /// 模板包围盒左上角要落到的世界坐标 Y。
+    pub y: f64,
+    /// 等比缩放 0.05~8.0。默认 1（原尺寸）。同一角色在各格中的缩放应保持相近，避免忽大忽小。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<f64>,
+    /// true = 水平镜像（翻转角色朝向）。默认 false。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flip_x: Option<bool>,
+}
+
+pub struct StampTemplateTool {
+    pub events: UnboundedSender<AgentEvent>,
+    pub templates_dir: std::path::PathBuf,
+}
+
+impl Tool for StampTemplateTool {
+    const NAME: &'static str = "stamp_template";
+    type Error = ToolError;
+    type Args = StampTemplateArgs;
+    type Output = String;
+
+    fn definition(
+        &self,
+        _prompt: String,
+    ) -> impl std::future::Future<Output = ToolDefinition> + Send {
+        let def = tool_def::<StampTemplateArgs>(
+            Self::NAME,
+            "把保存的模板实例化到画布 (x,y)，可缩放（scale）和水平镜像（flip_x=true 翻转朝向）。漫画的每一格都要用本工具复用同一角色/场景模板，而不是重画。",
+        );
+        async move { def }
+    }
+
+    fn call(
+        &self,
+        args: Self::Args,
+    ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
+        let events = self.events.clone();
+        let templates_dir = self.templates_dir.clone();
+        let name = Self::NAME;
+        async move {
+            let id = next_tool_id(name);
+            let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
+            if !args.x.is_finite() || !args.y.is_finite() {
+                return fail_tool(&events, id, name, args_json, ToolError::invalid_args("坐标必须是有限数值")).await;
+            }
+            if let Some(s) = args.scale {
+                if !s.is_finite() || !(0.05..=8.0).contains(&s) {
+                    return fail_tool(
+                        &events,
+                        id,
+                        name,
+                        args_json,
+                        ToolError::invalid_args(format!("scale {s} 超出范围 0.05~8.0")),
+                    )
+                    .await;
+                }
+            }
+            let _ = events.unbounded_send(AgentEvent::ToolCall {
+                id: id.clone(),
+                name: name.to_string(),
+                args: args_json,
+            });
+            let emit_err = |events: &UnboundedSender<AgentEvent>, id: String, msg: String| {
+                let _ = events.unbounded_send(AgentEvent::ToolResult {
+                    id,
+                    result: msg.clone(),
+                    is_error: true,
+                });
+                Err(ToolError::not_found(msg))
+            };
+            let template =
+                match crate::scene::templates::load(&templates_dir, args.name.trim()) {
+                    Ok(t) => t,
+                    Err(e) => return emit_err(&events, id, e),
+                };
+            let stamped = match crate::scene::templates::stamp(
+                &template,
+                args.x,
+                args.y,
+                args.scale.unwrap_or(1.0),
+                args.flip_x.unwrap_or(false),
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = events.unbounded_send(AgentEvent::ToolResult {
+                        id,
+                        result: e.clone(),
+                        is_error: true,
+                    });
+                    return Err(ToolError::invalid_args(e));
+                }
+            };
+            let n = stamped.len();
+            let (tx, rx) = futures::channel::oneshot::channel();
+            let _ = events.unbounded_send(AgentEvent::InsertElements {
+                elements: stamped,
+                reply: tx,
+            });
+            let outcome: CanvasOpOutcome = rx
+                .await
+                .unwrap_or_else(|_| Err(CanvasOpError::internal("画布插入被取消（应用已关闭）")));
+            let (is_error, message) = match &outcome {
+                Ok(m) => (false, m.clone()),
+                Err(e) => (true, e.message.clone()),
+            };
+            let _ = events.unbounded_send(AgentEvent::ToolResult {
+                id,
+                result: message.clone(),
+                is_error,
+            });
+            outcome.map(|m| format!("已放置模板「{}」×{n} 个元素。{m}", template.name)).map_err(ToolError::from_op)
+        }
+    }
+}
+
+// --- List Templates ----------------------------------------------------------
+
+pub struct ListTemplatesTool {
+    pub events: UnboundedSender<AgentEvent>,
+    pub templates_dir: std::path::PathBuf,
+}
+
+impl Tool for ListTemplatesTool {
+    const NAME: &'static str = "list_templates";
+    type Error = ToolError;
+    type Args = NoArgs;
+    type Output = String;
+
+    fn definition(
+        &self,
+        _prompt: String,
+    ) -> impl std::future::Future<Output = ToolDefinition> + Send {
+        let def = tool_def::<NoArgs>(
+            Self::NAME,
+            "列出模板库里所有可复用模板（名字、类别、大小、文字）。开始画漫画前先查一下，已有角色直接 stamp_template 复用。",
+        );
+        async move { def }
+    }
+
+    fn call(
+        &self,
+        _args: Self::Args,
+    ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
+        let events = self.events.clone();
+        let templates_dir = self.templates_dir.clone();
+        let name = Self::NAME;
+        async move {
+            let id = next_tool_id(name);
+            let _ = events.unbounded_send(AgentEvent::ToolCall {
+                id: id.clone(),
+                name: name.to_string(),
+                args: Value::Null,
+            });
+            let list = crate::scene::templates::list(&templates_dir);
+            let result = if list.is_empty() {
+                "模板库为空：先用绘图工具画出角色/场景，再 save_template 保存".to_string()
+            } else {
+                list.iter()
+                    .map(|t| format!("- {}", t.one_line()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let _ = events.unbounded_send(AgentEvent::ToolResult {
+                id,
+                result: result.clone(),
+                is_error: false,
+            });
+            Ok(result)
+        }
+    }
+}
+
+// --- Speech Bubble -----------------------------------------------------------
+
+/// Arguments for `draw_speech_bubble`.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct SpeechBubbleArgs {
+    /// 气泡外接框左上角 X。
+    pub x: f64,
+    /// 气泡外接框左上角 Y。
+    pub y: f64,
+    /// 气泡宽（世界单位）。正文台词建议 ≥ 140。
+    pub w: f64,
+    /// 气泡高（世界单位）。一行台词建议 ≥ 56。
+    pub h: f64,
+    /// 台词内容。过长会自动换行（按气泡内宽），放不下就加高气泡或精简文字。
+    pub text: String,
+    /// 尾巴方向（指向说话者嘴部）：down_left（默认）/ down_right / up_left /
+    /// up_right / none（无尾巴，旁白用方框即可）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail: Option<String>,
+    /// 台词字号。默认 16。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_size: Option<f64>,
+    /// 可选样式覆盖（描边/填充等）。默认白底黑边实心填充。
+    #[serde(default, deserialize_with = "de_style")]
+    pub style: CanvasStyle,
+}
+
+/// 漫画对话气泡：尾巴三角（先画，垫底）→ 白底椭圆（盖住接缝）→ 绑定文字
+/// （居中、随容器移动）。一次 InsertElements 插入三个元素。
+pub struct SpeechBubbleTool {
+    pub events: UnboundedSender<AgentEvent>,
+}
+
+/// 气泡默认样式：白底黑边实心（漫画标准观感），style 参数可逐字段覆盖。
+fn bubble_base_style() -> crate::scene::ElementStyle {
+    let mut s = crate::scene::ElementStyle::default();
+    s.stroke = 0x1e1e1e;
+    s.stroke_width = 2.0;
+    s.background = Some(0xff_ff_ff);
+    s.fill_style = crate::scene::FillStyle::Solid;
+    s.roughness = 1.0;
+    s
+}
+
+impl Tool for SpeechBubbleTool {
+    const NAME: &'static str = "draw_speech_bubble";
+    type Error = ToolError;
+    type Args = SpeechBubbleArgs;
+    type Output = String;
+
+    fn definition(
+        &self,
+        _prompt: String,
+    ) -> impl std::future::Future<Output = ToolDefinition> + Send {
+        let def = tool_def::<SpeechBubbleArgs>(
+            Self::NAME,
+            "画一个漫画对话气泡：白底黑边椭圆 + 朝向说话者的尾巴 + 居中台词（自动换行）。tail 指定尾巴方向（down_left 默认 / down_right / up_left / up_right / none）。返回气泡椭圆与文字的 id，改台词用 update_element 改文字 id。",
+        );
+        async move { def }
+    }
+
+    fn call(
+        &self,
+        args: Self::Args,
+    ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
+        let events = self.events.clone();
+        let name = Self::NAME;
+        async move {
+            let id = next_tool_id(name);
+            let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
+            if let Err(e) = validate_bubble(&args) {
+                return fail_tool(&events, id, name, args_json, e).await;
+            }
+            let dir = args.tail.as_deref().unwrap_or("down_left");
+            let (ux, uy): (f64, f64) = match dir {
+                "none" => (0.0, 0.0),
+                "down_left" => (-1.0, 1.0),
+                "down_right" => (1.0, 1.0),
+                "up_left" => (-1.0, -1.0),
+                "up_right" => (1.0, -1.0),
+                _ => unreachable!("validate_bubble 已拒绝未知方向"),
+            };
+            let style = args
+                .style
+                .clone()
+                .merge_into(bubble_base_style());
+            let cx = args.x + args.w / 2.0;
+            let cy = args.y + args.h / 2.0;
+            let ellipse_id = new_element_id();
+            let mut elements: Vec<crate::scene::Element> = Vec::new();
+            if dir != "none" {
+                // 尾巴：在椭圆边上取朝向点，底边两端向圆心收 15%（被椭圆盖住
+                // 接缝），尖端沿方向外推。
+                let norm = (ux * ux + uy * uy).sqrt();
+                let (ux, uy) = (ux / norm, uy / norm);
+                let theta = uy.atan2(ux);
+                let (rx, ry) = (args.w / 2.0, args.h / 2.0);
+                let bx = cx + rx * theta.cos();
+                let by = cy + ry * theta.sin();
+                let len = (0.30 * args.w.min(args.h)).max(18.0);
+                let tip = crate::scene::WPoint::new(bx + ux * len, by + uy * len);
+                let half = (0.06 * args.w).clamp(5.0, 14.0);
+                let pull = 0.85;
+                let b1 = crate::scene::WPoint::new(
+                    cx + (bx + -uy * half - cx) * pull,
+                    cy + (by + ux * half - cy) * pull,
+                );
+                let b2 = crate::scene::WPoint::new(
+                    cx + (bx - -uy * half - cx) * pull,
+                    cy + (by - ux * half - cy) * pull,
+                );
+                elements.push(crate::scene::Element::from_absolute_points_with_id(
+                    new_element_id(),
+                    |points| crate::scene::ElementKind::Polygon {
+                        points,
+                        smooth: false,
+                    },
+                    vec![b1, tip, b2],
+                    style.clone(),
+                ));
+            }
+            elements.push(crate::scene::Element::new_with_id(
+                ellipse_id,
+                crate::scene::ElementKind::Ellipse,
+                crate::scene::WBounds::new(args.x, args.y, args.w, args.h),
+                style,
+            ));
+            // 台词：绑定到椭圆的居中标签；初始包围盒给个粗估，插入后由
+            // pending_measure 精确重排。
+            let font_size = args.font_size.unwrap_or(16.0);
+            let mut label = crate::scene::Element::new(
+                crate::scene::ElementKind::Text {
+                    text: crate::ai::canvas_ops::normalize_text(args.text.clone()),
+                    font_size,
+                    font_family: crate::render::HANDWRITTEN_FONT.to_string(),
+                    wrap_width: Some((args.w - 40.0).max(30.0)),
+                    min_height: None,
+                    container_id: Some(ellipse_id),
+                    text_align: crate::scene::TextAlign::Center,
+                    anchor: None,
+                },
+                crate::scene::WBounds::new(args.x + 20.0, cy - font_size * 0.7, args.w - 40.0, font_size * 1.4),
+                crate::scene::ElementStyle::default(),
+            );
+            label.style.roughness = 0.0;
+            elements.push(label);
+            let n = elements.len();
+            let _ = events.unbounded_send(AgentEvent::ToolCall {
+                id: id.clone(),
+                name: name.to_string(),
+                args: args_json,
+            });
+            let (tx, rx) = futures::channel::oneshot::channel();
+            let _ = events.unbounded_send(AgentEvent::InsertElements {
+                elements,
+                reply: tx,
+            });
+            let outcome: CanvasOpOutcome = rx
+                .await
+                .unwrap_or_else(|_| Err(CanvasOpError::internal("画布插入被取消（应用已关闭）")));
+            let (is_error, message) = match &outcome {
+                Ok(m) => (false, m.clone()),
+                Err(e) => (true, e.message.clone()),
+            };
+            let _ = events.unbounded_send(AgentEvent::ToolResult {
+                id,
+                result: message.clone(),
+                is_error,
+            });
+            outcome
+                .map(|m| format!("已添加对话气泡（{n} 个元素：尾巴/椭圆/文字）。{m}"))
+                .map_err(ToolError::from_op)
+        }
+    }
+}
+
+fn validate_bubble(args: &SpeechBubbleArgs) -> Result<(), ToolError> {
+    if args.text.trim().is_empty() {
+        return Err(ToolError::invalid_args("台词内容不能为空"));
+    }
+    for (n, v) in [("x", args.x), ("y", args.y), ("w", args.w), ("h", args.h)] {
+        if !v.is_finite() {
+            return Err(ToolError::invalid_args(format!("{n} 必须是有限数值")));
+        }
+    }
+    if args.w <= 0.0 || args.h <= 0.0 {
+        return Err(ToolError::invalid_args("气泡宽高必须为正数"));
+    }
+    if let Some(fs) = args.font_size {
+        if !fs.is_finite() || fs <= 0.0 {
+            return Err(ToolError::invalid_args("字号必须为正数"));
+        }
+    }
+    match args.tail.as_deref() {
+        None | Some("down_left") | Some("down_right") | Some("up_left") | Some("up_right")
+        | Some("none") => {}
+        Some(other) => {
+            return Err(ToolError::invalid_args(format!(
+                "tail 只支持 down_left / down_right / up_left / up_right / none，收到 {other}"
+            )))
+        }
+    }
+    args.style.validate().map_err(ToolError::invalid_args)?;
+    Ok(())
+}
+
 // --- List Elements ---------------------------------------------------------
 
 /// A lightweight summary of one canvas element, for the `list_elements` tool.
@@ -1677,6 +2235,7 @@ pub fn all_tools(
     events: UnboundedSender<AgentEvent>,
     snapshot: Arc<Mutex<Vec<ElementSnapshot>>>,
     active_skill: super::skills::ActiveSkill,
+    templates_dir: std::path::PathBuf,
 ) -> Vec<Box<dyn rig_core::tool::ToolDyn>> {
     vec![
         Box::new(RectangleTool {
@@ -1734,6 +2293,22 @@ pub fn all_tools(
             events: events.clone(),
         }),
         Box::new(DeletePageTool {
+            events: events.clone(),
+        }),
+        Box::new(SaveTemplateTool {
+            events: events.clone(),
+            snapshot: snapshot.clone(),
+            templates_dir: templates_dir.clone(),
+        }),
+        Box::new(StampTemplateTool {
+            events: events.clone(),
+            templates_dir: templates_dir.clone(),
+        }),
+        Box::new(ListTemplatesTool {
+            events: events.clone(),
+            templates_dir: templates_dir.clone(),
+        }),
+        Box::new(SpeechBubbleTool {
             events: events.clone(),
         }),
         Box::new(ListElementsTool { snapshot }),
@@ -1976,5 +2551,119 @@ mod tests {
             }
         }
         assert!(saw_result, "no ToolResult event");
+    }
+
+    fn mk_bubble() -> SpeechBubbleArgs {
+        SpeechBubbleArgs {
+            x: 100.0,
+            y: 80.0,
+            w: 200.0,
+            h: 110.0,
+            text: "你好，世界".into(),
+            tail: None,
+            font_size: None,
+            style: CanvasStyle::default(),
+        }
+    }
+
+    #[test]
+    fn validate_bubble_directions_and_bounds() {
+        assert!(validate_bubble(&mk_bubble()).is_ok());
+        for tail in ["down_left", "down_right", "up_left", "up_right", "none"] {
+            let a = SpeechBubbleArgs {
+                tail: Some(tail.into()),
+                ..mk_bubble()
+            };
+            assert!(validate_bubble(&a).is_ok(), "tail={tail}");
+        }
+        let unknown = SpeechBubbleArgs {
+            tail: Some("sideways".into()),
+            ..mk_bubble()
+        };
+        assert!(validate_bubble(&unknown).is_err());
+        let empty = SpeechBubbleArgs {
+            text: "  ".into(),
+            ..mk_bubble()
+        };
+        assert!(validate_bubble(&empty).is_err());
+        let zero = SpeechBubbleArgs {
+            w: 0.0,
+            ..mk_bubble()
+        };
+        assert!(validate_bubble(&zero).is_err());
+    }
+
+    /// Speech-bubble tool chain: ToolCall → InsertElements（3 个元素：尾巴、
+    /// 椭圆、绑定文字）→ 主线程回执 → ToolResult is_error=false。
+    #[test]
+    fn bubble_tool_emits_three_bound_elements() {
+        use futures::task::noop_waker_ref;
+        use std::task::Context;
+
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<AgentEvent>();
+        let tool = SpeechBubbleTool { events: tx };
+        let mut fut = Box::pin(tool.call(mk_bubble()));
+        let waker = noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+
+        match std::future::Future::poll(fut.as_mut(), &mut cx) {
+            std::task::Poll::Pending => {}
+            std::task::Poll::Ready(_) => panic!("tool completed before reply"),
+        }
+
+        let mut inserted: Option<Vec<crate::scene::Element>> = None;
+        let mut replied = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AgentEvent::InsertElements { elements, reply } => {
+                    reply
+                        .send(Ok("已插入 3 个元素，id 依次为：a1, b2, c3".to_string()))
+                        .expect("reply send");
+                    inserted = Some(elements);
+                    replied = true;
+                }
+                AgentEvent::ToolResult { is_error, .. } => {
+                    panic!("ToolResult before reply: is_error={is_error}");
+                }
+                _ => {}
+            }
+        }
+        assert!(replied, "no InsertElements event to reply to");
+
+        let elements = inserted.unwrap();
+        assert_eq!(elements.len(), 3, "尾巴 + 椭圆 + 文字");
+        // 第一个是尾巴三角（有尾巴方向时），中间是椭圆，最后是绑定到椭圆的居中文字。
+        let tail = &elements[0];
+        assert!(tail.is_point_based(), "尾巴应为多边形");
+        let ellipse = &elements[1];
+        assert!(matches!(ellipse.kind, crate::scene::ElementKind::Ellipse));
+        // 椭圆白底实心（漫画标准观感）。
+        assert_eq!(ellipse.style.background, Some(0xff_ff_ff));
+        assert_eq!(ellipse.style.fill_style, crate::scene::FillStyle::Solid);
+        match &elements[2].kind {
+            crate::scene::ElementKind::Text {
+                container_id, ..
+            } => assert_eq!(*container_id, Some(ellipse.id)),
+            other => panic!("期望绑定文字，实际 {other:?}"),
+        }
+        // 尾巴尖端在气泡外接框之下（down_left 方向：尖端 y > 气泡底边）。
+        let tip_y = tail.absolute_points().iter().map(|p| p.y).fold(f64::MIN, f64::max);
+        assert!(tip_y > 80.0 + 110.0, "尾巴应伸到气泡外 tip_y={tip_y}");
+
+        match std::future::Future::poll(fut.as_mut(), &mut cx) {
+            std::task::Poll::Ready(Ok(msg)) => assert!(msg.contains("对话气泡")),
+            _ => panic!("tool did not complete after reply"),
+        }
+        let mut saw_ok_result = false;
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::ToolResult {
+                is_error, result, ..
+            } = event
+            {
+                saw_ok_result = true;
+                assert!(!is_error, "成功回执被记为错误: {result}");
+            }
+        }
+        assert!(saw_ok_result);
     }
 }

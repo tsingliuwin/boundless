@@ -111,6 +111,7 @@ const BUILTIN_SOURCES: &[(&str, &str)] = &[
     ),
     ("mindmap", include_str!("../../skills/mindmap/SKILL.md")),
     ("slides", include_str!("../../skills/slides/SKILL.md")),
+    ("comic", include_str!("../../skills/comic/SKILL.md")),
 ];
 
 /// Parse a SKILL.md file, tagging errors with the file path.
@@ -271,12 +272,13 @@ mod tests {
     #[test]
     fn builtin_skills_parse_and_catalog_is_nonempty() {
         let all = load_all();
-        assert!(all.len() >= 4, "至少包含四个内置技能");
+        assert!(all.len() >= 5, "至少包含五个内置技能");
         for name in [
             "blackboard-poster",
             "ink-wash-landscape",
             "mindmap",
             "slides",
+            "comic",
         ] {
             let s = find(name).unwrap_or_else(|| panic!("缺少内置技能 {name}"));
             assert!(!s.body.is_empty());
@@ -288,6 +290,7 @@ mod tests {
             "**blackboard-poster**",
             "**ink-wash-landscape**",
             "**slides**",
+            "**comic**",
         ] {
             assert!(cat.contains(name), "catalog 缺少 {name}");
         }

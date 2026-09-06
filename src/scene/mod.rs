@@ -3,6 +3,7 @@
 pub mod element;
 pub mod mindmap;
 pub mod pages;
+pub mod templates;
 
 pub use element::*;
 

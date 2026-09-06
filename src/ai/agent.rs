@@ -25,7 +25,7 @@ use rig_core::message::Message as RigMessage;
 use rig_core::providers::openai::{self, Client as OpenAIClient};
 use rig_core::streaming::{StreamedAssistantContent, StreamingChat};
 
-use super::canvas_ops::{CanvasOp, CanvasOpOutcome};
+use super::canvas_ops::{CanvasOp, CanvasOpError, CanvasOpOutcome};
 use super::client::ChatMessage;
 use super::settings::AiSettings;
 use super::tools::all_tools;
@@ -92,6 +92,10 @@ pub const SYSTEM_PROMPT: &str = r##"你是 boundless 白板应用的绘图助手
 - draw_polygon(points, smooth?, style?)：画封闭多边形（≥3 顶点），水墨的山、岸首选。smooth=true 时为通过各点的平滑闭合曲线（花瓣/云朵等有机形态）。
 - add_image(path, x?, y?, width?)：把本地图片（PNG/JPEG/GIF/WebP）嵌入画布。文件会被复制进工作区资源库，原文件移动/删除不影响画布。height 按图片比例自动求出。适合插画、照片、贴图素材。
 - draw_mindmap(root, cx?, cy?)：一次调用画出整张思维导图。root 是嵌套树：{"text":"中心主题","children":[{"text":"一级分支","children":[{"text":"要点"}]}]}。布局（节点位置、曲线连线、分支配色、防重叠防交叉）全部自动计算——只给文字，不要自己用矩形+连线拼导图。节点文字 ≤ 20 字单行关键词，全图 ≤ 40 节点、≤ 5 层。
+- save_template(name, kind, ids, delete_source?)：把已画好的一组元素保存为可复用模板，是漫画/连环画保证人物、场景一致性的关键工具。kind 取 character（角色）/ scene（场景）/ prop（道具）；ids 是组成该模板的元素 id 列表；delete_source=true 时保存后删除画布上的原元素（推荐：在页面外画好角色 → 收进模板库 → 用 stamp_template 盖章到每一格）。同名模板会覆盖更新。
+- stamp_template(name, x, y, scale?, flip_x?)：把模板实例化到画布 (x,y)（模板包围盒左上角对齐），scale 等比缩放（0.05~8，默认 1），flip_x=true 水平镜像（翻转角色朝向）。返回新元素 id 列表。**同一角色/场景必须始终用 stamp_template 复用同一模板，不要每次重画**——这是保持一致性的铁律。要改表情/动作时，盖章后用 update_element 微调盖出的元素即可。
+- list_templates()：列出模板库里所有模板（名字、类别、大小、文字），用于复用之前会话保存的角色和场景。
+- draw_speech_bubble(x, y, w, h, text, tail?, font_size?)：画一个漫画对话气泡（白底黑边椭圆 + 朝向说话者的尾巴 + 居中文字）。tail 指定尾巴方向：down_left（默认）/ down_right / up_left / up_right / none。文字自动按气泡宽度换行；返回气泡椭圆和文字的 id，改台词用 update_element 改文字 id。旁白/独白用 draw_rectangle + draw_text 画方框即可。
 - set_canvas_background(preset?, color?)：设置画布底色。preset: greenboard（墨绿粉笔板）/ blackboard（黑板黑）/ white（白板）。
 - update_element(id, x?, y?, text?, style?, font_size?)：修改已有元素——移动（x/y）、改文字（text）、改样式（style，只改提供的字段）或改字号（font_size，仅文本）。画错了优先用它修正，不必删除重画。
 - delete_element(id)：删除一个元素（及其标签）。
@@ -155,6 +159,22 @@ pub enum AgentEvent {
         pre_assigned_id: Option<uuid::Uuid>,
         reply: futures::channel::oneshot::Sender<CanvasOpOutcome>,
     },
+    /// 模板工具：按 id 前缀从画布提取元素（含容器绑定标签的克隆），主线程
+    /// 返回元素本体供工具持久化；`delete_source` 为 true 时主线程在克隆后
+    /// 删除画布上的这些元素（save_template 的"画完即收进模板库"用法）。
+    ExtractElements {
+        ids: Vec<String>,
+        delete_source: bool,
+        reply: futures::channel::oneshot::Sender<
+            Result<Vec<crate::scene::Element>, CanvasOpError>,
+        >,
+    },
+    /// 模板工具：把一批预变换好的元素（盖章产物 / 气泡组合）整体插入画布，
+    /// 一次入历史。reply 返回插入的短 id 列表（与 elements 顺序一致）。
+    InsertElements {
+        elements: Vec<crate::scene::Element>,
+        reply: futures::channel::oneshot::Sender<CanvasOpOutcome>,
+    },
     /// The model made a tool call. `id` is rig's internal call id (used to pair
     /// with the later [`AgentEvent::ToolResult`]); `name` is the tool, `args` is
     /// the raw JSON arguments the model supplied. Shown as an expandable step
@@ -192,6 +212,7 @@ impl BoundlessAgent {
         events: UnboundedSender<AgentEvent>,
         snapshot: Arc<Mutex<Vec<super::tools::ElementSnapshot>>>,
         active_skill: super::skills::ActiveSkill,
+        templates_dir: std::path::PathBuf,
     ) -> anyhow::Result<rig_core::agent::Agent<Model>> {
         if settings.api_key.is_empty() {
             return Err(anyhow!(
@@ -227,7 +248,7 @@ impl BoundlessAgent {
             .additional_params(serde_json::json!({
                 "reasoning_effort": settings.reasoning_effort.as_str()
             }))
-            .tools(all_tools(events, snapshot, active_skill))
+            .tools(all_tools(events, snapshot, active_skill, templates_dir))
             .build();
         Ok(agent)
     }
@@ -247,9 +268,10 @@ impl BoundlessAgent {
         snapshot: Arc<Mutex<Vec<super::tools::ElementSnapshot>>>,
         runtime_context: String,
         active_skill: super::skills::ActiveSkill,
+        templates_dir: std::path::PathBuf,
     ) -> anyhow::Result<AgentRequest> {
         let (tx, rx) = futures::channel::mpsc::unbounded();
-        let agent = Self::build(settings, tx.clone(), snapshot, active_skill)?;
+        let agent = Self::build(settings, tx.clone(), snapshot, active_skill, templates_dir)?;
         let chat_history: Vec<RigMessage> = history.into_iter().filter_map(msg_to_rig).collect();
 
         // Prepend the fresh canvas snapshot as a user-role runtime context so

@@ -1821,6 +1821,117 @@ impl BoardView {
         self.pending_measure.push(id);
     }
 
+    /// 模板库目录：`<workspace>/.boundless/templates`。AI 模板工具
+    /// （save/stamp/list_template）按名字存取可复用的角色/场景/道具模板。
+    pub fn templates_dir(&self) -> PathBuf {
+        self.workspace.data_dir().join("templates")
+    }
+
+    /// AI 模板工具：按 id 前缀提取元素（深拷贝，含其容器绑定标签），供
+    /// `save_template` 持久化为模板。前缀全部解析失败或一个元素都没选中时
+    /// 返回 NotFound。
+    pub fn extract_elements(&self, prefixes: &[String]) -> Result<Vec<Element>, CanvasOpError> {
+        let mut picked_ids: Vec<ElementId> = Vec::new();
+        let mut picked: Vec<Element> = Vec::new();
+        for p in prefixes {
+            let uuid = self
+                .scene
+                .find_by_id_prefix(p)
+                .ok_or_else(|| CanvasOpError::not_found(format!("找不到元素 id={p}")))?;
+            if picked_ids.contains(&uuid) {
+                continue;
+            }
+            if let Some(el) = self.scene.get(uuid) {
+                picked_ids.push(uuid);
+                picked.push(el.clone());
+            }
+        }
+        // 容器的绑定标签跟随入库（标签在 scene 里的位置可能在容器之前）。
+        let labels: Vec<Element> = self
+            .scene
+            .elements
+            .iter()
+            .filter(|el| {
+                matches!(el.kind,
+                    ElementKind::Text { container_id: Some(cid), .. } if picked_ids.contains(&cid))
+            })
+            .cloned()
+            .collect();
+        picked.extend(labels);
+        if picked.is_empty() {
+            return Err(CanvasOpError::not_found("没有可提取的元素"));
+        }
+        Ok(picked)
+    }
+
+    /// [`Self::extract_elements`] 的"提取并删除"变体：`save_template` 传
+    /// delete_source=true 时，元素收进模板库后画布上不再保留原图（一次历史
+    /// 记录，可整体撤销）。
+    pub fn extract_and_delete_elements(
+        &mut self,
+        prefixes: &[String],
+        cx: &mut Context<Self>,
+    ) -> Result<Vec<Element>, CanvasOpError> {
+        let picked = self.extract_elements(prefixes)?;
+        self.history.record(&self.scene);
+        for el in &picked {
+            self.scene.remove(el.id);
+        }
+        self.mark_dirty();
+        cx.notify();
+        Ok(picked)
+    }
+
+    /// AI 模板工具：把一批预变换好的元素（模板盖章产物 / 对话气泡组合）
+    /// 整体插入画布。一次历史记录（整体可撤销）；文字元素排队精确测量；
+    /// 若落点在某张幻灯片页面内，相机跟随该页。返回短 id 列表。
+    pub fn insert_elements(
+        &mut self,
+        elements: Vec<Element>,
+        cx: &mut Context<Self>,
+    ) -> CanvasOpOutcome {
+        if elements.is_empty() {
+            return Err(CanvasOpError::invalid_args("没有可插入的元素"));
+        }
+        self.history.record(&self.scene);
+        let mut short_ids: Vec<String> = Vec::with_capacity(elements.len());
+        let mut bbox: Option<WBounds> = None;
+        for el in elements {
+            if el.is_text() {
+                self.pending_measure.push(el.id);
+            }
+            bbox = Some(match bbox {
+                Some(u) => u.union(&el.bounds),
+                None => el.bounds,
+            });
+            let id = self.scene.add(el);
+            short_ids.push(id.to_string()[..8].to_string());
+        }
+        // 页面跟随：与 apply_canvas_op 的 follow 语义一致。
+        if let Some(b) = bbox {
+            let page = crate::scene::pages::page_at(
+                &self.scene.pages,
+                b.center().x,
+                b.center().y,
+            );
+            if let Some(p) = page {
+                if self.ai_focus_page != Some(p) {
+                    self.ai_focus_page = Some(p);
+                    if self.presenting.is_none() {
+                        self.pending_page_focus = Some(p);
+                    }
+                }
+            }
+        }
+        self.mark_dirty();
+        cx.notify();
+        Ok(format!(
+            "已插入 {} 个元素，id 依次为：{}",
+            short_ids.len(),
+            short_ids.join(", ")
+        ))
+    }
+
     /// Build a lightweight snapshot of all canvas elements for the AI agent's
     /// `list_elements` tool. Each entry carries the element's short id, kind
     /// label, optional text, and bounding box.
@@ -1918,6 +2029,18 @@ impl BoardView {
                     p.w,
                     p.h
                 ));
+            }
+        }
+
+        // 素材模板库：模型必须知道有哪些可复用的角色/场景模板，才能在
+        // 漫画等多格创作里保持人物与场景一致（同角色只 stamp 不重画）。
+        let summaries = crate::scene::templates::list(&self.templates_dir());
+        if !summaries.is_empty() {
+            body.push_str(
+                "素材模板库（用 stamp_template 复用，保证人物/场景跨格一致）：\n",
+            );
+            for t in &summaries {
+                body.push_str(&format!("- {}\n", t.one_line()));
             }
         }
 

@@ -440,12 +440,12 @@ impl AiPanel {
         // Build the per-turn canvas state in one board access: the element list
         // feeds the `list_elements` tool, and the runtime-context string is
         // prepended to the prompt so the agent sees current state upfront.
-        let (snapshot, runtime_context) = self
+        let (snapshot, runtime_context, templates_dir) = self
             .board
             .update(cx, |board, _cx| {
                 let snapshot = board.element_snapshot();
                 let context = board.runtime_context();
-                (snapshot, context)
+                (snapshot, context, board.templates_dir())
             })
             .unwrap_or_default();
         // Share the snapshot so tools see live state: the main thread refreshes
@@ -479,6 +479,7 @@ impl AiPanel {
             snapshot.clone(),
             runtime_context,
             self.active_skill.clone(),
+            templates_dir,
         ) {
             Ok(request) => self.start_stream_task(request, snapshot, cx),
             Err(e) => {
@@ -690,6 +691,49 @@ impl AiPanel {
                     .unwrap_or_else(|_| {
                         Err(crate::ai::canvas_ops::CanvasOpError::internal(
                             "画布操作失败：视图已销毁",
+                        ))
+                    });
+                let _ = reply.send(outcome);
+                cx.notify();
+                true
+            }
+            AgentEvent::ExtractElements { ids, delete_source, reply } => {
+                // 模板工具要元素本体：主线程解析前缀、深拷贝（含绑定标签），
+                // delete_source 时顺带删除原图；之后同样刷新共享快照。
+                let outcome = board
+                    .update(cx, |board, cx| {
+                        let result = if delete_source {
+                            board.extract_and_delete_elements(&ids, cx)
+                        } else {
+                            board.extract_elements(&ids)
+                        };
+                        let fresh = board.element_snapshot();
+                        let mut snap = snapshot.lock().unwrap_or_else(|e| e.into_inner());
+                        *snap = fresh;
+                        result
+                    })
+                    .unwrap_or_else(|_| {
+                        Err(crate::ai::canvas_ops::CanvasOpError::internal(
+                            "元素提取失败：视图已销毁",
+                        ))
+                    });
+                let _ = reply.send(outcome);
+                cx.notify();
+                true
+            }
+            AgentEvent::InsertElements { elements, reply } => {
+                // 模板盖章 / 气泡组合：整批插入，一次历史记录。
+                let outcome = board
+                    .update(cx, |board, cx| {
+                        let outcome = board.insert_elements(elements, cx);
+                        let fresh = board.element_snapshot();
+                        let mut snap = snapshot.lock().unwrap_or_else(|e| e.into_inner());
+                        *snap = fresh;
+                        outcome
+                    })
+                    .unwrap_or_else(|_| {
+                        Err(crate::ai::canvas_ops::CanvasOpError::internal(
+                            "画布插入失败：视图已销毁",
                         ))
                     });
                 let _ = reply.send(outcome);

@@ -42,6 +42,7 @@ fn run() -> anyhow::Result<()> {
         snapshot.clone(),
         String::new(),
         boundless::ai::skills::ActiveSkill::new(),
+        std::path::PathBuf::new(),
     )?;
     println!("模型: {} — 考题[思维导图]: {EXAM_PROMPT}", settings.model);
 
