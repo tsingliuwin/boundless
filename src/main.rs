@@ -123,32 +123,50 @@ fn main() {
                 // item shows this as its shortcut. Harmless on macOS (which also
                 // has cmd-q).
                 KeyBinding::new("ctrl-q", Quit, None),
+                // 编辑命令族：ctrl-* 是 Windows 习惯；macOS 用户预期 Cmd 系，
+                // 两者并存（cmd 修饰键在 Windows 上不存在，绑定天然不触发）。
+                // E2E-007 曾抓到「Cmd-Z 无绑定」：撤销只能用 Ctrl-Z。
                 KeyBinding::new("ctrl-z", Undo, Some("Board")),
+                KeyBinding::new("cmd-z", Undo, Some("Board")),
                 KeyBinding::new("ctrl-shift-z", Redo, Some("Board")),
+                KeyBinding::new("cmd-shift-z", Redo, Some("Board")),
                 KeyBinding::new("ctrl-y", Redo, Some("Board")),
                 KeyBinding::new("ctrl-s", SaveScene, Some("Board")),
+                KeyBinding::new("cmd-s", SaveScene, Some("Board")),
                 KeyBinding::new("ctrl-o", OpenScene, Some("Board")),
+                KeyBinding::new("cmd-o", OpenScene, Some("Board")),
                 // 插入图片：文件对话框。粘贴（cmd-v / ctrl-v）在剪贴板是
                 // 图片时也能嵌入；两者都限定 CANVAS 上下文，不影响输入框。
                 KeyBinding::new("ctrl-i", InsertImage, Some(CANVAS)),
+                KeyBinding::new("cmd-i", InsertImage, Some(CANVAS)),
                 KeyBinding::new("cmd-v", PasteImage, Some(CANVAS)),
                 KeyBinding::new("ctrl-v", PasteImage, Some(CANVAS)),
                 KeyBinding::new("delete", DeleteSelection, Some(CANVAS)),
                 KeyBinding::new("backspace", DeleteSelection, Some(CANVAS)),
                 KeyBinding::new("escape", CancelOp, Some(CANVAS)),
                 KeyBinding::new("ctrl-shift-]", BringToFront, Some(CANVAS)),
+                KeyBinding::new("cmd-shift-]", BringToFront, Some(CANVAS)),
                 KeyBinding::new("ctrl-shift-[", SendToBack, Some(CANVAS)),
+                KeyBinding::new("cmd-shift-[", SendToBack, Some(CANVAS)),
                 KeyBinding::new("ctrl-]", BringForward, Some(CANVAS)),
+                KeyBinding::new("cmd-]", BringForward, Some(CANVAS)),
                 KeyBinding::new("ctrl-[", SendBackward, Some(CANVAS)),
+                KeyBinding::new("cmd-[", SendBackward, Some(CANVAS)),
                 KeyBinding::new("ctrl-=", ZoomIn, Some("Board")),
+                KeyBinding::new("cmd-=", ZoomIn, Some("Board")),
                 KeyBinding::new("ctrl--", ZoomOut, Some("Board")),
+                KeyBinding::new("cmd--", ZoomOut, Some("Board")),
                 KeyBinding::new("ctrl-0", ZoomReset, Some("Board")),
+                KeyBinding::new("cmd-0", ZoomReset, Some("Board")),
                 KeyBinding::new("ctrl-b", ToggleAi, Some("Board")),
+                KeyBinding::new("cmd-b", ToggleAi, Some("Board")),
                 // Left explorer (workspace tree) toggle.
                 KeyBinding::new("ctrl-e", ToggleExplorer, Some("Board")),
+                KeyBinding::new("cmd-e", ToggleExplorer, Some("Board")),
                 // Standard settings shortcut (gear button in the menu bar /
                 // the chat panel's model label open the same page).
                 KeyBinding::new("ctrl-,", OpenSettings, Some("Board")),
+                KeyBinding::new("cmd-,", OpenSettings, Some("Board")),
                 // Slide pages: flip while editing; full set while presenting
                 // (direction keys / PageUp-Down / space advance, Esc exits).
                 KeyBinding::new("pagedown", GotoNextPage, Some("Board")),

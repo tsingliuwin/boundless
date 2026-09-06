@@ -169,6 +169,24 @@ fn now_line() -> String {
     )
 }
 
+/// E2E harness ground-truth log: when `$BOUNDLESS_E2E_LOG` points at a file,
+/// key mouse/tool transitions append there so UI tests can see what the app
+/// actually received (GPUI has no accessibility tree to introspect).
+fn e2e_debug(msg: &str) {
+    static PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    let path = PATH.get_or_init(|| std::env::var("BOUNDLESS_E2E_LOG").ok().map(PathBuf::from));
+    if let Some(p) = path {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+        {
+            use std::io::Write as _;
+            let _ = writeln!(f, "[{}] {}", chrono::Local::now().format("%H:%M:%S%.3f"), msg);
+        }
+    }
+}
+
 /// Fade-through-black: veil ramps to opaque over `in_ms`, holds, then ramps
 /// out over `out_ms`. Derived per frame from `started`.
 #[derive(Clone, Copy)]
@@ -3911,6 +3929,10 @@ impl BoardView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        e2e_debug(&format!(
+            "left_down pos=({:.0},{:.0}) tool={:?} click_count={}",
+            event.position.x, event.position.y, self.tool, event.click_count
+        ));
         // Presentation mode is view-only: no drawing, selecting or panning.
         // Flipping is keyboard-driven (PageUp/PageDown/arrows), Esc exits.
         if self.presenting.is_some() {
@@ -4414,6 +4436,10 @@ impl BoardView {
             DragState::Drawing { start, seed } => {
                 self.update_draft(start, world, event.modifiers.shift, seed);
                 self.drag = DragState::Drawing { start, seed };
+                e2e_debug(&format!(
+                    "move_drawing pos=({:.0},{:.0}) world=({:.0},{:.0})",
+                    event.position.x, event.position.y, world.x, world.y
+                ));
                 cx.notify();
             }
             DragState::Freedraw {
@@ -4717,6 +4743,12 @@ impl BoardView {
 
     fn on_left_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         let _ = window;
+        e2e_debug(&format!(
+            "left_up pos=({:.0},{:.0}) drag_pending={}",
+            event.position.x,
+            event.position.y,
+            !matches!(self.drag, DragState::Idle)
+        ));
         // A click/drag release on the settings page belongs to the page.
         if self.settings_open {
             return;

@@ -27,9 +27,22 @@ const PREVIEW_CHARS: usize = 30;
 
 /// Root data directory: `~/.boundless`. Created on first access. Holds only
 /// app-level state — the session store follows the active workspace instead.
+///
+/// `$BOUNDLESS_HOME` overrides the whole tree (E2E/UI tests run against a
+/// throwaway home so they never touch real user data).
 pub fn data_dir() -> PathBuf {
-    let base = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    base.join(".boundless")
+    resolve_data_dir(std::env::var("BOUNDLESS_HOME").ok().as_deref())
+}
+
+/// Env-var-aware half of [`data_dir`], factored out so tests don't mutate
+/// process-global state.
+fn resolve_data_dir(env_home: Option<&str>) -> PathBuf {
+    if let Some(dir) = env_home.filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".boundless")
 }
 
 /// The active workspace's data dir. `None` = no workspace active (tests,
@@ -318,6 +331,19 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("boundless-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn boundless_home_env_overrides_data_dir() {
+        assert_eq!(
+            resolve_data_dir(Some("/tmp/boundless-e2e")),
+            PathBuf::from("/tmp/boundless-e2e")
+        );
+        // 空串视为未设置，回落到 ~/.boundless
+        let fallback = resolve_data_dir(Some(""));
+        assert!(fallback.ends_with(".boundless"), "{fallback:?}");
+        let default = resolve_data_dir(None);
+        assert!(default.ends_with(".boundless"), "{default:?}");
     }
 
     #[test]
