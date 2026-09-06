@@ -15,7 +15,7 @@ VERSION="${1:-0.0.0-local}"
 TARGET="aarch64-apple-darwin"
 APP="Boundless.app"
 
-echo "Building release binary for $TARGET…"
+echo "Building release binary for ${TARGET}…"
 cargo build --release --target "$TARGET"
 
 echo "Assembling $APP (v$VERSION)…"
