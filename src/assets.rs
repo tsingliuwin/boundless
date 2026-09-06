@@ -48,8 +48,14 @@ impl AssetStore {
             return Some(img.clone());
         }
         let bytes = std::fs::read(self.dir.join(name)).ok()?;
-        // RenderImage frames are RGBA; image::open covers png/jpeg/gif/webp.
-        let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+        let mut img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+        // gpui 的约定：Metal 图集多色纹理是 BGRA8Unorm、原样上传字节，所以
+        // RenderImage 帧必须是 BGRA（见 gpui 剪贴板/图片元素的同类转换，以及
+        // board.rs 纸纹贴图按 B,G,R 写像素）。直接喂 RGBA 会让红蓝互换——
+        // 画布上图片颜色失真的根因。
+        for pixel in img.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
         let render = Arc::new(RenderImage::new(vec![image::Frame::new(img)]));
         self.cache.borrow_mut().insert(name.to_string(), render.clone());
         Some(render)
@@ -112,6 +118,20 @@ mod tests {
             std::sync::Arc::ptr_eq(&first, &second),
             "second load must be the cached Arc"
         );
+    }
+
+    #[test]
+    fn load_swaps_to_bgra_for_gpui_atlas() {
+        // gpui 的 Metal 图集多色纹理是 BGRA8Unorm 且原样上传字节：帧必须是
+        // BGRA，否则画布上图片红蓝互换（颜色失真 bug 的回归锁）。
+        let store = temp_store();
+        let name = store.store(&tiny_png(), "png").expect("store");
+        let img = store.load(&name).expect("decode");
+        let bytes = img.as_bytes(0).expect("frame bytes");
+        // tiny_png 像素 0 = 纯红 (255,0,0,255) → BGRA 后 [0,0,255,255]。
+        assert_eq!(&bytes[0..4], &[0, 0, 255, 255]);
+        // 像素 1 = 纯蓝 (0,0,255,255) → BGRA 后 [255,0,0,255]。
+        assert_eq!(&bytes[4..8], &[255, 0, 0, 255]);
     }
 
     #[test]
