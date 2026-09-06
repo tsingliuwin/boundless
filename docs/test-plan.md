@@ -74,8 +74,8 @@ L1  单元 (src/**)      纯函数：几何、布局、解析、状态机（现�
 
 | ID | 用例 | 操作 | 断言 | 优先级 | 状态 |
 |---|---|---|---|---|---|
-| U-RD-001 | 五种 fill_style 出图 | 矩形×{hachure,dense,solid,watercolor,gradient} 生成 `paths_for_element` | 全部非空；仅 gradient 走 FillPath（实=双遍密排 FillSketch，见 §4.3 说明） | P0 | ✅（2026-09-06 `all_fill_styles_produce_paths`） |
-| U-RD-002 | 渐变色标方向 | gradient 矩形 fill_color | `Background::Gradient`，180°，stop0=lighten(0.35)、stop1=darken(0.35) | P0 | ✅（2026-09-06） |
+| U-RD-001 | 五种 fill_style 出图 | 矩形×{hachure,dense,solid,watercolor,gradient} 生成 `paths_for_element` | 全部非空；**任何样式都不走 FillPath**（真机不可见，含 macOS——见测试日志 2026-09-06 追加轮）（实=双遍密排 FillSketch） | P0 | ✅（2026-09-06 更新期望表） |
+| U-RD-002 | 渐变逐线上色 | 用户真实元素（黄底椭圆+飞白）world_geometry | 零 FillPath；每根排线单 OpSet 带色，颜色=按 y 在 lighten/darken(35%) 间精确插值、单调顶亮底暗 | P0 | ✅（2026-09-06 重写，原 FillPath 断言已废弃） |
 | U-RD-003 | fill_params 密度序 | 比较 5 种样式 (gap, weight) | hachure gap > dense > solid；watercolor/gradient 符合预设值 | P1 | 🆕 |
 | U-RD-004 | hachure 覆盖参数生效 | `hachure_gap/fill_weight/hachure_angle` 设定后几何 | 排线行数 = f(bounds/gap)；角度改变行方向 | P1 | 🆕 |
 | U-RD-005 | dry_width 参数 | 飞白 dry_width=2.0 vs 0.2 | 主笔 PaintOverride.width 线性跟随 | P1 | 🆕 |

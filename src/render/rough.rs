@@ -8,7 +8,7 @@ use roughr::Srgba;
 use crate::camera::Camera;
 use crate::scene::{
     curve_samples, diamond_polygon, Element, ElementKind, ElementStyle,
-    FillStyle as SceneFillStyle, LineType, StrokeStyle, WPoint,
+    FillStyle as SceneFillStyle, LineType, StrokeStyle, WBounds, WPoint,
 };
 use roughr::core::{FillStyle, LineCap, LineJoin, OpSetType, Options};
 
@@ -143,20 +143,17 @@ fn options_for(style: &ElementStyle, seed: u64, is_freedraw: bool) -> Options {
     if let Some(bg) = style.background {
         options.fill = Some(srgba(bg, style.opacity));
         // gpui 0.2.2 在 Windows 上 PathBuilder::fill() 的产物不可见（最小
-        // 复现工程 fill_repro 证实：同窗口 quad 正常、fill 路径消失）。因此
-        // 除渐变外所有填充统一走已被证明可靠的排线（FillSketch→stroke）管线；
-        // macOS 的 path 着色器原生支持渐变（fill_color 按 path bounds 解析
-        // gradient stops），渐变样式让 roughr 走 Solid → FillPath，paint 阶段
-        // 用 linear_gradient 一次画成真实渐变面（Windows 上渐变会回退为
-        // 不可见——与所有 fill 路径同命运，排线近似仍是那里的兜底方案）。
+        // 复现工程 fill_repro 证实：同窗口 quad 正常、fill 路径消失）。而
+        // macOS 真机上 FillPath + 渐变同样不显示（描边正常、填充面消失，
+        // 2026-09-06 用户实测；「着色器支持」只是读码推断，从未上屏验证
+        // 过）。因此所有填充——包括渐变——一律走已被证明可靠的排线
+        // （FillSketch→stroke）管线；渐变由 rough_shape 按每根排线的
+        // y 位置在 lighten→darken 之间逐线上色，密排重叠 → 视觉平滑。
         // 间距/线宽参数统一由 fill_params 决定；注意 fill_weight 必须在
         // 绘制阶段以 PaintOverride.width 回传（见 paint_world_geom）——
         // roughr 生成期不会把线宽烘焙进几何。
         let (gap, weight) = fill_params(style);
-        options.fill_style = Some(match style.fill_style {
-            SceneFillStyle::Gradient => FillStyle::Solid,
-            _ => FillStyle::Hachure,
-        });
+        options.fill_style = Some(FillStyle::Hachure);
         options.fill_weight = Some(weight);
         options.hachure_gap = Some(gap);
         if let Some(angle) = style.hachure_angle {
@@ -189,10 +186,11 @@ fn fill_params(style: &ElementStyle) -> (f32, f32) {
             let gap = (sw * 1.1).max(1.2);
             (gap, gap * 1.7)
         }
-        // 渐变：几何走 Solid（FillPath 真渐变面），这组排线参数不参与渲染。
+        // 渐变：密排重叠排线（线宽 ≈ 2.2× 间距，无白缝），由 rough_shape
+        // 按每根线的 y 位置逐线上色 —— 视觉等效平滑渐变。
         SceneFillStyle::Gradient => {
-            let gap = (sw * 0.55).max(0.8);
-            (gap, gap * 1.15)
+            let gap = (sw * 0.9).max(1.2);
+            (gap, gap * 2.2)
         }
     };
     // Agent 级细粒度参数逐项覆盖预设派生值（字段为 f64 世界单位）。
@@ -321,6 +319,16 @@ fn lighten(rgb: u32, factor: f32) -> u32 {
     (lr << 16) | (lg << 8) | lb
 }
 
+/// Per-channel lerp between two Hsla colors (gradient line coloring).
+fn lerp_hsla(a: Hsla, b: Hsla, t: f32) -> Hsla {
+    Hsla {
+        h: a.h + (b.h - a.h) * t,
+        s: a.s + (b.s - a.s) * t,
+        l: a.l + (b.l - a.l) * t,
+        a: a.a + (b.a - a.a) * t,
+    }
+}
+
 /// Per-channel darkening of a 0xRRGGBB color (watercolor edge pooling).
 fn darken(rgb: u32, factor: f32) -> u32 {
     let r = (((rgb >> 16) & 0xff) as f32 * factor).round() as u32;
@@ -373,12 +381,13 @@ pub fn paths_for_element(
 fn rough_shape(
     style: &ElementStyle,
     seed: u64,
-    center: WPoint,
+    bounds: WBounds,
     draw: impl Fn(&KurboGenerator) -> rough_piet::KurboDrawable<f64>,
 ) -> WorldGeom {
     let fill_on = style.background.is_some();
     let watercolor = fill_on && style.fill_style == SceneFillStyle::Watercolor;
     let sw = style.stroke_width as f32;
+    let center = bounds.center();
 
     // Base pass: outline + the style's fill — except watercolor, whose fill
     // comes entirely from the layered washes below (stroke-only here).
@@ -500,6 +509,64 @@ fn rough_shape(
                     );
                 }
             }
+            // 渐变：每根填充排线按其中点 y 在 lighten→darken 之间插值上色
+            // （顶亮底暗，180° CSS 角约定），密排重叠 → 视觉平滑渐变面。
+            // 不走 FillPath：真机上不可见，见 options_for 的注释。
+            // roughr 把整片排线装进一个 FillSketch OpSet —— 按线拆分成
+            // 每 MoveTo 段一个 OpSet，才能逐线上色。
+            SceneFillStyle::Gradient => {
+                let bg = style.background.unwrap_or(0);
+                let op = style.opacity;
+                let top = color_u32(lighten(bg, 0.35), op);
+                let bottom = color_u32(darken(bg, 0.35), op);
+                let (_, weight) = fill_params(style);
+                let y0 = bounds.y;
+                let y1 = bounds.y + bounds.h;
+                let mut gradient_sets: Vec<RoughOpSet> = Vec::new();
+                for set in sets.drain(..) {
+                    if set.op_set_type != OpSetType::FillSketch {
+                        gradient_sets.push(set);
+                        continue;
+                    }
+                    let mut current: Vec<kurbo::PathEl> = Vec::new();
+                    let mut flush = |line: &mut Vec<kurbo::PathEl>, out: &mut Vec<RoughOpSet>| {
+                        let ys: Vec<f64> = line
+                            .iter()
+                            .filter_map(|el| match el {
+                                kurbo::PathEl::MoveTo(p) | kurbo::PathEl::LineTo(p) => Some(p.y),
+                                _ => None,
+                            })
+                            .collect();
+                        if ys.is_empty() {
+                            return;
+                        }
+                        let ymid: f64 = ys.iter().sum::<f64>() / ys.len() as f64;
+                        let t = if y1 > y0 {
+                            ((ymid - y0) / (y1 - y0)).clamp(0.0, 1.0) as f32
+                        } else {
+                            0.0
+                        };
+                        let mut ops = kurbo::BezPath::new();
+                        ops.extend(line.drain(..));
+                        out.push(RoughOpSet {
+                            op_set_type: OpSetType::FillSketch,
+                            ops,
+                            paint: Some(PaintOverride {
+                                color: Some(lerp_hsla(top, bottom, t)),
+                                width: Some(weight as f64),
+                            }),
+                        });
+                    };
+                    for el in set.ops.elements() {
+                        if matches!(el, kurbo::PathEl::MoveTo(_)) {
+                            flush(&mut current, &mut gradient_sets);
+                        }
+                        current.push(*el);
+                    }
+                    flush(&mut current, &mut gradient_sets);
+                }
+                sets = gradient_sets;
+            }
             _ => {}
         }
     }
@@ -517,9 +584,7 @@ pub fn world_geometry(el: &Element) -> WorldGeom {
             if b.w < 0.01 || b.h < 0.01 {
                 return WorldGeom::Empty;
             }
-            rough_shape(style, el.seed, b.center(), |gen| {
-                gen.rectangle(b.x, b.y, b.w, b.h)
-            })
+            rough_shape(style, el.seed, *b, |gen| gen.rectangle(b.x, b.y, b.w, b.h))
         }
         ElementKind::Ellipse => {
             if b.w < 0.01 || b.h < 0.01 {
@@ -528,7 +593,7 @@ pub fn world_geometry(el: &Element) -> WorldGeom {
             // roughr's ellipse treats (x, y) as the CENTER and width/height as
             // diameters, but our bounds.x/y is the top-left corner. Translate.
             let center = b.center();
-            rough_shape(style, el.seed, center, |gen| {
+            rough_shape(style, el.seed, *b, |gen| {
                 gen.ellipse(center.x, center.y, b.w, b.h)
             })
         }
@@ -537,7 +602,7 @@ pub fn world_geometry(el: &Element) -> WorldGeom {
                 return WorldGeom::Empty;
             }
             let points: Vec<_> = diamond_polygon(b).iter().map(|p| to_euclid(*p)).collect();
-            rough_shape(style, el.seed, b.center(), |gen: &KurboGenerator| {
+            rough_shape(style, el.seed, *b, |gen: &KurboGenerator| {
                 gen.polygon(&points)
             })
         }
@@ -552,9 +617,9 @@ pub fn world_geometry(el: &Element) -> WorldGeom {
             let pts: Vec<_> = points.iter().map(|p| to_euclid(*p)).collect();
             if *smooth {
                 let bez = closed_catmull_rom_bez(&points);
-                rough_shape(style, el.seed, b.center(), |gen| gen.bez_path(bez.clone()))
+                rough_shape(style, el.seed, *b, |gen| gen.bez_path(bez.clone()))
             } else {
-                rough_shape(style, el.seed, b.center(), |gen: &KurboGenerator| {
+                rough_shape(style, el.seed, *b, |gen: &KurboGenerator| {
                     gen.polygon(&pts)
                 })
             }
@@ -986,31 +1051,92 @@ mod tests {
     }
 
     #[test]
-    fn gradient_ellipse_renders_a_true_gradient_fill_path() {
+    fn gradient_fill_colors_hachure_lines_top_light_bottom_dark() {
+        // U-RD-002（回归）：FillPath+渐变在真机（gpui 0.2.2 Metal）上不渲染
+        // （描边正常、填充面消失，2026-09-06 用户实测）。渐变必须走
+        // FillSketch 排线管线并逐线上色 —— 本用例取用户画板里的真实元素
+        // （黄底椭圆、飞白笔刷、真实 seed/尺寸），断言：
+        //   1) 不再产出任何 FillPath；
+        //   2) 排线被拆成每线一个 OpSet 且都带 PaintOverride 颜色；
+        //   3) 按 y 排序后颜色从 lighten(35%) 单调过渡到 darken(35%)。
+        let mut el = Element::new(
+            ElementKind::Ellipse,
+            WBounds::new(139.71875, 11.3984375, 250.8515625, 151.796875),
+            ElementStyle {
+                background: Some(0xffd949),
+                fill_style: SceneFillStyle::Gradient,
+                brush: Some(crate::scene::Brush::DryBrush),
+                ..Default::default()
+            },
+        );
+        el.seed = 9626531750521935218;
+
+        let sets = match world_geometry(&el) {
+            WorldGeom::Rough(sets) => sets,
+            _ => panic!("expected rough geom"),
+        };
+        assert!(
+            sets.iter().all(|s| s.op_set_type != OpSetType::FillPath),
+            "gradient must not rely on FillPath (invisible on device)"
+        );
+        let mut lines: Vec<(f64, Hsla)> = sets
+            .iter()
+            .filter(|s| s.op_set_type == OpSetType::FillSketch)
+            .map(|s| {
+                let paint = s.paint.as_ref().expect("gradient line must carry color");
+                let color = paint.color.expect("gradient line must carry a color");
+                let ys: Vec<f64> = s
+                    .ops
+                    .elements()
+                    .iter()
+                    .filter_map(|el| match el {
+                        kurbo::PathEl::MoveTo(p) | kurbo::PathEl::LineTo(p) => Some(p.y),
+                        _ => None,
+                    })
+                    .collect();
+                (ys.iter().sum::<f64>() / ys.len() as f64, color)
+            })
+            .collect();
+        assert!(
+            lines.len() >= 10,
+            "gradient needs fine hachure lines, got {}",
+            lines.len()
+        );
+        lines.sort_by(|a, b| a.0.total_cmp(&b.0));
+        // 每根线的颜色必须精确等于按其中点 y 插值的期望色（顶亮底暗）。
+        let top = color_u32(lighten(0xffd949, 0.35), 1.0);
+        let bottom = color_u32(darken(0xffd949, 0.35), 1.0);
+        let (y0, y1) = (el.bounds.y, el.bounds.y + el.bounds.h);
+        let lightness = |c: Hsla| c.l;
+        for (ymid, color) in &lines {
+            let t = if y1 > y0 {
+                (((ymid - y0) / (y1 - y0)) as f32).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let expected = lerp_hsla(top, bottom, t);
+            assert!(
+                (lightness(*color) - lightness(expected)).abs() < 1e-4,
+                "line at y={ymid} colored {color:?}, expected {expected:?}"
+            );
+        }
+        // 两端方向性：最高线明显比最低线亮。
+        assert!(
+            lightness(lines[0].1) > lightness(lines.last().unwrap().1) + 0.2,
+            "gradient must go light → dark top→bottom"
+        );
+
+        // 绘制输出：所有填充线都以 Solid 颜色出图（不再有渐变 Background）。
         let camera = Camera::default();
         let origin = gpui::point(px(0.0), px(0.0));
-        let style = ElementStyle {
-            background: Some(0xa5d8ff),
-            fill_style: SceneFillStyle::Gradient,
-            ..Default::default()
-        };
-        let el = Element::new(
-            ElementKind::Ellipse,
-            WBounds::new(0.0, 0.0, 100.0, 80.0),
-            style,
-        );
-        // True gradient: the fill is ONE FillPath opset (roughr Solid) painted
-        // with a linear_gradient Background — not per-line hachure coloring.
-        match world_geometry(&el) {
-            WorldGeom::Rough(sets) => assert!(
-                sets.iter().any(|s| s.op_set_type == OpSetType::FillPath),
-                "gradient fill must produce a single FillPath face"
-            ),
-            _ => panic!("expected rough geom"),
-        }
         let paths = paths_for_element(&el, &camera, origin);
-        // 1 gradient face + the outline passes.
-        assert!(paths.len() >= 2, "expected fill face + outline, got {}", paths.len());
+        assert!(paths.len() > lines.len(), "fill lines + outline expected");
+        assert!(
+            !paths
+                .iter()
+                .any(|p| format!("{:?}", p.color).starts_with("LinearGradient")),
+            "no LinearGradient should remain on the paint path"
+        );
     }
 
     #[test]
@@ -1020,12 +1146,14 @@ mod tests {
         // 真填充面（Windows fill 不可见的平台约束，见 options_for）。
         let camera = Camera::default();
         let origin = gpui::point(px(0.0), px(0.0));
+        // 渐变也不走 FillPath（真机不可见，见 gradient_fill_colors_* 用例），
+        // 它与其它样式的差别在「逐线颜色」而非图元类型。
         for (fs, want_fill_path) in [
             (SceneFillStyle::Hachure, false),
             (SceneFillStyle::Dense, false),
             (SceneFillStyle::Solid, false),
             (SceneFillStyle::Watercolor, false),
-            (SceneFillStyle::Gradient, true),
+            (SceneFillStyle::Gradient, false),
         ] {
             let el = Element::new(
                 ElementKind::Rectangle,
