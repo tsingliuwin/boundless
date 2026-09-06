@@ -156,7 +156,12 @@ fn options_for(style: &ElementStyle, seed: u64, is_freedraw: bool) -> Options {
         options.fill_style = Some(FillStyle::Hachure);
         options.fill_weight = Some(weight);
         options.hachure_gap = Some(gap);
-        if let Some(angle) = style.hachure_angle {
+        if style.fill_style == SceneFillStyle::Gradient {
+            // 渐变逐线上色的等色线 = 排线本身，排线必须水平才是「顶亮底暗」
+            // 的垂直渐变。⚠️ roughr 的 hachure_angle=0 画出的是竖直线
+            // （实测：线端点 ymid 全挤在形状中央），水平线是 ±90。
+            options.set_hachure_angle(Some(90.0));
+        } else if let Some(angle) = style.hachure_angle {
             options.set_hachure_angle(Some(angle as f32));
         }
         options.disable_multi_stroke_fill = Some(true);
@@ -186,11 +191,12 @@ fn fill_params(style: &ElementStyle) -> (f32, f32) {
             let gap = (sw * 1.1).max(1.2);
             (gap, gap * 1.7)
         }
-        // 渐变：密排重叠排线（线宽 ≈ 2.2× 间距，无白缝），由 rough_shape
-        // 按每根线的 y 位置逐线上色 —— 视觉等效平滑渐变。
+        // 渐变：密排重叠排线（线宽 ≈ 3× 间距；roughr 的逐线抖动会让局部
+        // 间距变大，2.2× 时会漏白缝），由 rough_shape 按每根线的 y 位置
+        // 逐线上色 —— 视觉等效平滑渐变。
         SceneFillStyle::Gradient => {
             let gap = (sw * 0.9).max(1.2);
-            (gap, gap * 2.2)
+            (gap, gap * 3.0)
         }
     };
     // Agent 级细粒度参数逐项覆盖预设派生值（字段为 f64 世界单位）。
@@ -534,6 +540,8 @@ fn rough_shape(
                             .iter()
                             .filter_map(|el| match el {
                                 kurbo::PathEl::MoveTo(p) | kurbo::PathEl::LineTo(p) => Some(p.y),
+                                // roughr 的填充线是带抖动的三次曲线，终点才是线的另一端
+                                kurbo::PathEl::CurveTo(_, _, p) => Some(p.y),
                                 _ => None,
                             })
                             .collect();
@@ -1091,6 +1099,7 @@ mod tests {
                     .iter()
                     .filter_map(|el| match el {
                         kurbo::PathEl::MoveTo(p) | kurbo::PathEl::LineTo(p) => Some(p.y),
+                        kurbo::PathEl::CurveTo(_, _, p) => Some(p.y),
                         _ => None,
                     })
                     .collect();
