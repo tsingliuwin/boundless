@@ -267,6 +267,85 @@ fn point_slice_mut(el: &mut Element) -> Option<&mut Vec<WPoint>> {
     }
 }
 
+/// 盖章/插入的碰撞提示（纯函数，供 `insert_elements` 把警告附在返回消息里）。
+///
+/// 只抓"同类体量、半掩埋"的叠放——那通常是一致性事故（窗穿头、道具压脸、
+/// 同一角色盖到同一处）。刻意排除三类正常情况：
+/// - 细长/小元素（最短边 < 40）：地面线、桌沿、四肢、小道具——遮挡和被
+///   遮挡都是常态；
+/// - 体量差 > 6 倍的包含关系：角色站在大幅背景板/分格框前是构图常态；
+/// - 文字与线状元素不参与（文字压底、气泡压头发都合法）。
+/// 命中的语义交给模型判断：有意遮挡（桌挡腿、坐进沙发）可忽略，无意碰撞
+/// 必须 `update_element` 挪开。最多返回 3 条，防止刷屏。
+pub fn overlap_warnings(existing: &[Element], incoming: &[Element]) -> Vec<String> {
+    const MIN_SIDE: f64 = 40.0;
+    const MAX_RATIO: f64 = 6.0;
+    const MIN_BURIED: f64 = 0.5;
+    const MAX_HINTS: usize = 3;
+
+    let solid = |el: &Element| {
+        matches!(
+            el.kind,
+            ElementKind::Rectangle
+                | ElementKind::Ellipse
+                | ElementKind::Diamond
+                | ElementKind::Polygon { .. }
+                | ElementKind::Image { .. }
+        )
+    };
+    let sizable = |el: &Element| el.bounds.w >= MIN_SIDE && el.bounds.h >= MIN_SIDE;
+    let kind_label = |el: &Element| match el.kind {
+        ElementKind::Rectangle => "矩形",
+        ElementKind::Ellipse => "椭圆",
+        ElementKind::Diamond => "菱形",
+        ElementKind::Polygon { .. } => "多边形",
+        ElementKind::Image { .. } => "图片",
+        _ => "元素",
+    };
+    let area = |b: crate::scene::WBounds| (b.w * b.h).max(1.0);
+
+    let mut hints = Vec::new();
+    for nel in incoming {
+        if !solid(nel) || !sizable(nel) {
+            continue;
+        }
+        for el in existing {
+            if !solid(el) || !sizable(el) {
+                continue;
+            }
+            let a = area(nel.bounds);
+            let b = area(el.bounds);
+            let (small, big) = if a <= b { (a, b) } else { (b, a) };
+            if big / small > MAX_RATIO {
+                continue;
+            }
+            let ix = nel.bounds.x.max(el.bounds.x);
+            let iy = nel.bounds.y.max(el.bounds.y);
+            let iw = nel.bounds.right().min(el.bounds.right()) - ix;
+            let ih = nel.bounds.bottom().min(el.bounds.bottom()) - iy;
+            if iw <= 0.0 || ih <= 0.0 {
+                continue;
+            }
+            let buried = (iw * ih) / small;
+            if buried < MIN_BURIED {
+                continue;
+            }
+            hints.push(format!(
+                "新{} {} 与既有{} {} 重叠 {:.0}%——若是有意遮挡（桌挡腿/坐进沙发）可忽略，无意碰撞请用 update_element 挪开",
+                kind_label(nel),
+                nel.id.to_string().get(..8).unwrap_or(""),
+                kind_label(el),
+                el.id.to_string().get(..8).unwrap_or(""),
+                buried * 100.0
+            ));
+            if hints.len() >= MAX_HINTS {
+                return hints;
+            }
+        }
+    }
+    hints
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,6 +532,51 @@ mod tests {
             elements: vec![],
         }, 0.0, 0.0, 1.0, false)
         .is_err());
+    }
+
+    #[test]
+    fn overlap_warnings_catches_buried_same_scale_shapes() {
+        // 复刻三轮漫画的事故：房间模板的窗户(100x120)撞上角色头部(80x80)。
+        let window = rect(90.0, 90.0, 100.0, 120.0, Some(0xa5d8ff));
+        let head = rect(100.0, 100.0, 80.0, 80.0, Some(0xffd8a8));
+        let hints = overlap_warnings(&[window], &[head]);
+        assert_eq!(hints.len(), 1);
+        assert!(hints[0].contains("100%"), "{}", hints[0]);
+        assert!(hints[0].contains("update_element"), "{}", hints[0]);
+    }
+
+    #[test]
+    fn overlap_warnings_ignores_normal_composition() {
+        // 地面线（细长）与角色：不算碰撞。
+        let ground = Element::from_absolute_points(
+            |points| ElementKind::Line { points },
+            vec![WPoint::new(0.0, 500.0), WPoint::new(700.0, 500.0)],
+            crate::scene::ElementStyle::default(),
+        );
+        let body = rect(100.0, 360.0, 100.0, 140.0, None);
+        assert!(overlap_warnings(&[ground], std::slice::from_ref(&body)).is_empty());
+
+        // 大幅背景板吞掉角色（体量差 > 6 倍）：构图常态，不算碰撞。
+        let backdrop = rect(0.0, 0.0, 700.0, 420.0, Some(0xf5efdc));
+        assert!(overlap_warnings(&[backdrop], std::slice::from_ref(&body)).is_empty());
+
+        // 文字元素不参与。
+        let label = bound_label(&body, "字");
+        assert!(overlap_warnings(std::slice::from_ref(&body), &[label]).is_empty());
+
+        // 不相交不算。
+        let elsewhere = rect(900.0, 100.0, 80.0, 80.0, None);
+        assert!(overlap_warnings(std::slice::from_ref(&body), &[elsewhere]).is_empty());
+    }
+
+    #[test]
+    fn overlap_warnings_caps_at_three() {
+        let existing: Vec<Element> = (0..5)
+            .map(|i| rect(100.0 + i as f64 * 5.0, 100.0, 200.0, 150.0, None))
+            .collect();
+        // 五个同位大矩形都半掩埋新矩形 → 只报前 3 条。
+        let hints = overlap_warnings(&existing, &[rect(105.0, 105.0, 150.0, 100.0, None)]);
+        assert_eq!(hints.len(), 3);
     }
 
     #[test]

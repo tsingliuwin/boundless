@@ -1893,6 +1893,9 @@ impl BoardView {
         if elements.is_empty() {
             return Err(CanvasOpError::invalid_args("没有可插入的元素"));
         }
+        // 碰撞提示在插入前算：与既有"同类体量"元素的半掩埋叠放通常是事故
+        // （窗穿头/道具压脸），把警告附在结果里让模型自行判断处置。
+        let hints = crate::scene::templates::overlap_warnings(&self.scene.elements, &elements);
         self.history.record(&self.scene);
         let mut short_ids: Vec<String> = Vec::with_capacity(elements.len());
         let mut bbox: Option<WBounds> = None;
@@ -1925,11 +1928,16 @@ impl BoardView {
         }
         self.mark_dirty();
         cx.notify();
-        Ok(format!(
+        let mut message = format!(
             "已插入 {} 个元素，id 依次为：{}",
             short_ids.len(),
             short_ids.join(", ")
-        ))
+        );
+        if !hints.is_empty() {
+            message.push_str("。⚠️ 碰撞提示：");
+            message.push_str(&hints.join("；"));
+        }
+        Ok(message)
     }
 
     /// Build a lightweight snapshot of all canvas elements for the AI agent's
