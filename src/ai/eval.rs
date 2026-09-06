@@ -237,6 +237,38 @@ pub fn apply(
             c.ops_applied += 1;
             msg = format!("已删除元素 id={}", &id[..id.len().min(8)]);
         }
+        CanvasOp::SetElementPoints { id, points } => {
+            let Some(el) = c.elements.iter_mut().find(|e| id_matches(&e.id, id)) else {
+                c.ops_failed += 1;
+                return Err(format!("找不到元素 id={id}"));
+            };
+            if points.len() < 2 || points.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
+                c.ops_failed += 1;
+                return Err("points 需要 ≥ 2 个有限坐标点".to_string());
+            }
+            match el.points.as_mut() {
+                Some(pts) => {
+                    *pts = points.iter().map(|p| [p.x, p.y]).collect();
+                    // Mirror the board's bounds rebuild from the new points.
+                    let min_x = pts.iter().map(|p| p[0]).fold(f64::INFINITY, f64::min);
+                    let min_y = pts.iter().map(|p| p[1]).fold(f64::INFINITY, f64::min);
+                    let max_x = pts.iter().map(|p| p[0]).fold(f64::NEG_INFINITY, f64::max);
+                    let max_y = pts.iter().map(|p| p[1]).fold(f64::NEG_INFINITY, f64::max);
+                    el.x = min_x;
+                    el.y = min_y;
+                    el.w = max_x - min_x;
+                    el.h = max_y - min_y;
+                    c.ops_applied += 1;
+                    msg = format!("已调整 id={} 的形状（{} 个点）。肢体动作已更新", el.id, pts.len());
+                }
+                None => {
+                    c.ops_failed += 1;
+                    return Err(
+                        "该元素不支持摆姿势（只有线条/箭头/多边形/自由绘制可以改点）".to_string(),
+                    );
+                }
+            }
+        }
         CanvasOp::UpdateElement {
             id,
             x,

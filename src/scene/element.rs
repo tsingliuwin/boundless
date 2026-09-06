@@ -694,6 +694,54 @@ impl Element {
         self.normalize_point_bounds();
     }
 
+    /// Replace the absolute (world-space) points of a point-based element,
+    /// rebuilding bounds and relative points. The point count MAY change —
+    /// adding points to a line adds joints (an elbow turns a straight arm
+    /// into a bent one); arrowheads / polygon smoothness are preserved, and
+    /// freedraw widths are kept when still parallel, else reset to uniform
+    /// ratios. Returns false for non-point-based elements or invalid input
+    /// (< 2 points, non-finite coords) — callers translate that into a
+    /// corrective error.
+    pub fn set_absolute_points(&mut self, points: Vec<WPoint>) -> bool {
+        if !self.is_point_based() {
+            return false;
+        }
+        if points.len() < 2 || points.iter().any(|p| !(p.x.is_finite() && p.y.is_finite())) {
+            return false;
+        }
+        let old_widths = match &self.kind {
+            ElementKind::Freedraw { widths, .. } => Some(widths.clone()),
+            _ => None,
+        };
+        let old_kind = std::mem::replace(&mut self.kind, ElementKind::Rectangle);
+        self.kind = match old_kind {
+            ElementKind::Line { .. } => ElementKind::Line { points },
+            ElementKind::Arrow {
+                end_arrowhead,
+                start_arrowhead,
+                ..
+            } => ElementKind::Arrow {
+                points,
+                end_arrowhead,
+                start_arrowhead,
+            },
+            ElementKind::Freedraw { .. } => {
+                let widths = match old_widths {
+                    Some(w) if w.len() == points.len() => w,
+                    _ => vec![1.0; points.len()],
+                };
+                ElementKind::Freedraw { points, widths }
+            }
+            ElementKind::Polygon { smooth, .. } => ElementKind::Polygon { points, smooth },
+            _ => unreachable!("is_point_based guard"),
+        };
+        // kind 里现在存的是绝对点：把 bounds 原点清零后，normalize 会把
+        // 它们当作"相对点 + (0,0) origin"重新归一化成标准形态。
+        self.bounds = WBounds::default();
+        self.normalize_point_bounds();
+        true
+    }
+
     /// Hit test in world coordinates. `tol` is a world-space tolerance.
     pub fn hit_test(&self, p: WPoint, tol: f64) -> bool {
         let stroke_tol = (self.effective_stroke_width() / 2.0).max(2.0) + tol;
@@ -887,6 +935,67 @@ mod tests {
 
     fn rect_style() -> ElementStyle {
         ElementStyle::default()
+    }
+
+    #[test]
+    fn set_absolute_points_rejoints_limbs_and_keeps_flags() {
+        // 直手臂（2 点）改成折臂（3 点）：点数可变、bounds 归一化。
+        let mut arm = Element::from_absolute_points(
+            |points| ElementKind::Line { points },
+            vec![WPoint::new(100.0, 100.0), WPoint::new(160.0, 130.0)],
+            rect_style(),
+        );
+        assert!(arm.set_absolute_points(vec![
+            WPoint::new(100.0, 100.0),
+            WPoint::new(130.0, 115.0),
+            WPoint::new(150.0, 80.0),
+        ]));
+        let abs = arm.absolute_points();
+        assert_eq!(abs.len(), 3);
+        assert_eq!(abs[2], WPoint::new(150.0, 80.0), "绝对点原样可读");
+        assert_eq!(
+            (arm.bounds.x, arm.bounds.y),
+            (100.0, 80.0),
+            "bounds 覆盖新点集"
+        );
+        assert!((arm.bounds.h - 35.0).abs() < 1e-9);
+
+        // 箭头标志在重建后保留。
+        let mut arrow = Element::from_absolute_points(
+            |points| ElementKind::Arrow {
+                points,
+                end_arrowhead: true,
+                start_arrowhead: false,
+            },
+            vec![WPoint::new(0.0, 0.0), WPoint::new(10.0, 0.0)],
+            rect_style(),
+        );
+        assert!(arrow.set_absolute_points(vec![
+            WPoint::new(0.0, 0.0),
+            WPoint::new(5.0, 5.0),
+            WPoint::new(10.0, 10.0),
+        ]));
+        assert!(matches!(
+            arrow.kind,
+            ElementKind::Arrow {
+                end_arrowhead: true,
+                start_arrowhead: false,
+                ..
+            }
+        ));
+
+        // 非点集元素与非法输入拒绝。
+        let mut rect = Element::new(
+            ElementKind::Rectangle,
+            WBounds::new(0.0, 0.0, 10.0, 10.0),
+            rect_style(),
+        );
+        assert!(!rect.set_absolute_points(vec![WPoint::new(0.0, 0.0), WPoint::new(1.0, 1.0)]));
+        assert!(!arm.set_absolute_points(vec![WPoint::new(0.0, 0.0)]));
+        assert!(!arm.set_absolute_points(vec![
+            WPoint::new(0.0, 0.0),
+            WPoint::new(f64::NAN, 1.0)
+        ]));
     }
 
     #[test]

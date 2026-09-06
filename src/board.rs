@@ -1704,6 +1704,35 @@ impl BoardView {
                 self.remove_element(uuid);
                 Ok(format!("已删除元素 id={}", &uuid.to_string()[..8]))
             }
+            CanvasOp::SetElementPoints { id, points } => {
+                let Some(uuid) = self.scene.find_by_id_prefix(&id) else {
+                    return Err(CanvasOpError::not_found(format!("找不到元素 id={id}")));
+                };
+                if points.len() < 2 || points.iter().any(|p| !p.x.is_finite() || !p.y.is_finite())
+                {
+                    return Err(CanvasOpError::invalid_args(
+                        "points 需要 ≥ 2 个有限坐标点",
+                    ));
+                }
+                let pts: Vec<WPoint> = points.into_iter().map(Into::into).collect();
+                let Some(el) = self.scene.elements.iter_mut().find(|e| e.id == uuid) else {
+                    return Err(CanvasOpError::not_found(format!("找不到元素 id={id}")));
+                };
+                if !el.set_absolute_points(pts) {
+                    return Err(CanvasOpError::invalid_args(
+                        "该元素不支持摆姿势（只有线条/箭头/多边形/自由绘制可以改点）",
+                    ));
+                }
+                self.history.record(&self.scene);
+                Ok(format!(
+                    "已调整 id={} 的形状（{} 个点）。肢体动作已更新",
+                    &uuid.to_string()[..8],
+                    self.scene
+                        .get(uuid)
+                        .map(|e| e.absolute_points().len())
+                        .unwrap_or(0)
+                ))
+            }
             CanvasOp::Clear => {
                 self.history.record(&self.scene);
                 self.scene.restore(Vec::new());

@@ -715,6 +715,93 @@ impl Tool for UpdateElementTool {
     }
 }
 
+// --- Pose Element（摆肢体/掰关节） ------------------------------------------
+
+/// Arguments for `pose_element`.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct PoseElementArgs {
+    /// 要摆姿势的元素 id（盖章返回的 8 位短 id；角色的手臂/腿是线条元素，
+    /// list_elements 里 kind=line/arrow/polygon）。
+    pub id: String,
+    /// 新的绝对坐标点序列（世界坐标，≥2 个）。点数可与原来不同：给直线
+    /// 加中间点 = 加关节（肘/膝）。例：把垂在身侧的直手臂 [(150,300),
+    /// (150,380)] 改成举起的折臂 [(150,300),(160,330),(120,300)]。
+    pub points: Vec<OpPoint>,
+}
+
+pub struct PoseElementTool {
+    pub events: UnboundedSender<AgentEvent>,
+    pub snapshot: Arc<Mutex<Vec<ElementSnapshot>>>,
+}
+
+fn validate_pose(args: &PoseElementArgs) -> Result<(), ToolError> {
+    if args.id.trim().is_empty() {
+        return Err(ToolError::invalid_args("id 不能为空"));
+    }
+    if args.points.len() < 2 {
+        return Err(ToolError::invalid_args("points 至少需要两个坐标点"));
+    }
+    if args.points.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
+        return Err(ToolError::invalid_args("坐标点必须是有限数值"));
+    }
+    Ok(())
+}
+
+impl Tool for PoseElementTool {
+    const NAME: &'static str = "pose_element";
+    type Error = ToolError;
+    type Args = PoseElementArgs;
+    type Output = String;
+
+    fn definition(
+        &self,
+        _prompt: String,
+    ) -> impl std::future::Future<Output = ToolDefinition> + Send {
+        let def = tool_def::<PoseElementArgs>(
+            Self::NAME,
+            "摆肢体姿势：替换线条/箭头/多边形元素的绝对坐标点（≥2，点数可变，加中间点=加关节）。这是角色肢体语言的核心工具——盖章后的角色手臂/腿是独立线条元素，用本工具掰出举手、摊手、指点、叉腰、扶额、奔跑摆臂等动作。禁止只让角色垂手站立说话。",
+        );
+        async move { def }
+    }
+
+    fn call(
+        &self,
+        args: Self::Args,
+    ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
+        let events = self.events.clone();
+        let snapshot = self.snapshot.clone();
+        let name = Self::NAME;
+        async move {
+            let id = next_tool_id(name);
+            let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
+            if let Err(e) = validate_pose(&args) {
+                return fail_tool(&events, id, name, args_json, e).await;
+            }
+            // Early id-existence check against the live snapshot（guard 在
+            // 块内释放，fail_tool 的 await 不得持锁跨 await）。
+            let id_exists = {
+                let snap = snapshot.lock().unwrap_or_else(|e| e.into_inner());
+                snapshot_has_id(&snap, args.id.trim())
+            };
+            if !id_exists {
+                return fail_tool(
+                    &events,
+                    id,
+                    name,
+                    args_json,
+                    ToolError::not_found(format!("找不到元素 id={}", args.id.trim())),
+                )
+                .await;
+            }
+            let op = CanvasOp::SetElementPoints {
+                id: args.id.trim().to_string(),
+                points: args.points,
+            };
+            run_canvas_op(&events, id, name, args_json, op, None).await
+        }
+    }
+}
+
 // --- Delete Element --------------------------------------------------------
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -2392,6 +2479,10 @@ pub fn all_tools(
             events: events.clone(),
             snapshot: snapshot.clone(),
         }),
+        Box::new(PoseElementTool {
+            events: events.clone(),
+            snapshot: snapshot.clone(),
+        }),
         Box::new(DeleteElementTool {
             events: events.clone(),
             snapshot: snapshot.clone(),
@@ -2683,6 +2774,65 @@ mod tests {
             }
         }
         assert!(saw_result, "no ToolResult event");
+    }
+
+    #[test]
+    fn validate_pose_requires_id_and_points() {
+        let mk = |id: &str, pts: Vec<(f64, f64)>| PoseElementArgs {
+            id: id.into(),
+            points: pts.into_iter().map(|(x, y)| OpPoint { x, y }).collect(),
+        };
+        assert!(validate_pose(&mk("a1b2c3d4", vec![(0.0, 0.0), (10.0, 10.0)])).is_ok());
+        assert!(validate_pose(&mk("  ", vec![(0.0, 0.0), (1.0, 1.0)])).is_err());
+        assert!(validate_pose(&mk("a1", vec![(0.0, 0.0)])).is_err());
+        assert!(validate_pose(&mk("a1", vec![(0.0, 0.0), (f64::NAN, 1.0)])).is_err());
+    }
+
+    /// pose_element 链路：ToolCall → SetElementPoints → 回执 → ToolResult。
+    #[test]
+    fn pose_tool_emits_set_element_points_op() {
+        use futures::task::noop_waker_ref;
+        use std::task::Context;
+
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<AgentEvent>();
+        let tool = PoseElementTool {
+            events: tx,
+            snapshot: Arc::new(std::sync::Mutex::new(vec![snap("a1b2c3d4")])),
+        };
+        let args = PoseElementArgs {
+            id: "a1b2c3d4".into(),
+            points: vec![
+                OpPoint { x: 150.0, y: 300.0 },
+                OpPoint { x: 160.0, y: 330.0 },
+                OpPoint { x: 120.0, y: 300.0 },
+            ],
+        };
+        let mut fut = Box::pin(tool.call(args));
+        let waker = noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+        match std::future::Future::poll(fut.as_mut(), &mut cx) {
+            std::task::Poll::Pending => {}
+            std::task::Poll::Ready(_) => panic!("completed before reply"),
+        }
+        let mut saw_op = false;
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::CanvasOp { op, reply, .. } = event {
+                match op {
+                    CanvasOp::SetElementPoints { id, points } => {
+                        assert_eq!(id, "a1b2c3d4");
+                        assert_eq!(points.len(), 3);
+                    }
+                    other => panic!("期望 SetElementPoints，实际 {other:?}"),
+                }
+                let _ = reply.send(Ok("已调整 id=a1b2c3d4 的形状（3 个点）".into()));
+                saw_op = true;
+            }
+        }
+        assert!(saw_op, "no SetElementPoints op");
+        match std::future::Future::poll(fut.as_mut(), &mut cx) {
+            std::task::Poll::Ready(Ok(msg)) => assert!(msg.contains("已调整")),
+            _ => panic!("did not complete after reply"),
+        }
     }
 
     fn mk_bubble() -> SpeechBubbleArgs {

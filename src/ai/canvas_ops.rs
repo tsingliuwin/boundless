@@ -235,6 +235,16 @@ pub enum CanvasOp {
     },
     /// Delete an element by id (also removes its bound label, if any).
     DeleteElement { id: String },
+    /// 摆姿势：把点集元素（线条/箭头/多边形/自由绘制）的绝对坐标点整体
+    /// 替换为 `points`（≥2）。点数可以和原来不同——给直线条加中间点就是
+    /// 加关节（肘/膝），这是角色肢体语言的核心操作。箭头标志、多边形
+    /// smooth、自由绘制的宽度比例（点数不变时）自动保留。
+    SetElementPoints {
+        /// 元素 id（8 位短前缀）。
+        id: String,
+        /// 新的绝对坐标点序列。
+        points: Vec<OpPoint>,
+    },
     /// Embed a raster image (PNG/JPEG/GIF/WebP/BMP) onto the canvas. The
     /// file is COPIED into the workspace asset store, so later moves or
     /// deletes of the original never break the board. Height derives from
@@ -522,6 +532,7 @@ impl CanvasOp {
             CanvasOp::Text { .. } => "文本",
             CanvasOp::UpdateElement { .. } => "修改",
             CanvasOp::DeleteElement { .. } => "删除",
+            CanvasOp::SetElementPoints { .. } => "摆姿势",
             CanvasOp::Clear => "清空",
             CanvasOp::SetBackground { .. } => "底色",
             CanvasOp::SetTexture { .. } => "纸纹",
