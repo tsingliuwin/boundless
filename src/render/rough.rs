@@ -302,6 +302,15 @@ fn closed_catmull_rom_bez(pts: &[WPoint]) -> kurbo::BezPath {
 /// 这组辅助已删除。
 
 /// Per-channel lightening of a 0xRRGGBB color toward white.
+/// 真·渐变的填充 Background：整个填充面（roughr Solid → FillPath 粗化
+/// 闭合外形）以单个 linear_gradient 一次画成 —— 顶部提亮 35%，底部加深
+/// 35%，平滑无级（180° = CSS 角度约定下的自上而下）。
+pub(crate) fn gradient_background(c: u32, opacity: f32) -> Background {
+    let top = gpui::linear_color_stop(color_u32(lighten(c, 0.35), opacity), 0.0);
+    let bottom = gpui::linear_color_stop(color_u32(darken(c, 0.35), opacity), 1.0);
+    gpui::linear_gradient(180.0, top, bottom)
+}
+
 fn lighten(rgb: u32, factor: f32) -> u32 {
     let r = ((rgb >> 16) & 0xff) as f32;
     let g = ((rgb >> 8) & 0xff) as f32;
@@ -751,15 +760,7 @@ pub fn paint_world_geom(
 
     let stroke_color = color_u32(style.stroke, style.opacity);
     let fill_color: Background = match (style.background, style.fill_style) {
-        // 真·渐变：整个填充面（roughr Solid → FillPath 粗化闭合外形）以
-        // 单个 linear_gradient 一次画成 —— 顶部提亮 35%，底部加深 35%，
-        // 平滑无级（180° = CSS 角度约定下的自上而下）。
-        (Some(c), SceneFillStyle::Gradient) => {
-            let top = gpui::linear_color_stop(color_u32(lighten(c, 0.35), style.opacity), 0.0);
-            let bottom =
-                gpui::linear_color_stop(color_u32(darken(c, 0.35), style.opacity), 1.0);
-            gpui::linear_gradient(180.0, top, bottom)
-        }
+        (Some(c), SceneFillStyle::Gradient) => gradient_background(c, style.opacity),
         (Some(c), _) => color_u32(c, style.opacity).into(),
         _ => stroke_color.into(),
     };
@@ -1010,6 +1011,93 @@ mod tests {
         let paths = paths_for_element(&el, &camera, origin);
         // 1 gradient face + the outline passes.
         assert!(paths.len() >= 2, "expected fill face + outline, got {}", paths.len());
+    }
+
+    #[test]
+    fn all_fill_styles_produce_paths() {
+        // U-RD-001：五种填充样式都必须出图。实 = 双遍密排 FillSketch
+        //（视觉近实心，见 solid_fill_ellipse 测试），只有渐变走 FillPath
+        // 真填充面（Windows fill 不可见的平台约束，见 options_for）。
+        let camera = Camera::default();
+        let origin = gpui::point(px(0.0), px(0.0));
+        for (fs, want_fill_path) in [
+            (SceneFillStyle::Hachure, false),
+            (SceneFillStyle::Dense, false),
+            (SceneFillStyle::Solid, false),
+            (SceneFillStyle::Watercolor, false),
+            (SceneFillStyle::Gradient, true),
+        ] {
+            let el = Element::new(
+                ElementKind::Rectangle,
+                WBounds::new(0.0, 0.0, 100.0, 80.0),
+                ElementStyle {
+                    background: Some(0xa5d8ff),
+                    fill_style: fs,
+                    ..Default::default()
+                },
+            );
+            let paths = paths_for_element(&el, &camera, origin);
+            assert!(!paths.is_empty(), "{fs:?} produced no paths");
+            let has_fill_path = matches!(
+                world_geometry(&el),
+                WorldGeom::Rough(ref sets) if sets.iter().any(|s| s.op_set_type == OpSetType::FillPath)
+            );
+            assert_eq!(
+                has_fill_path, want_fill_path,
+                "{fs:?} FillPath presence mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn gradient_background_is_top_light_bottom_dark() {
+        // U-RD-002：竖向渐变（180°），顶部提亮 35%、底部加深 35%。
+        let dbg = format!("{:?}", gradient_background(0xa5d8ff, 1.0));
+        assert!(dbg.starts_with("LinearGradient(180"), "got: {dbg}");
+        let top = format!("{:?}", color_u32(lighten(0xa5d8ff, 0.35), 1.0));
+        let bottom = format!("{:?}", color_u32(darken(0xa5d8ff, 0.35), 1.0));
+        assert!(dbg.contains(&top), "top stop {top} missing in {dbg}");
+        assert!(dbg.contains(&bottom), "bottom stop {bottom} missing in {dbg}");
+    }
+
+    #[test]
+    fn degenerate_shapes_do_not_panic() {
+        // U-RD-009：零尺寸/负尺寸/单点/双点以下 —— 全部安全返回。
+        let camera = Camera::default();
+        let origin = gpui::point(px(0.0), px(0.0));
+        let style = ElementStyle {
+            background: Some(0xa5d8ff),
+            fill_style: SceneFillStyle::Gradient,
+            ..Default::default()
+        };
+        for bounds in [
+            WBounds::new(0.0, 0.0, 0.0, 0.0),
+            WBounds::new(0.0, 0.0, 100.0, 0.0),
+            WBounds::new(0.0, 0.0, -5.0, 80.0),
+        ] {
+            for kind in [
+                ElementKind::Rectangle,
+                ElementKind::Ellipse,
+                ElementKind::Diamond,
+            ] {
+                let el = Element::new(kind.clone(), bounds, style.clone());
+                let _ = paths_for_element(&el, &camera, origin);
+            }
+        }
+        // 单点线条渲染为圆点（笔触点按的设计，与 freedraw 一致），零点
+        // 才是 Empty。
+        let dot = Element::from_absolute_points(
+            |points| ElementKind::Line { points },
+            vec![WPoint::new(1.0, 1.0)],
+            style.clone(),
+        );
+        assert!(matches!(world_geometry(&dot), WorldGeom::Outline(_)));
+        let empty = Element::from_absolute_points(
+            |points| ElementKind::Line { points },
+            Vec::new(),
+            style,
+        );
+        assert!(matches!(world_geometry(&empty), WorldGeom::Empty));
     }
 
     #[test]

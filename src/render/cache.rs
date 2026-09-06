@@ -154,6 +154,16 @@ fn fingerprint_into(h: &mut Fnv, el: &Element) {
         }
     }
     h.write_f64(f64::from(s.opacity));
+    // 阴影参与指纹：给已有形状加/改阴影必须触发几何重建，否则渲染缓存
+    // 一直命中旧几何，阴影永远画不出来（测试日志 2026-09-06 发现）。
+    match s.shadow {
+        Some(sh) => {
+            h.write_bool(true);
+            h.write_f64(sh.dx);
+            h.write_f64(sh.dy);
+        }
+        None => h.write_bool(false),
+    }
     match &el.kind {
         ElementKind::Rectangle => h.write_u64(1),
         ElementKind::Ellipse => h.write_u64(2),
@@ -432,6 +442,53 @@ mod tests {
         let mut el = sample_element();
         let before = fingerprint(&el);
         el.seed = 43;
+        assert_ne!(before, fingerprint(&el));
+    }
+
+    /// U-RD-011 指纹参数化矩阵：样式/几何的每一个渲染相关字段单独翻转，
+    /// 指纹必须改变。新增 ElementStyle 字段的人必须把字段加进
+    /// `fingerprint_into` —— 在这里给矩阵加一行，忘了就会红。
+    #[test]
+    fn fingerprint_changes_for_every_style_field() {
+        fn changed_by(f: impl FnOnce(&mut crate::scene::ElementStyle)) -> bool {
+            let mut el = sample_element();
+            let before = fingerprint(&el);
+            f(&mut el.style);
+            fingerprint(&el) != before
+        }
+        use crate::scene::{Brush, FillStyle, LineType, Shadow, StrokeStyle};
+        let cases: Vec<(&str, Box<dyn FnOnce(&mut crate::scene::ElementStyle)>)> = vec![
+            ("stroke", Box::new(|s: &mut _| s.stroke = 0xff0000)),
+            ("background set", Box::new(|s: &mut _| s.background = Some(0xa5d8ff))),
+            ("stroke_width", Box::new(|s: &mut _| s.stroke_width = 5.0)),
+            ("roughness", Box::new(|s: &mut _| s.roughness = 2.5)),
+            ("stroke_style", Box::new(|s: &mut _| s.stroke_style = StrokeStyle::Dashed)),
+            ("line_type", Box::new(|s: &mut _| s.line_type = LineType::Curved)),
+            ("fill_style", Box::new(|s: &mut _| s.fill_style = FillStyle::Gradient)),
+            ("brush", Box::new(|s: &mut _| s.brush = Some(Brush::DryBrush))),
+            ("hachure_gap", Box::new(|s: &mut _| s.hachure_gap = Some(3.0))),
+            ("fill_weight", Box::new(|s: &mut _| s.fill_weight = Some(2.0))),
+            ("hachure_angle", Box::new(|s: &mut _| s.hachure_angle = Some(90.0))),
+            ("dry_density", Box::new(|s: &mut _| s.dry_density = Some(0.3))),
+            ("dry_width", Box::new(|s: &mut _| s.dry_width = Some(1.5))),
+            ("opacity", Box::new(|s: &mut _| s.opacity = 0.5)),
+            (
+                "shadow",
+                Box::new(|s: &mut _| s.shadow = Some(Shadow { dx: 6.0, dy: 8.0 })),
+            ),
+        ];
+        for (name, f) in cases {
+            assert!(changed_by(f), "fingerprint must change when `{name}` changes");
+        }
+    }
+
+    #[test]
+    fn fingerprint_changes_on_shadow_move() {
+        // 阴影偏移的中间值也要敏感（不只 Some/None 翻转）。
+        let mut el = sample_element();
+        el.style.shadow = Some(crate::scene::Shadow { dx: 6.0, dy: 8.0 });
+        let before = fingerprint(&el);
+        el.style.shadow = Some(crate::scene::Shadow { dx: 7.0, dy: 8.0 });
         assert_ne!(before, fingerprint(&el));
     }
 

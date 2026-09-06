@@ -34,6 +34,24 @@ struct ExplorerRename {
     is_folder: bool,
 }
 
+/// 把 `iw×ih` 的图片适配进 `max_w×max_h`：保持宽高比、只缩不放。
+/// 返回显示尺寸 (w, h)。U-BR-003 的被测纯函数。
+pub(crate) fn fit_image(iw: f64, ih: f64, max_w: f64, max_h: f64) -> (f64, f64) {
+    let (iw, ih) = (iw.max(1.0), ih.max(1.0));
+    let k = (max_w / iw).min(max_h / ih).min(1.0);
+    (iw * k, ih * k)
+}
+
+/// 工具栏填充样式按钮的样式变更：切样式，且「渐」在无底色时补一个
+/// 天蓝底（渐变要有底色才有内容可渐变 —— 点下去立刻有可见效果）。
+/// U-BR-002 的被测纯函数。
+pub(crate) fn apply_fill_style(s: &mut ElementStyle, fs: crate::scene::FillStyle) {
+    s.fill_style = fs;
+    if fs == crate::scene::FillStyle::Gradient && s.background.is_none() {
+        s.background = Some(0xa5d8ff);
+    }
+}
+
 actions!(
     boundless,
     [
@@ -262,10 +280,8 @@ pub struct BoardView {
     canvas_texture: Option<PaperTexture>,
     /// Precomputed 256×256 BGRA noise tiles, one per material.
     paper_tiles: [Arc<RenderImage>; 3],
-    /// Decoded image elements, keyed by asset file name. Filled lazily at
-    /// paint time (first paint decodes synchronously; afterwards it's a map
-    /// hit). RefCell: build_paint only has &self.
-    image_cache: std::cell::RefCell<HashMap<String, Arc<RenderImage>>>,
+    /// Embedded-image asset store (图片字节 + 解码缓存).
+    assets: crate::assets::AssetStore,
     /// Page index to bring the camera to on the next render frame. Set when
     /// the AI **switches pages**: an op landing on a different page than the
     /// AI's previous one moves the camera there (watching each slide being
@@ -414,7 +430,7 @@ impl BoardView {
                 paper_tile(PaperTexture::Kraft),
                 paper_tile(PaperTexture::Chalkboard),
             ],
-            image_cache: std::cell::RefCell::new(HashMap::new()),
+            assets: crate::assets::AssetStore::new(workspace.data_dir().join("assets")),
             pending_page_focus: None,
             ai_focus_page: None,
             page_anim: None,
@@ -1134,7 +1150,7 @@ impl BoardView {
                     .and_then(|e| e.to_str())
                     .unwrap_or("png")
                     .to_string();
-                let asset = self.store_image_asset(&bytes, &ext).map_err(|e| {
+                let asset = self.assets.store(&bytes, &ext).map_err(|e| {
                     CanvasOpError::internal(format!("写入图片资源失败: {e}"))
                 })?;
                 let w = width.unwrap_or(320.0).clamp(20.0, 4000.0);
@@ -2421,38 +2437,6 @@ impl BoardView {
     // embedded images (图片元素：粘贴 / 插入文件 / agent add_image 共用)
     // ------------------------------------------------------------------
 
-    /// Workspace asset store for embedded images: `<root>/.boundless/assets/`.
-    fn asset_dir(&self) -> PathBuf {
-        self.workspace.data_dir().join("assets")
-    }
-
-    /// Decode + cache an asset by file name. The first paint of an asset
-    /// decodes synchronously; afterwards it's a cache hit.
-    fn load_image_asset(&self, name: &str) -> Option<Arc<RenderImage>> {
-        if let Some(img) = self.image_cache.borrow().get(name) {
-            return Some(img.clone());
-        }
-        let bytes = std::fs::read(self.asset_dir().join(name)).ok()?;
-        // RenderImage frames are RGBA; image::open covers png/jpeg/gif/webp.
-        let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
-        let render = Arc::new(RenderImage::new(vec![image::Frame::new(img)]));
-        self.image_cache
-            .borrow_mut()
-            .insert(name.to_string(), render.clone());
-        Some(render)
-    }
-
-    /// Store raw image bytes in the asset store under a fresh unique name
-    /// (`img-<uuid>.<ext>`), so the board survives moving/deleting the
-    /// original file.
-    fn store_image_asset(&self, bytes: &[u8], ext: &str) -> std::io::Result<String> {
-        let dir = self.asset_dir();
-        std::fs::create_dir_all(&dir)?;
-        let name = format!("img-{}.{}", uuid::Uuid::new_v4(), ext.trim_start_matches('.'));
-        std::fs::write(dir.join(&name), bytes)?;
-        Ok(name)
-    }
-
     /// Embed an image from raw bytes: stores the asset and adds an Image
     /// element centered in the current viewport, scaled down (aspect kept)
     /// to at most ~45% of the visible world extent, never upscaled.
@@ -2466,12 +2450,12 @@ impl BoardView {
             image::load_from_memory(bytes).map_err(|e| anyhow::anyhow!("图片解码失败: {e}"))?;
         let (iw, ih) = (decoded.width().max(1) as f64, decoded.height().max(1) as f64);
         let asset = self
-            .store_image_asset(bytes, ext)
+            .assets
+            .store(bytes, ext)
             .map_err(|e| anyhow::anyhow!("写入图片资源失败: {e}"))?;
 
         let vis = self.visible_world_bounds();
-        let k = ((vis.w * 0.45) / iw).min((vis.h * 0.45) / ih).min(1.0);
-        let (w, h) = (iw * k, ih * k);
+        let (w, h) = fit_image(iw, ih, vis.w * 0.45, vis.h * 0.45);
         let x = vis.center().x - w / 2.0;
         let y = vis.center().y - h / 2.0;
 
@@ -5583,7 +5567,7 @@ impl BoardView {
                 ElementKind::Image { asset } => {
                     // Decode lazily (first paint of a given asset); failures
                     // degrade to a skipped element rather than blocking paint.
-                    if let Some(img) = self.load_image_asset(asset) {
+                    if let Some(img) = self.assets.load(asset) {
                         let screen_origin = self
                             .camera
                             .world_to_screen(WPoint::new(el.bounds.x, el.bounds.y), origin);
@@ -7196,16 +7180,10 @@ impl BoardView {
                             .when(!active, |d| d.border_color(rgb(0xcccccc)))
                             .on_click(move |_, _, cx| {
                                 weak.update(cx, |this, cx| {
-                                    this.apply_style_to_selection(|s| {
-                                        s.fill_style = fs;
-                                        // 渐变需要底色才有内容可渐变：无填充色时
-                                        // 默认天蓝，保证点下去立刻有可见效果。
-                                        if fs == crate::scene::FillStyle::Gradient
-                                            && s.background.is_none()
-                                        {
-                                            s.background = Some(0xa5d8ff);
-                                        }
-                                    }, cx)
+                                    this.apply_style_to_selection(
+                                        |s| apply_fill_style(s, fs),
+                                        cx,
+                                    )
                                 })
                                 .ok();
                             }),
@@ -8489,6 +8467,52 @@ impl BoardView {
                 .child(card)
                 .into_any_element(),
         )
+    }
+}
+
+#[cfg(test)]
+mod image_insert_tests {
+    use super::{apply_fill_style, fit_image};
+    use crate::scene::{ElementStyle, FillStyle};
+
+    fn approx(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    /// U-BR-003：大图缩进视口 45%、保持比例；小图不放大。
+    #[test]
+    fn fit_image_downscales_keeps_aspect_never_upscales() {
+        // 大图：2000×1000 放进 400×400 → 400×200。
+        let (w, h) = fit_image(2000.0, 1000.0, 400.0, 400.0);
+        assert!(approx(w, 400.0) && approx(h, 200.0), "got {w}x{h}");
+        // 竖图：500×2000 放进 300×600 → 150×600。
+        let (w, h) = fit_image(500.0, 2000.0, 300.0, 600.0);
+        assert!(approx(w, 150.0) && approx(h, 600.0), "got {w}x{h}");
+        // 小图：不放大。
+        let (w, h) = fit_image(50.0, 40.0, 400.0, 400.0);
+        assert!(approx(w, 50.0) && approx(h, 40.0), "got {w}x{h}");
+        // 退化输入不崩、不出 0。
+        let (w, h) = fit_image(0.0, 0.0, 400.0, 400.0);
+        assert!(w >= 1.0 && h >= 1.0, "got {w}x{h}");
+    }
+
+    /// U-BR-002：点「渐」且无底色 → 自动补天蓝底；有底色 → 保留原色；
+    /// 其他填充样式不动底色。
+    #[test]
+    fn gradient_button_defaults_background_only_when_missing() {
+        let mut s = ElementStyle::default();
+        apply_fill_style(&mut s, FillStyle::Gradient);
+        assert_eq!(s.fill_style, FillStyle::Gradient);
+        assert_eq!(s.background, Some(0xa5d8ff), "missing bg must default");
+
+        let mut s = ElementStyle::default();
+        s.background = Some(0xffe8cc);
+        apply_fill_style(&mut s, FillStyle::Gradient);
+        assert_eq!(s.background, Some(0xffe8cc), "existing bg must be kept");
+
+        let mut s = ElementStyle::default();
+        apply_fill_style(&mut s, FillStyle::Solid);
+        assert_eq!(s.background, None, "non-gradient styles must not set bg");
     }
 }
 

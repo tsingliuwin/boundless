@@ -2,6 +2,7 @@
 
 > 版本：2026-09-06 · 适用分支：main
 > 配套脚本：`scripts/e2e/`（macOS UI 自动化工具链）
+> 测试执行记录：`docs/test-logs/`（每轮完整循环：运行→分析→修复→回归）
 
 ---
 
@@ -73,17 +74,17 @@ L1  单元 (src/**)      纯函数：几何、布局、解析、状态机（现�
 
 | ID | 用例 | 操作 | 断言 | 优先级 | 状态 |
 |---|---|---|---|---|---|
-| U-RD-001 | 五种 fill_style 出图 | 矩形×{hachure,dense,solid,watercolor,gradient} 生成 `paths_for_element` | 全部非空；solid/gradient 含 `FillPath`，其余含 `FillSketch` | P0 | 部分✅（solid/gradient 已有，hachure/dense/watercolor 🆕） |
-| U-RD-002 | 渐变色标方向 | gradient 矩形 fill_color | `Background::Gradient`，180°，stop0=lighten(0.35)、stop1=darken(0.35) | P0 | 🆕 |
+| U-RD-001 | 五种 fill_style 出图 | 矩形×{hachure,dense,solid,watercolor,gradient} 生成 `paths_for_element` | 全部非空；仅 gradient 走 FillPath（实=双遍密排 FillSketch，见 §4.3 说明） | P0 | ✅（2026-09-06 `all_fill_styles_produce_paths`） |
+| U-RD-002 | 渐变色标方向 | gradient 矩形 fill_color | `Background::Gradient`，180°，stop0=lighten(0.35)、stop1=darken(0.35) | P0 | ✅（2026-09-06） |
 | U-RD-003 | fill_params 密度序 | 比较 5 种样式 (gap, weight) | hachure gap > dense > solid；watercolor/gradient 符合预设值 | P1 | 🆕 |
 | U-RD-004 | hachure 覆盖参数生效 | `hachure_gap/fill_weight/hachure_angle` 设定后几何 | 排线行数 = f(bounds/gap)；角度改变行方向 | P1 | 🆕 |
 | U-RD-005 | dry_width 参数 | 飞白 dry_width=2.0 vs 0.2 | 主笔 PaintOverride.width 线性跟随 | P1 | 🆕 |
 | U-RD-006 | 阴影渲染 | 带 `shadow` 的矩形 | 输出在最前多两组深色 opset，且几何被偏移 dx/dy | P1 | 🆕 |
 | U-RD-007 | 虚线样式 | dashed 矩形轮廓 | 路径段数显著多于实线（dash 切分） | P2 | 🆕 |
 | U-RD-008 | 缩放稳定性 | 同一元素 zoom 0.5/1/2 各 paint | 路径数恒定（几何世界坐标缓存）；屏幕坐标随 zoom 缩放 | P1 | 🆕 |
-| U-RD-009 | 退化输入 | 零宽/负尺寸/单点/空 points | 返回 `Empty` 或 dot，不 panic | P0 | 部分✅（点笔已有；形状退化 🆕） |
+| U-RD-009 | 退化输入 | 零宽/负尺寸/单点/空 points | 返回 `Empty` 或 dot，不 panic | P0 | ✅（2026-09-06；单点线=圆点按设计） |
 | U-RD-010 | 图片资产名进指纹 | 同 seed 同 bounds 换 asset 名 | 指纹必变 | P0 | ✅（`image_elements_have_no_vector_geometry`） |
-| U-RD-011 | 缓存指纹参数化矩阵 | 对 style 每个字段（含 dry_density/dry_width/line_type/opacity/text_align…）逐字段翻转 | 每次翻转指纹必变（参数化遍历，防新增字段漏哈希） | P0 | 🆕（防"加字段忘指纹"复发） |
+| U-RD-011 | 缓存指纹参数化矩阵 | 对 style 每个字段（含 dry_density/dry_width/line_type/opacity/text_align…）逐字段翻转 | 每次翻转指纹必变（参数化遍历，防新增字段漏哈希） | P0 | ✅（2026-09-06；**当场抓到 shadow 漏哈希真 bug**，见测试日志） |
 | U-RD-012 | 几何生成性能预算 | 1000 个混合元素 `world_geometry` | 总耗时 < 预算（如 2s，release）；缓存二次构建 0 生成 | P2 | 🆕（`#[ignore]` 基准） |
 
 #### 4.1.2 场景与画板核心（SC/BR）
@@ -95,8 +96,8 @@ L1  单元 (src/**)      纯函数：几何、布局、解析、状态机（现�
 | U-SC-003 | 命中测试矩阵 | 9 种 ElementKind × 内部/边缘/外部 | 全部按各自几何规则 | P1 | 部分✅（rect/ellipse/line 有） |
 | U-SC-004 | elements_in / content_bounds | 混合元素集合 | 返回与 bounds 相交全集并集正确 | P1 | 🆕 |
 | U-BR-001 | apply_style_to_selection | 多选混合样式 → 设 fill_style | 整组一致变更；`selection_fill_style` 返回 Some(同值)；不一致时返回 None 回退预设 | P0 | 🆕 |
-| U-BR-002 | 渐变按钮缺省底色 | 无 background 选中矩形 → 点「渐」 | `background == Some(0xa5d8ff)` 且 fill_style = Gradient（回归 781ec73 前行为） | P0 | 🆕 |
-| U-BR-003 | insert 尺寸计算 | 各尺寸图片 × 各视口 | fit ≤ 视口 45%、不放大、居中、比例保持 | P0 | 🆕（把 `insert_image_bytes` 的计算抽为纯函数后测） |
+| U-BR-002 | 渐变按钮缺省底色 | 无 background 选中矩形 → 点「渐」 | `background == Some(0xa5d8ff)` 且 fill_style = Gradient（回归 781ec73 前行为） | P0 | ✅（2026-09-06，`apply_fill_style` 纯函数） |
+| U-BR-003 | insert 尺寸计算 | 各尺寸图片 × 各视口 | fit ≤ 视口 45%、不放大、居中、比例保持 | P0 | ✅（2026-09-06，`fit_image` 纯函数） |
 | U-BR-004 | page_of_op | 每种 CanvasOp → 所属页 | 位置落在哪页返回哪页；UpdateElement 移动后跟随新页 | P1 | 🆕 |
 | U-BR-005 | visible_world_bounds | 给定 camera/bounds | 世界可视矩形正确（含缩放/平移） | P1 | 🆕 |
 | U-BR-006 | 自动保存节拍 | autosave_tick 模拟脏/干净 | 脏→写盘并清除脏标；干净→不写 | P1 | 🆕 |
@@ -131,11 +132,11 @@ L1  单元 (src/**)      纯函数：几何、布局、解析、状态机（现�
 
 | ID | 用例 | 操作 | 断言 | 优先级 | 状态 |
 |---|---|---|---|---|---|
-| I-SC-001 | 场景文件兼容矩阵 | `tests/fixtures/` 下存放：v0.2 旧板、无 pages 板、无 line_type 板、含 image 板 | 全部可加载 → 再保存 → 再加载，语义等价（现有两个 ✅ 的扩展） | P0 | 🆕 |
+| I-SC-001 | 场景文件兼容矩阵 | `tests/fixtures/` 下存放：v0.2 旧板、无 pages 板、无 line_type 板、含 image 板 | 全部可加载 → 再保存 → 再加载，语义等价（现有两个 ✅ 的扩展） | P0 | ✅（2026-09-06，JSON 内联于 `tests/integration.rs`） |
 | I-SC-002 | CanvasOp 批量回放→场景 | eval `replay()` 结果与手工构造元素集合对比（类型/位置/样式） | 两轨一致（防 op 与手画行为漂移） | P1 | 🆕 |
-| I-WK-001 | 图片资源存储往返 | `store_image_asset` → 磁盘 → `load_image_asset` 解码 | 尺寸/像素一致；重名自动避让（uuid）；目录自动创建 | P0 | 🆕 |
+| I-WK-001 | 图片资源存储往返 | `store_image_asset` → 磁盘 → `load_image_asset` 解码 | 尺寸/像素一致；重名自动避让（uuid）；目录自动创建 | P0 | ✅（2026-09-06，`src/assets.rs::AssetStore` 单元测试） |
 | I-WK-002 | 工作区全生命周期 | create_board → scan → rename → delete → last_board 记取/恢复 | 每步磁盘状态与 API 返回一致（扩展现有 4 个） | P1 | 🆕 |
-| I-HI-001 | 历史×场景组合 | 连续 20 次混合变更（增/删/改/层序）后逐步 undo 到空、redo 到顶 | 每步场景与录制快照一致 | P1 | 🆕 |
+| I-HI-001 | 历史×场景组合 | 连续 20 次混合变更（增/删/改/层序）后逐步 undo 到空、redo 到顶 | 每步场景与录制快照一致 | P1 | ✅（2026-09-06，6 类混合变更逐步校验） |
 | I-AI-001 | 会话绑定板切换 | session 绑定 board A/B → 切换 → 打开 | `open_session` 语义正确（现有 rebind 测试的端到端扩展） | P2 | 🆕 |
 | I-TX-001 | 编辑会话×元素落盘 | 文本编辑会话 → commit → 场景序列化 → 重载 | 文本与 UTF-16 映射无损 | P1 | 🆕 |
 | I-UP-001 | 原地更新残留清理 | 模拟 `.old` 残留 → `cleanup_old` | 清理且不动现役文件 | P2 | 🆕 |
@@ -181,7 +182,7 @@ L1  单元 (src/**)      纯函数：几何、布局、解析、状态机（现�
 | ID | 用例 | 载体 | 断言 | 优先级 | 状态 |
 |---|---|---|---|---|---|
 | AI-EV-001 | 既有 rubric 回归 | `cargo test -p boundless eval`（29 个 ✅） | 保持通过 | P0 | ✅ |
-| AI-EV-002 | 录制回放金样 | 把历史会话的 op 序列存 `tests/fixtures/ops/*.json`，逐个 replay + rubric | 评分不低于基线（防提示词/布局回归） | P1 | 🆕 |
+| AI-EV-002 | 录制回放金样 | 把历史会话的 op 序列存 `tests/fixtures/ops/*.json`，逐个 replay + rubric | 评分不低于基线（防提示词/布局回归）。⚠️ 2026-09-06 修复 push_shape 漏计 ops_applied 后，依赖该计数的评分阈值整体上移，录制金样时需重新校准基线 | P1 | 🆕 |
 | AI-EV-003 | 工具 schema 快照 | 序列化全部 `ToolDefinition` | JSON Schema 与快照 diff（防字段漂移破坏模型端契约） | P1 | 🆕 |
 | AI-EV-004 | 真实模型端到端 | 手动/夜间：3 个标准任务（登录流程图/水墨山水/思维导图）跑真模型 → rubric 评分 | 评分达标；成本记录在案 | P2 | 🆕 |
 

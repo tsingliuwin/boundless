@@ -3,6 +3,7 @@
 //! them. The binary in main.rs is a thin shell around `board::BoardView`.
 
 pub mod ai;
+pub mod assets;
 pub mod board;
 pub mod camera;
 pub mod history;

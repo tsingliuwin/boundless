@@ -732,6 +732,9 @@ fn push_shape(
             });
         }
     }
+    // 计数必须与元素入画同步：矩形/椭圆/菱形此前从不计入 ops_applied，
+    // 评测统计（"narrating without drawing"等检查）因此失真。
+    c.ops_applied += 1;
     Ok(format!(
         "已添加{} id={}",
         kind_label(kind),
