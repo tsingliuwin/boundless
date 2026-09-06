@@ -1779,6 +1779,11 @@ pub struct StampTemplateArgs {
     /// true = 水平镜像（翻转角色朝向）。默认 false。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flip_x: Option<bool>,
+    /// 整体旋转角度（度，顺时针，-45~45，默认 0）。动势专用：奔跑前倾
+    /// 12~20、惊吓后仰 -8~-15、摔倒/翻滚 30~45。矩形/椭圆/菱形会转成多
+    /// 边形实现旋转（手绘风视觉无差）；文字不旋转保持水平，只随组移动。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation: Option<f64>,
 }
 
 pub struct StampTemplateTool {
@@ -1798,7 +1803,7 @@ impl Tool for StampTemplateTool {
     ) -> impl std::future::Future<Output = ToolDefinition> + Send {
         let def = tool_def::<StampTemplateArgs>(
             Self::NAME,
-            "把保存的模板实例化到画布 (x,y)，可缩放（scale）和水平镜像（flip_x=true 翻转朝向）。漫画的每一格都要用本工具复用同一角色/场景模板，而不是重画。",
+            "把保存的模板实例化到画布 (x,y)：scale 缩放、flip_x=true 翻转朝向、rotation 整体倾斜做动势（奔跑前倾 12~20、惊吓后仰 -8~-15、摔倒 30~45）。漫画每一格都用本工具复用同一角色/场景模板，不要重画；角色要活起来就换姿势 + 换 rotation + 叠表情。",
         );
         async move { def }
     }
@@ -1828,6 +1833,18 @@ impl Tool for StampTemplateTool {
                     .await;
                 }
             }
+            if let Some(r) = args.rotation {
+                if !r.is_finite() || !(-45.0..=45.0).contains(&r) {
+                    return fail_tool(
+                        &events,
+                        id,
+                        name,
+                        args_json,
+                        ToolError::invalid_args(format!("rotation {r} 超出范围 -45~45 度")),
+                    )
+                    .await;
+                }
+            }
             let _ = events.unbounded_send(AgentEvent::ToolCall {
                 id: id.clone(),
                 name: name.to_string(),
@@ -1852,6 +1869,7 @@ impl Tool for StampTemplateTool {
                 args.y,
                 args.scale.unwrap_or(1.0),
                 args.flip_x.unwrap_or(false),
+                args.rotation.unwrap_or(0.0),
             ) {
                 Ok(v) => v,
                 Err(e) => {
@@ -1958,14 +1976,19 @@ pub struct SpeechBubbleArgs {
     pub h: f64,
     /// 台词内容。过长会自动换行（按气泡内宽），放不下就加高气泡或精简文字。
     pub text: String,
+    /// 气泡形状：speech（椭圆对话泡，默认）/ burst（爆炸星形框，惊叫/巨响，
+    /// 淡黄底）/ thought（思考云，云朵边 + 圆点尾迹，内心独白）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<String>,
     /// 尾巴方向（指向说话者嘴部）：down_left（默认）/ down_right / up_left /
-    /// up_right / none（无尾巴，旁白用方框即可）。
+    /// up_right / none（thought 的圆点尾迹也沿此方向；burst 无尾巴）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tail: Option<String>,
     /// 台词字号。默认 16。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font_size: Option<f64>,
-    /// 可选样式覆盖（描边/填充等）。默认白底黑边实心填充。
+    /// 可选样式覆盖（描边/填充等）。默认 speech/thought 白底、burst 淡黄底，
+    /// 黑边实心。
     #[serde(default, deserialize_with = "de_style")]
     pub style: CanvasStyle,
 }
@@ -1999,7 +2022,7 @@ impl Tool for SpeechBubbleTool {
     ) -> impl std::future::Future<Output = ToolDefinition> + Send {
         let def = tool_def::<SpeechBubbleArgs>(
             Self::NAME,
-            "画一个漫画对话气泡：白底黑边椭圆 + 朝向说话者的尾巴 + 居中台词（自动换行）。tail 指定尾巴方向（down_left 默认 / down_right / up_left / up_right / none）。返回气泡椭圆与文字的 id，改台词用 update_element 改文字 id。",
+            "画漫画气泡（自动换行居中）：shape=speech 椭圆对话泡（默认，尾巴指向说话者）/ burst 爆炸星形淡黄框（惊叫、巨响、怒吼）/ thought 思考云（内心独白，圆点尾迹）。tail 指定尾巴方向：down_left 默认 / down_right / up_left / up_right / none。返回气泡与文字的 id，改台词用 update_element 改文字 id。",
         );
         async move { def }
     }
@@ -2016,6 +2039,7 @@ impl Tool for SpeechBubbleTool {
             if let Err(e) = validate_bubble(&args) {
                 return fail_tool(&events, id, name, args_json, e).await;
             }
+            let shape = args.shape.as_deref().unwrap_or("speech");
             let dir = args.tail.as_deref().unwrap_or("down_left");
             let (ux, uy): (f64, f64) = match dir {
                 "none" => (0.0, 0.0),
@@ -2025,66 +2049,159 @@ impl Tool for SpeechBubbleTool {
                 "up_right" => (1.0, -1.0),
                 _ => unreachable!("validate_bubble 已拒绝未知方向"),
             };
-            let style = args
-                .style
-                .clone()
-                .merge_into(bubble_base_style());
+            // burst 经典淡黄底；speech/thought 白底。
+            let base = if shape == "burst" {
+                let mut s = bubble_base_style();
+                s.background = Some(0xff_f3_bf);
+                s
+            } else {
+                bubble_base_style()
+            };
+            let style = args.style.clone().merge_into(base);
             let cx = args.x + args.w / 2.0;
             let cy = args.y + args.h / 2.0;
-            let ellipse_id = new_element_id();
+            let body_id = new_element_id();
             let mut elements: Vec<crate::scene::Element> = Vec::new();
-            if dir != "none" {
-                // 尾巴：在椭圆边上取朝向点，底边两端向圆心收 15%（被椭圆盖住
-                // 接缝），尖端沿方向外推。
-                let norm = (ux * ux + uy * uy).sqrt();
-                let (ux, uy) = (ux / norm, uy / norm);
-                let theta = uy.atan2(ux);
-                let (rx, ry) = (args.w / 2.0, args.h / 2.0);
-                let bx = cx + rx * theta.cos();
-                let by = cy + ry * theta.sin();
-                let len = (0.30 * args.w.min(args.h)).max(18.0);
-                let tip = crate::scene::WPoint::new(bx + ux * len, by + uy * len);
-                let half = (0.06 * args.w).clamp(5.0, 14.0);
-                let pull = 0.85;
-                let b1 = crate::scene::WPoint::new(
-                    cx + (bx + -uy * half - cx) * pull,
-                    cy + (by + ux * half - cy) * pull,
-                );
-                let b2 = crate::scene::WPoint::new(
-                    cx + (bx - -uy * half - cx) * pull,
-                    cy + (by - ux * half - cy) * pull,
-                );
-                elements.push(crate::scene::Element::from_absolute_points_with_id(
-                    new_element_id(),
-                    |points| crate::scene::ElementKind::Polygon {
-                        points,
-                        smooth: false,
-                    },
-                    vec![b1, tip, b2],
-                    style.clone(),
-                ));
+            match shape {
+                // 爆炸星形框（惊叫/巨响）：14 点 7 尖角，无尾巴，文字直接
+                // 绑定在星形上。
+                "burst" => {
+                    let n = 14;
+                    let pts: Vec<crate::scene::WPoint> = (0..n)
+                        .map(|i| {
+                            let t = i as f64 / n as f64 * std::f64::consts::TAU;
+                            let (rx, ry) = if i % 2 == 0 {
+                                (args.w * 0.56, args.h * 0.56)
+                            } else {
+                                (args.w * 0.39, args.h * 0.39)
+                            };
+                            crate::scene::WPoint::new(cx + rx * t.cos(), cy + ry * t.sin())
+                        })
+                        .collect();
+                    elements.push(crate::scene::Element::from_absolute_points_with_id(
+                        body_id,
+                        |points| crate::scene::ElementKind::Polygon {
+                            points,
+                            smooth: false,
+                        },
+                        pts,
+                        style.clone(),
+                    ));
+                }
+                // 思考云：波动半径的平滑闭合曲线 + 沿 tail 方向的两颗圆点
+                // 尾迹（老夫子式内心独白）。
+                "thought" => {
+                    let (rx, ry) = (args.w / 2.0, args.h / 2.0);
+                    if dir != "none" {
+                        let norm = (ux * ux + uy * uy).sqrt();
+                        let (dux, duy) = (ux / norm, uy / norm);
+                        let theta = duy.atan2(dux);
+                        let ex = cx + rx * theta.cos();
+                        let ey = cy + ry * theta.sin();
+                        let len = (0.45 * args.w.min(args.h)).max(24.0);
+                        for (k, d) in [(0.45, 16.0), (0.9, 10.0)] {
+                            let dcx = ex + dux * len * k;
+                            let dcy = ey + duy * len * k;
+                            elements.push(crate::scene::Element::new_with_id(
+                                new_element_id(),
+                                crate::scene::ElementKind::Ellipse,
+                                crate::scene::WBounds::new(
+                                    dcx - d / 2.0,
+                                    dcy - d / 2.0,
+                                    d,
+                                    d,
+                                ),
+                                style.clone(),
+                            ));
+                        }
+                    }
+                    let n = 12;
+                    let pts: Vec<crate::scene::WPoint> = (0..n)
+                        .map(|i| {
+                            let t = i as f64 / n as f64 * std::f64::consts::TAU;
+                            let r = if i % 2 == 0 { 1.0 } else { 0.86 };
+                            crate::scene::WPoint::new(
+                                cx + rx * r * t.cos(),
+                                cy + ry * r * t.sin(),
+                            )
+                        })
+                        .collect();
+                    elements.push(crate::scene::Element::from_absolute_points_with_id(
+                        body_id,
+                        |points| crate::scene::ElementKind::Polygon {
+                            points,
+                            smooth: true,
+                        },
+                        pts,
+                        style.clone(),
+                    ));
+                }
+                // 默认椭圆对话泡：尾巴三角垫底 + 白底椭圆盖住接缝。
+                _ => {
+                    if dir != "none" {
+                        // 尾巴：在椭圆边上取朝向点，底边两端向圆心收 15%（被椭圆
+                        // 盖住接缝），尖端沿方向外推。
+                        let norm = (ux * ux + uy * uy).sqrt();
+                        let (ux, uy) = (ux / norm, uy / norm);
+                        let theta = uy.atan2(ux);
+                        let (rx, ry) = (args.w / 2.0, args.h / 2.0);
+                        let bx = cx + rx * theta.cos();
+                        let by = cy + ry * theta.sin();
+                        let len = (0.30 * args.w.min(args.h)).max(18.0);
+                        let tip = crate::scene::WPoint::new(bx + ux * len, by + uy * len);
+                        let half = (0.06 * args.w).clamp(5.0, 14.0);
+                        let pull = 0.85;
+                        let b1 = crate::scene::WPoint::new(
+                            cx + (bx + -uy * half - cx) * pull,
+                            cy + (by + ux * half - cy) * pull,
+                        );
+                        let b2 = crate::scene::WPoint::new(
+                            cx + (bx - -uy * half - cx) * pull,
+                            cy + (by - ux * half - cy) * pull,
+                        );
+                        elements.push(crate::scene::Element::from_absolute_points_with_id(
+                            new_element_id(),
+                            |points| crate::scene::ElementKind::Polygon {
+                                points,
+                                smooth: false,
+                            },
+                            vec![b1, tip, b2],
+                            style.clone(),
+                        ));
+                    }
+                    elements.push(crate::scene::Element::new_with_id(
+                        body_id,
+                        crate::scene::ElementKind::Ellipse,
+                        crate::scene::WBounds::new(args.x, args.y, args.w, args.h),
+                        style,
+                    ));
+                }
             }
-            elements.push(crate::scene::Element::new_with_id(
-                ellipse_id,
-                crate::scene::ElementKind::Ellipse,
-                crate::scene::WBounds::new(args.x, args.y, args.w, args.h),
-                style,
-            ));
-            // 台词：绑定到椭圆的居中标签；初始包围盒给个粗估，插入后由
-            // pending_measure 精确重排。
+            // 台词：绑定到主体（椭圆/云/星）的居中标签；初始包围盒给个粗估，
+            // 插入后由 pending_measure 精确重排。burst 的文字区按星形内圈收。
             let font_size = args.font_size.unwrap_or(16.0);
+            let text_width = if shape == "burst" {
+                (args.w * 0.62).max(30.0)
+            } else {
+                (args.w - 40.0).max(30.0)
+            };
             let mut label = crate::scene::Element::new(
                 crate::scene::ElementKind::Text {
                     text: crate::ai::canvas_ops::normalize_text(args.text.clone()),
                     font_size,
                     font_family: crate::render::HANDWRITTEN_FONT.to_string(),
-                    wrap_width: Some((args.w - 40.0).max(30.0)),
+                    wrap_width: Some(text_width),
                     min_height: None,
-                    container_id: Some(ellipse_id),
+                    container_id: Some(body_id),
                     text_align: crate::scene::TextAlign::Center,
                     anchor: None,
                 },
-                crate::scene::WBounds::new(args.x + 20.0, cy - font_size * 0.7, args.w - 40.0, font_size * 1.4),
+                crate::scene::WBounds::new(
+                    cx - text_width / 2.0,
+                    cy - font_size * 0.7,
+                    text_width,
+                    font_size * 1.4,
+                ),
                 crate::scene::ElementStyle::default(),
             );
             label.style.roughness = 0.0;
@@ -2113,7 +2230,14 @@ impl Tool for SpeechBubbleTool {
                 is_error,
             });
             outcome
-                .map(|m| format!("已添加对话气泡（{n} 个元素：尾巴/椭圆/文字）。{m}"))
+                .map(|m| {
+                    let label = match shape {
+                        "burst" => "爆炸气泡",
+                        "thought" => "思考气泡",
+                        _ => "对话气泡",
+                    };
+                    format!("已添加{label}（{n} 个元素）。{m}")
+                })
                 .map_err(ToolError::from_op)
         }
     }
@@ -2134,6 +2258,14 @@ fn validate_bubble(args: &SpeechBubbleArgs) -> Result<(), ToolError> {
     if let Some(fs) = args.font_size {
         if !fs.is_finite() || fs <= 0.0 {
             return Err(ToolError::invalid_args("字号必须为正数"));
+        }
+    }
+    match args.shape.as_deref() {
+        None | Some("speech") | Some("burst") | Some("thought") => {}
+        Some(other) => {
+            return Err(ToolError::invalid_args(format!(
+                "shape 只支持 speech / burst / thought，收到 {other}"
+            )))
         }
     }
     match args.tail.as_deref() {
@@ -2560,6 +2692,7 @@ mod tests {
             w: 200.0,
             h: 110.0,
             text: "你好，世界".into(),
+            shape: None,
             tail: None,
             font_size: None,
             style: CanvasStyle::default(),
@@ -2576,11 +2709,23 @@ mod tests {
             };
             assert!(validate_bubble(&a).is_ok(), "tail={tail}");
         }
+        for shape in ["speech", "burst", "thought"] {
+            let a = SpeechBubbleArgs {
+                shape: Some(shape.into()),
+                ..mk_bubble()
+            };
+            assert!(validate_bubble(&a).is_ok(), "shape={shape}");
+        }
         let unknown = SpeechBubbleArgs {
             tail: Some("sideways".into()),
             ..mk_bubble()
         };
         assert!(validate_bubble(&unknown).is_err());
+        let bad_shape = SpeechBubbleArgs {
+            shape: Some("round".into()),
+            ..mk_bubble()
+        };
+        assert!(validate_bubble(&bad_shape).is_err());
         let empty = SpeechBubbleArgs {
             text: "  ".into(),
             ..mk_bubble()
@@ -2665,5 +2810,111 @@ mod tests {
             }
         }
         assert!(saw_ok_result);
+    }
+
+    /// burst 气泡：14 点星形（淡黄底）+ 绑定文字，无尾巴三角。
+    #[test]
+    fn burst_bubble_emits_star_and_label() {
+        use futures::task::noop_waker_ref;
+        use std::task::Context;
+
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<AgentEvent>();
+        let tool = SpeechBubbleTool { events: tx };
+        let args = SpeechBubbleArgs {
+            shape: Some("burst".into()),
+            tail: Some("down_left".into()),
+            ..mk_bubble()
+        };
+        let mut fut = Box::pin(tool.call(args));
+        let waker = noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+        match std::future::Future::poll(fut.as_mut(), &mut cx) {
+            std::task::Poll::Pending => {}
+            std::task::Poll::Ready(_) => panic!("completed before reply"),
+        }
+        let mut elements = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::InsertElements { elements: e, reply } = event {
+                let _ = reply.send(Ok("已插入 2 个元素".into()));
+                elements = Some(e);
+            }
+        }
+        let elements = elements.unwrap();
+        assert_eq!(elements.len(), 2, "星形 + 文字，无尾巴");
+        let star = &elements[0];
+        match &star.kind {
+            crate::scene::ElementKind::Polygon { points, smooth } => {
+                assert_eq!(points.len(), 14);
+                assert!(!*smooth);
+            }
+            other => panic!("期望星形多边形，实际 {other:?}"),
+        }
+        // 淡黄底。
+        assert_eq!(star.style.background, Some(0xff_f3_bf));
+        // 文字绑定星形，文字区收窄（*0.62）。
+        match &elements[1].kind {
+            crate::scene::ElementKind::Text {
+                container_id: Some(cid),
+                wrap_width,
+                ..
+            } => {
+                assert_eq!(*cid, star.id);
+                assert!((wrap_width.unwrap() - 200.0 * 0.62).abs() < 1e-9);
+            }
+            other => panic!("期望绑定文字，实际 {other:?}"),
+        }
+    }
+
+    /// thought 气泡：两颗圆点尾迹 + 平滑云朵 + 绑定文字（无三角尾巴）。
+    #[test]
+    fn thought_bubble_emits_dots_cloud_label() {
+        use futures::task::noop_waker_ref;
+        use std::task::Context;
+
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<AgentEvent>();
+        let tool = SpeechBubbleTool { events: tx };
+        let args = SpeechBubbleArgs {
+            shape: Some("thought".into()),
+            tail: Some("down_left".into()),
+            ..mk_bubble()
+        };
+        let mut fut = Box::pin(tool.call(args));
+        let waker = noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+        match std::future::Future::poll(fut.as_mut(), &mut cx) {
+            std::task::Poll::Pending => {}
+            std::task::Poll::Ready(_) => panic!("completed before reply"),
+        }
+        let mut elements = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::InsertElements { elements: e, reply } = event {
+                let _ = reply.send(Ok("已插入 4 个元素".into()));
+                elements = Some(e);
+            }
+        }
+        let elements = elements.unwrap();
+        assert_eq!(elements.len(), 4, "两颗圆点 + 云朵 + 文字");
+        let dot1 = &elements[0];
+        let dot2 = &elements[1];
+        assert!(matches!(dot1.kind, crate::scene::ElementKind::Ellipse));
+        assert!(matches!(dot2.kind, crate::scene::ElementKind::Ellipse));
+        // 圆点沿 down_left 方向递减、远离气泡（在气泡外接框下方）。
+        assert!(dot1.bounds.w > dot2.bounds.w);
+        assert!(dot2.bounds.y > 80.0 + 110.0, "尾迹应在气泡下方之外");
+        let cloud = &elements[2];
+        match &cloud.kind {
+            crate::scene::ElementKind::Polygon { points, smooth } => {
+                assert_eq!(points.len(), 12);
+                assert!(*smooth);
+            }
+            other => panic!("期望平滑云朵，实际 {other:?}"),
+        }
+        match &elements[3].kind {
+            crate::scene::ElementKind::Text {
+                container_id: Some(cid),
+                ..
+            } => assert_eq!(*cid, cloud.id),
+            other => panic!("期望绑定文字，实际 {other:?}"),
+        }
     }
 }

@@ -93,9 +93,9 @@ pub const SYSTEM_PROMPT: &str = r##"你是 boundless 白板应用的绘图助手
 - add_image(path, x?, y?, width?)：把本地图片（PNG/JPEG/GIF/WebP）嵌入画布。文件会被复制进工作区资源库，原文件移动/删除不影响画布。height 按图片比例自动求出。适合插画、照片、贴图素材。
 - draw_mindmap(root, cx?, cy?)：一次调用画出整张思维导图。root 是嵌套树：{"text":"中心主题","children":[{"text":"一级分支","children":[{"text":"要点"}]}]}。布局（节点位置、曲线连线、分支配色、防重叠防交叉）全部自动计算——只给文字，不要自己用矩形+连线拼导图。节点文字 ≤ 20 字单行关键词，全图 ≤ 40 节点、≤ 5 层。
 - save_template(name, kind, ids, delete_source?)：把已画好的一组元素保存为可复用模板，是漫画/连环画保证人物、场景一致性的关键工具。kind 取 character（角色）/ scene（场景）/ prop（道具）；ids 是组成该模板的元素 id 列表；delete_source=true 时保存后删除画布上的原元素（推荐：在页面外画好角色 → 收进模板库 → 用 stamp_template 盖章到每一格）。同名模板会覆盖更新。
-- stamp_template(name, x, y, scale?, flip_x?)：把模板实例化到画布 (x,y)（模板包围盒左上角对齐），scale 等比缩放（0.05~8，默认 1），flip_x=true 水平镜像（翻转角色朝向）。返回新元素 id 列表。**同一角色/场景必须始终用 stamp_template 复用同一模板，不要每次重画**——这是保持一致性的铁律。要改表情/动作时，盖章后用 update_element 微调盖出的元素即可。
-- list_templates()：列出模板库里所有模板（名字、类别、大小、文字），用于复用之前会话保存的角色和场景。
-- draw_speech_bubble(x, y, w, h, text, tail?, font_size?)：画一个漫画对话气泡（白底黑边椭圆 + 朝向说话者的尾巴 + 居中文字）。tail 指定尾巴方向：down_left（默认）/ down_right / up_left / up_right / none。文字自动按气泡宽度换行；返回气泡椭圆和文字的 id，改台词用 update_element 改文字 id。旁白/独白用 draw_rectangle + draw_text 画方框即可。
+- stamp_template(name, x, y, scale?, flip_x?, rotation?)：把模板实例化到画布 (x,y)（模板包围盒左上角对齐），scale 等比缩放（0.05~8，默认 1），flip_x=true 水平镜像（翻转角色朝向），rotation 整体倾斜（度，顺时针，-45~45，默认 0；奔跑前倾 12~20、惊吓后仰 -8~-15、摔倒翻滚 30~45）。返回新元素 id 列表。**同一角色/场景必须始终用 stamp_template 复用同一模板，不要每次重画**——这是一致性的铁律。要改表情/动作时，盖章后用 update_element 微调盖出的元素即可。**让画面活起来：同一角色在不同格要换姿势（多姿势模板）+ 换 rotation + 叠表情，禁止连续几格笔直站立同一表情。**
+- list_templates()：列出模板库里所有模板（名字、类别、大小、文字），用于复用之前会话保存的角色和场景。同一角色的多个姿势模板按「名字-姿势」命名（如 小明-站 / 小明-跑 / 小明-坐）。
+- draw_speech_bubble(x, y, w, h, text, shape?, tail?, font_size?)：画漫画气泡（居中自动换行文字）。shape：speech 椭圆对话泡（默认）/ burst 爆炸星形淡黄框（惊叫、巨响、怒吼）/ thought 思考云（内心独白，圆点尾迹）。tail 指定尾巴方向：down_left（默认）/ down_right / up_left / up_right / none。返回气泡与文字的 id，改台词用 update_element 改文字 id。旁白/独白说明用 draw_rectangle + draw_text 画方框。
 - set_canvas_background(preset?, color?)：设置画布底色。preset: greenboard（墨绿粉笔板）/ blackboard（黑板黑）/ white（白板）。
 - update_element(id, x?, y?, text?, style?, font_size?)：修改已有元素——移动（x/y）、改文字（text）、改样式（style，只改提供的字段）或改字号（font_size，仅文本）。画错了优先用它修正，不必删除重画。
 - delete_element(id)：删除一个元素（及其标签）。

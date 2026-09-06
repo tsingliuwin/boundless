@@ -186,19 +186,22 @@ fn union_bounds(elements: &[Element]) -> WBounds {
     acc.unwrap_or_default()
 }
 
-/// 把模板「盖」到画布上：整体平移到 (x, y)（模板包围盒左上角对齐）、等比缩放、
-/// 可选水平镜像（漫画里翻转朝向用）。返回全新元素列表：
+/// 把模板「盖」到画布上：整体平移到 (x, y)（模板包围盒左上角对齐）、等比
+/// 缩放、可选水平镜像（翻转朝向）、可选整体旋转（动势：奔跑前倾、惊吓后
+/// 仰；矩形/椭圆/菱形转成多边形实现旋转，文字只挪位置不转字形）。返回全
+/// 新元素列表：
 /// - 每个元素都分配新 id；
-/// - 文本与容器的绑定关系（container_id）映射到新 id，容器不在模板内的标签
-///   降级为独立文本（避免绑到画布上无关元素）；
-/// - 镜像同时翻转阴影偏移的 x 分量。
-/// 失败（空模板 / 非法缩放）返回 Err。
+/// - 文本与容器的绑定关系（container_id）映射到新 id，容器不在模板内的
+///   标签降级为独立文本（避免绑到画布上无关元素）；
+/// - 镜像翻转阴影偏移的 x 分量，旋转把阴影偏移当向量旋转。
+/// 失败（空模板 / 非法缩放或角度）返回 Err。
 pub fn stamp(
     t: &ComicTemplate,
     x: f64,
     y: f64,
     scale: f64,
     flip_x: bool,
+    rotation_deg: f64,
 ) -> Result<Vec<Element>, String> {
     if t.elements.is_empty() {
         return Err("模板为空，无法盖章".to_string());
@@ -206,11 +209,19 @@ pub fn stamp(
     if !scale.is_finite() || !(0.05..=8.0).contains(&scale) {
         return Err(format!("scale {scale} 超出范围 0.05~8.0"));
     }
+    if !rotation_deg.is_finite() || !(-45.0..=45.0).contains(&rotation_deg) {
+        return Err(format!("rotation {rotation_deg} 超出范围 -45~45 度"));
+    }
     if !x.is_finite() || !y.is_finite() {
         return Err("坐标必须是有限数值".to_string());
     }
     let bbox = union_bounds(&t.elements);
     let pivot = WPoint::new(bbox.x, bbox.y);
+    let theta = rotation_deg.to_radians();
+    let rotating = theta.abs() > 1e-9;
+    // 旋转中心：flip + scale 之后整组的中心（flip 保形、scale 以包围盒
+    // 左上角为支点，故组包围盒变为 (bbox.x, bbox.y, w·s, h·s)）。
+    let spin_center = WPoint::new(bbox.x + bbox.w * scale / 2.0, bbox.y + bbox.h * scale / 2.0);
     let mut out: Vec<Element> = Vec::with_capacity(t.elements.len());
     let mut id_map: Vec<(super::element::ElementId, super::element::ElementId)> =
         Vec::with_capacity(t.elements.len());
@@ -221,10 +232,20 @@ pub fn stamp(
             mirror_x(&mut el, bbox.x + bbox.w / 2.0);
         }
         el.rescale(scale, scale, pivot);
-        el.translate(x - bbox.x, y - bbox.y);
+        if rotating {
+            el = rotate_element(&el, spin_center, theta);
+        }
         el.id = super::element::ElementId::new_v4();
         id_map.push((old_id, el.id));
         out.push(el);
+    }
+    // 平移：让旋转（后）的整体包围盒左上角落在 (x, y)。rotation = 0 时
+    // 包围盒未变，与旧语义完全一致。
+    let aabb = union_bounds(&out);
+    let dx = x - aabb.x;
+    let dy = y - aabb.y;
+    for el in &mut out {
+        el.translate(dx, dy);
     }
     // 第二遍：重映射 container_id；容器不在模板内的标签降级为独立文本
     //（否则会绑到画布上某个无关元素）。
@@ -258,12 +279,166 @@ fn mirror_x(el: &mut Element, cx: f64) {
     }
 }
 
+/// 把一个点绕 `c` 旋转 `theta` 弧度（y 向下坐标系，theta > 0 为顺时针）。
+fn rotate_point(p: WPoint, c: WPoint, theta: f64) -> WPoint {
+    let (s, co) = theta.sin_cos();
+    let (dx, dy) = (p.x - c.x, p.y - c.y);
+    WPoint::new(c.x + dx * co - dy * s, c.y + dx * s + dy * co)
+}
+
 fn point_slice_mut(el: &mut Element) -> Option<&mut Vec<WPoint>> {
     match &mut el.kind {
         ElementKind::Line { points } | ElementKind::Arrow { points, .. } => Some(points),
         ElementKind::Freedraw { points, .. } => Some(points),
         ElementKind::Polygon { points, .. } => Some(points),
         _ => None,
+    }
+}
+
+/// 旋转单个元素（返回新元素）。可旋转的点集元素按点旋转后重建；轴对齐
+/// 形状转成对应多边形（Rectangle/Diamond → 直边 Polygon，Ellipse → 24 点
+/// 平滑闭合曲线）——手绘 rough 渲染下视觉无差；文字与图片的字形/像素无法
+/// 旋转，只把中心点转到旋转后的位置（漫画角度小，视觉可接受）。阴影偏移
+/// 向量随之旋转。
+fn rotate_element(el: &Element, c: WPoint, theta: f64) -> Element {
+    let mut style = el.style.clone();
+    if let Some(sh) = &mut style.shadow {
+        let (s, co) = theta.sin_cos();
+        let (dx, dy) = (sh.dx, sh.dy);
+        sh.dx = dx * co - dy * s;
+        sh.dy = dx * s + dy * co;
+    }
+    let id = el.id;
+    match &el.kind {
+        ElementKind::Rectangle => {
+            let b = el.bounds;
+            let pts = vec![
+                WPoint::new(b.x, b.y),
+                WPoint::new(b.right(), b.y),
+                WPoint::new(b.right(), b.bottom()),
+                WPoint::new(b.x, b.bottom()),
+            ];
+            let rotated: Vec<WPoint> = pts.iter().map(|p| rotate_point(*p, c, theta)).collect();
+            Element::from_absolute_points_with_id(
+                id,
+                |points| ElementKind::Polygon {
+                    points,
+                    smooth: false,
+                },
+                rotated,
+                style,
+            )
+        }
+        ElementKind::Diamond => {
+            let pts = crate::scene::element::diamond_polygon(&el.bounds);
+            let rotated: Vec<WPoint> = pts.iter().map(|p| rotate_point(*p, c, theta)).collect();
+            Element::from_absolute_points_with_id(
+                id,
+                |points| ElementKind::Polygon {
+                    points,
+                    smooth: false,
+                },
+                rotated,
+                style,
+            )
+        }
+        ElementKind::Ellipse => {
+            let b = el.bounds;
+            let ctr = b.center();
+            let (rx, ry) = (b.w / 2.0, b.h / 2.0);
+            let n = 24;
+            let rotated: Vec<WPoint> = (0..n)
+                .map(|i| {
+                    let t = i as f64 / n as f64 * std::f64::consts::TAU;
+                    rotate_point(
+                        WPoint::new(ctr.x + rx * t.cos(), ctr.y + ry * t.sin()),
+                        c,
+                        theta,
+                    )
+                })
+                .collect();
+            Element::from_absolute_points_with_id(
+                id,
+                |points| ElementKind::Polygon {
+                    points,
+                    smooth: true,
+                },
+                rotated,
+                style,
+            )
+        }
+        ElementKind::Line { .. } => {
+            let rotated: Vec<WPoint> = el
+                .absolute_points()
+                .iter()
+                .map(|p| rotate_point(*p, c, theta))
+                .collect();
+            Element::from_absolute_points_with_id(
+                id,
+                |points| ElementKind::Line { points },
+                rotated,
+                style,
+            )
+        }
+        ElementKind::Arrow {
+            end_arrowhead,
+            start_arrowhead,
+            ..
+        } => {
+            let (e, s) = (*end_arrowhead, *start_arrowhead);
+            let rotated: Vec<WPoint> = el
+                .absolute_points()
+                .iter()
+                .map(|p| rotate_point(*p, c, theta))
+                .collect();
+            Element::from_absolute_points_with_id(
+                id,
+                move |points| ElementKind::Arrow {
+                    points,
+                    end_arrowhead: e,
+                    start_arrowhead: s,
+                },
+                rotated,
+                style,
+            )
+        }
+        ElementKind::Freedraw { widths, .. } => {
+            let widths = widths.clone();
+            let rotated: Vec<WPoint> = el
+                .absolute_points()
+                .iter()
+                .map(|p| rotate_point(*p, c, theta))
+                .collect();
+            Element::from_absolute_points_with_id(
+                id,
+                move |points| ElementKind::Freedraw { points, widths },
+                rotated,
+                style,
+            )
+        }
+        ElementKind::Polygon { smooth, .. } => {
+            let smooth = *smooth;
+            let rotated: Vec<WPoint> = el
+                .absolute_points()
+                .iter()
+                .map(|p| rotate_point(*p, c, theta))
+                .collect();
+            Element::from_absolute_points_with_id(
+                id,
+                move |points| ElementKind::Polygon { points, smooth },
+                rotated,
+                style,
+            )
+        }
+        ElementKind::Image { .. } | ElementKind::Text { .. } => {
+            let mut out = el.clone();
+            out.style = style;
+            let b = el.bounds;
+            let nc = rotate_point(b.center(), c, theta);
+            out.bounds.x = nc.x - b.w / 2.0;
+            out.bounds.y = nc.y - b.h / 2.0;
+            out
+        }
     }
 }
 
@@ -442,7 +617,7 @@ mod tests {
     #[test]
     fn stamp_translates_and_remaps_container() {
         let t = sample_template();
-        let stamped = stamp(&t, 1000.0, 500.0, 1.0, false).unwrap();
+        let stamped = stamp(&t, 1000.0, 500.0, 1.0, false, 0.0).unwrap();
         assert_eq!(stamped.len(), 3);
         // 原包围盒 (100,100) → 目标 (1000,500)：整体平移 (+900, +400)。
         let head = &stamped[0];
@@ -465,7 +640,7 @@ mod tests {
     #[test]
     fn stamp_scales_geometry_and_font() {
         let t = sample_template();
-        let stamped = stamp(&t, 0.0, 0.0, 2.0, false).unwrap();
+        let stamped = stamp(&t, 0.0, 0.0, 2.0, false, 0.0).unwrap();
         let head = &stamped[0];
         assert!((head.bounds.w - 160.0).abs() < 1e-9);
         assert!((head.bounds.h - 160.0).abs() < 1e-9);
@@ -483,7 +658,7 @@ mod tests {
         // 模板包围盒 x∈[100,230]，镜像中心 cx=165：head(100..180) → 150..230，
         // body(110..230) → 100..220，label(110..170) → 160..220。
         // 目标 (100,100) 与包围盒原点重合，平移为零，纯看镜像效果。
-        let stamped = stamp(&t, 100.0, 100.0, 1.0, true).unwrap();
+        let stamped = stamp(&t, 100.0, 100.0, 1.0, true, 0.0).unwrap();
         let head = &stamped[0];
         assert!((head.bounds.x - 150.0).abs() < 1e-9);
         // 阴影偏移翻转。
@@ -512,7 +687,7 @@ mod tests {
         // 标签的容器不在模板元素集合里 → 盖章后降级为独立文本。
         let mut t = sample_template();
         t.elements.remove(0); // 去掉头部容器，标签成为孤儿
-        let stamped = stamp(&t, 0.0, 0.0, 1.0, false).unwrap();
+        let stamped = stamp(&t, 0.0, 0.0, 1.0, false, 0.0).unwrap();
         match &stamped[1].kind {
             ElementKind::Text {
                 container_id, ..
@@ -522,16 +697,68 @@ mod tests {
     }
 
     #[test]
-    fn stamp_rejects_bad_scale_and_empty() {
+    fn stamp_rejects_bad_scale_rotation_and_empty() {
         let t = sample_template();
-        assert!(stamp(&t, 0.0, 0.0, 0.01, false).is_err());
-        assert!(stamp(&t, 0.0, 0.0, f64::NAN, false).is_err());
-        assert!(stamp(&ComicTemplate {
-            name: "空".into(),
-            kind: TemplateKind::Prop,
-            elements: vec![],
-        }, 0.0, 0.0, 1.0, false)
+        assert!(stamp(&t, 0.0, 0.0, 0.01, false, 0.0).is_err());
+        assert!(stamp(&t, 0.0, 0.0, f64::NAN, false, 0.0).is_err());
+        assert!(stamp(&t, 0.0, 0.0, 1.0, false, 90.0).is_err());
+        assert!(stamp(&t, 0.0, 0.0, 1.0, false, f64::NAN).is_err());
+        assert!(stamp(
+            &ComicTemplate {
+                name: "空".into(),
+                kind: TemplateKind::Prop,
+                elements: vec![],
+            },
+            0.0,
+            0.0,
+            1.0,
+            false,
+            0.0
+        )
         .is_err());
+    }
+
+    #[test]
+    fn stamp_rotation_tilts_shapes_keeps_text_level() {
+        let t = sample_template(); // 头矩形 + 身矩形 + 绑定标签
+        let stamped = stamp(&t, 100.0, 100.0, 1.0, false, 20.0).unwrap();
+        // 头矩形旋转后变成直边多边形（4 点，不再轴对齐）。
+        let head = &stamped[0];
+        match &head.kind {
+            ElementKind::Polygon { points, smooth } => {
+                assert_eq!(points.len(), 4);
+                assert!(!*smooth);
+                // 旋转后顶点的 y 跨度超过原矩形边长（80×80 方形转 20° 后
+                // AABB 高 = 80·(cos20°+sin20°) ≈ 102；bounds 本身就是由
+                // 点集算出的，所以与原边长比才有意义）。
+                let ys: Vec<f64> = head.absolute_points().iter().map(|p| p.y).collect();
+                let span =
+                    ys.iter().cloned().fold(f64::MIN, f64::max)
+                        - ys.iter().cloned().fold(f64::INFINITY, f64::min);
+                assert!(span > 80.0, "y 跨度 {span} 应大于原边长 80");
+            }
+            other => panic!("期望旋转后的多边形，实际 {other:?}"),
+        }
+        // 旋转后整体包围盒左上角对齐目标 (100,100)。
+        let bbox = union_bounds(&stamped);
+        assert!((bbox.x - 100.0).abs() < 1e-6, "bbox.x={}", bbox.x);
+        assert!((bbox.y - 100.0).abs() < 1e-6, "bbox.y={}", bbox.y);
+        // 文字字形不旋转：仍是文本、仍绑定到新头、仍是水平包围盒。
+        match &stamped[2].kind {
+            ElementKind::Text {
+                text,
+                container_id: Some(cid),
+                ..
+            } => {
+                assert_eq!(text, "小明");
+                assert_eq!(*cid, head.id);
+            }
+            other => panic!("期望绑定文本，实际 {other:?}"),
+        }
+        // 阴影偏移随旋转（原 (10,12) 转 20°）。
+        let (s, c) = 20f64.to_radians().sin_cos();
+        let expect_dx = 10.0 * c - 12.0 * s;
+        assert!((head.style.shadow.unwrap().dx - expect_dx).abs() < 1e-6);
     }
 
     #[test]
@@ -599,7 +826,7 @@ mod tests {
             elements: vec![poly],
         };
         // 目标 (100,100) 与包围盒原点重合，平移为零，纯看镜像效果。
-        let stamped = stamp(&t, 100.0, 100.0, 1.0, true).unwrap();
+        let stamped = stamp(&t, 100.0, 100.0, 1.0, true, 0.0).unwrap();
         let abs = stamped[0].absolute_points();
         // 包围盒 x∈[100,160]，镜像中心 130：点 (160,120) → (100,120)。
         assert!(abs.iter().any(|p| (p.x - 100.0).abs() < 1e-9 && (p.y - 120.0).abs() < 1e-9));
