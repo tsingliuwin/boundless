@@ -331,7 +331,7 @@ pub enum ElementKind {
     Text {
         text: String,
         font_size: f64,
-        /// Font family name ("Caveat" hand-drawn, ".SystemUIFont" plain).
+        /// Font family name ("Excalifont" hand-drawn, ".SystemUIFont" plain).
         #[serde(default = "default_font_family")]
         font_family: String,
         /// Max line width in world units; when set, lines wrap at this width.
@@ -364,7 +364,7 @@ fn default_true() -> bool {
     true
 }
 
-/// Default font family for new text elements (hand-drawn Caveat).
+/// Default font family for new text elements (hand-drawn Excalifont).
 fn default_font_family() -> String {
     crate::render::HANDWRITTEN_FONT.to_string()
 }

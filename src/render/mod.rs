@@ -20,7 +20,7 @@ pub const SYSTEM_FONT: &str = ".SystemUIFont";
 /// aliases fall back to the hand-drawn default, so a model hallucinating a
 /// family degrades gracefully instead of rendering tofu.
 ///
-/// Aliases: `handwritten`/`default` → Excalifont (拉丁手写体，中文回落楷体);
+/// Aliases: `handwritten`/`default` → Excalifont (拉丁手写体，中文回落小赖);
 /// `kai`/`楷体` → KaiTi (brush-style, good for chalk headings);
 /// `hei`/`黑体` → SimHei (heavy sans, poster headings);
 /// `song`/`宋体` → SimSun (serif body); `system` → system UI font.
@@ -38,21 +38,20 @@ pub fn resolve_font_family(alias: &str) -> String {
     }
 }
 
-/// Font used for canvas text elements. Defaults to the hand-drawn Caveat;
-/// CJK glyphs fall back to the system UI font via GPUI's fallback chain.
+/// Font used for canvas text elements. Defaults to the hand-drawn Excalifont;
+/// CJK glyphs fall back to the embedded Xiaolai via GPUI's fallback chain.
 pub fn canvas_font() -> Font {
     gpui::font(HANDWRITTEN_FONT)
 }
 
-/// Build a font for the given family with CJK fallback to a handwriting-
-/// style system font (KaiTi 楷体 on Windows) so Chinese text also has a
-/// hand-drawn look. Latin glyphs come from the primary family (Patrick Hand).
+/// Build a font for the given family with CJK fallback to the embedded
+/// hand-drawn Xiaolai (小赖字体 — the same CJK fallback Excalidraw uses), so
+/// Chinese text keeps the hand-drawn look. KaiTi/Microsoft YaHei stay behind
+/// Xiaolai as print-style system fallbacks for any glyph it may miss.
 pub fn canvas_font_with(family: &str) -> Font {
     let mut f = gpui::font(family.to_string());
-    // KaiTi (楷体) is a brush-style system font shipped with Windows; it
-    // gives Chinese characters a hand-written feel. Microsoft YaHei is the
-    // fallback if KaiTi isn't installed.
     f.fallbacks = Some(gpui::FontFallbacks::from_fonts(vec![
+        "Xiaolai".to_string(),
         "KaiTi".to_string(),
         "Microsoft YaHei".to_string(),
     ]));
@@ -135,14 +134,19 @@ pub fn shape_text(
     let line_height = font_size * LINE_HEIGHT as f32;
     let wrap_px = wrap_width_world.map(|w| camera.scale(w).max(px(1.0)));
     let font = canvas_font_with(font_family);
+    // gpui's Windows fallback builder resolves fallback families against the
+    // *system* font collection only (direct_write.rs generate_font_fallbacks),
+    // so embedded fonts like Xiaolai can never serve as a fallback there.
+    // Instead, mixed Latin/CJK lines are shaped as separate runs: CJK chars
+    // get Xiaolai as their primary font, Latin keeps the hand-drawn family.
+    let cjk_font = (font_family == HANDWRITTEN_FONT).then(|| canvas_font_with("Xiaolai"));
     let text_system = window.text_system();
 
     let shape_one = |s: &str| {
         let line_text = if s.is_empty() { " " } else { s };
-        let shaped = text_system.shape_line(
-            line_text.to_string().into(),
-            font_size,
-            &[TextRun {
+        let runs = match &cjk_font {
+            Some(cjk) => build_script_runs(line_text, &font, cjk, color),
+            None => vec![TextRun {
                 len: line_text.len(),
                 font: font.clone(),
                 color,
@@ -150,6 +154,11 @@ pub fn shape_text(
                 underline: None,
                 strikethrough: None,
             }],
+        };
+        let shaped = text_system.shape_line(
+            line_text.to_string().into(),
+            font_size,
+            &runs,
             None,
         );
         if s.is_empty() {
@@ -196,6 +205,48 @@ pub fn shape_text(
         });
     }
     (lines, line_height)
+}
+
+/// CJK ranges — kana, hangul, ideographs, CJK punctuation and fullwidth
+/// forms, plus the CJK-style ellipsis/dash/quotes — that should render with
+/// the embedded hand-drawn CJK font instead of the Latin handwriting font.
+fn is_cjk_char(c: char) -> bool {
+    let u = c as u32;
+    (0x1100..=0x11FF).contains(&u) // Hangul jamo
+        || (0x2E80..=0x9FFF).contains(&u) // CJK radicals, kana, ideographs, punct
+        || (0xAC00..=0xD7AF).contains(&u) // Hangul syllables
+        || (0xF900..=0xFAFF).contains(&u) // CJK compatibility ideographs
+        || (0xFE30..=0xFE4F).contains(&u) // CJK vertical forms
+        || (0xFF00..=0xFFEF).contains(&u) // fullwidth forms
+        || matches!(u, 0x2014 | 0x2026 | 0x2018..=0x201D)
+}
+
+/// Split a line into `TextRun`s by script: CJK chars take `cjk_font`
+/// (Xiaolai), everything else keeps `base_font`. Runs alternate on script
+/// boundaries so a mixed sentence renders hand-drawn in both scripts.
+fn build_script_runs(line_text: &str, base_font: &Font, cjk_font: &Font, color: Hsla) -> Vec<TextRun> {
+    let mut runs: Vec<TextRun> = Vec::new();
+    let mut last_cjk: Option<bool> = None;
+    for c in line_text.chars() {
+        let is_cjk = is_cjk_char(c);
+        let len = c.len_utf8();
+        if let (Some(run), Some(last)) = (runs.last_mut(), last_cjk) {
+            if last == is_cjk {
+                run.len += len;
+                continue;
+            }
+        }
+        runs.push(TextRun {
+            len,
+            font: if is_cjk { cjk_font.clone() } else { base_font.clone() },
+            color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        });
+        last_cjk = Some(is_cjk);
+    }
+    runs
 }
 
 /// Split a single paragraph (no embedded newlines) into wrap segments that

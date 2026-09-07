@@ -98,15 +98,21 @@ fn main() {
             // platforms; Windows embeds its icon via build.rs.
             boundless::platform::set_app_icon();
 
-            // Register the embedded Excalifont handwriting font (Excalidraw's
-            // default) so text elements use a hand-drawn look for Latin glyphs;
-            // CJK falls back to the system KaiTi font via FontFallbacks.
-            let font_bytes: &'static [u8] = include_bytes!("../assets/fonts/Excalifont.ttf");
-            if let Err(e) = cx
-                .text_system()
-                .add_fonts(vec![std::borrow::Cow::Borrowed(font_bytes)])
-            {
-                eprintln!("failed to load Excalifont: {e}");
+            // Register the embedded handwriting fonts: Excalifont (Excalidraw's
+            // default) for Latin glyphs, plus Xiaolai (小赖字体, the same CJK
+            // hand-drawn font Excalidraw falls back to) so Chinese text gets a
+            // matching hand-drawn look via FontFallbacks instead of print-style
+            // KaiTi. Xiaolai's en-US family name record is "Xiaolai".
+            let embedded_fonts: Vec<std::borrow::Cow<'static, [u8]>> = vec![
+                std::borrow::Cow::Borrowed(include_bytes!(
+                    "../assets/fonts/Excalifont.ttf"
+                ).as_slice()),
+                std::borrow::Cow::Borrowed(include_bytes!(
+                    "../assets/fonts/Xiaolai-Regular.ttf"
+                ).as_slice()),
+            ];
+            if let Err(e) = cx.text_system().add_fonts(embedded_fonts) {
+                eprintln!("failed to load embedded fonts: {e}");
             }
 
             // Tool bindings are single letters, so they must be disabled while an
