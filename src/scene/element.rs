@@ -205,6 +205,10 @@ pub struct Shadow {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ElementStyle {
     pub stroke: u32,
+    /// 无描边：形状/线条/笔迹不画描边（填充保留）。文字忽略此标志
+    /// （文字颜色即 stroke，无描边对它无意义，渲染回落 0x1e1e1e）。
+    #[serde(default)]
+    pub stroke_none: bool,
     pub background: Option<u32>,
     pub stroke_width: f64,
     pub roughness: f32,
@@ -244,6 +248,7 @@ impl Default for ElementStyle {
     fn default() -> Self {
         Self {
             stroke: 0x1e1e1e,
+            stroke_none: false,
             background: None,
             stroke_width: 2.0,
             roughness: 1.0,

@@ -5732,7 +5732,9 @@ impl BoardView {
                 ElementKind::Text {
                     text, font_size, ..
                 } => {
-                    let color = color_u32(el.style.stroke, el.style.opacity);
+                    // 文字无描边概念：stroke_none 时回落深色，避免隐形文字。
+                    let stroke = if el.style.stroke_none { 0x1e1e1e } else { el.style.stroke };
+                    let color = color_u32(stroke, el.style.opacity);
                     let bg = el.style.background.map(|c| color_u32(c, el.style.opacity));
                     let shaped = self.text_cache.shaped(
                         text,
@@ -5951,7 +5953,10 @@ impl BoardView {
         let ed = self.editing.as_ref()?;
         let el = self.scene.get(ed.element_id)?;
         let text = ed.session.text();
-        let color = color_u32(el.style.stroke, el.style.opacity);
+        let color = color_u32(
+            if el.style.stroke_none { 0x1e1e1e } else { el.style.stroke },
+            el.style.opacity,
+        );
         let shaped = self.text_cache.shaped(
             &text,
             ed.font_size,
@@ -7280,11 +7285,38 @@ impl BoardView {
 
         let mut bar = bar_container().flex_col().items_start().gap_2().p_2();
 
-        // Stroke colors.
+        // Stroke colors. Leading 无 swatch = no stroke (borderless shapes);
+        // hidden for pure-text selections where stroke IS the text color.
         let mut row = div().flex().flex_row().gap_1();
+        if !only_text {
+            let weak = weak.clone();
+            let no_stroke = self.style.stroke_none;
+            let mut swatch = div()
+                .id("stroke-none")
+                .size_5()
+                .rounded_sm()
+                .bg(rgb(0xffffff))
+                .border_1()
+                .cursor_pointer()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(crate::icons::no_fill(color_u32(0x999999, 1.0)));
+            swatch = if no_stroke {
+                swatch.border_color(rgb(SELECTION_COLOR)).border_2()
+            } else {
+                swatch.border_color(rgb(0xcccccc))
+            };
+            row = row.child(swatch.on_click(move |_, _, cx| {
+                weak.update(cx, |this, cx| {
+                    this.apply_style_to_selection(|s| s.stroke_none = true, cx)
+                })
+                .ok();
+            }));
+        }
         for color in STROKE_COLORS {
             let weak = weak.clone();
-            let active = self.style.stroke == color;
+            let active = !self.style.stroke_none && self.style.stroke == color;
             let mut swatch = div()
                 .id(gpui::ElementId::named_usize("stroke", color as usize))
                 .size_5()
@@ -7299,7 +7331,10 @@ impl BoardView {
             };
             row = row.child(swatch.on_click(move |_, _, cx| {
                 weak.update(cx, |this, cx| {
-                    this.apply_style_to_selection(|s| s.stroke = color, cx)
+                    this.apply_style_to_selection(|s| {
+                        s.stroke = color;
+                        s.stroke_none = false;
+                    }, cx)
                 })
                 .ok();
             }));

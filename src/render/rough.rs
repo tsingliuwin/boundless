@@ -852,6 +852,8 @@ pub fn paint_world_geom(
     let stroke_width_px = camera.scale(style.stroke_width).max(px(0.5));
     let fill_weight_px = camera.scale(style.stroke_width * 0.5).max(px(0.5));
     let dashed = style.stroke_style == StrokeStyle::Dashed;
+    // 无描边：跳过一切描边绘制（Path / Sampled / Outline），填充保留。
+    let stroke_visible = !style.stroke_none;
 
     match geom {
         WorldGeom::Empty => {}
@@ -891,6 +893,9 @@ pub fn paint_world_geom(
                         }
                     }
                     OpSetType::Path => {
+                        if !stroke_visible {
+                            continue;
+                        }
                         let mut width_px = stroke_width_px;
                         let mut color = stroke_color;
                         if let Some(p) = &set.paint {
@@ -916,6 +921,9 @@ pub fn paint_world_geom(
             }
         }
         WorldGeom::Sampled(passes) => {
+            if !stroke_visible {
+                return out;
+            }
             for pass in passes {
                 let Some(first) = pass.points.first() else {
                     continue;
@@ -941,7 +949,7 @@ pub fn paint_world_geom(
             }
         }
         WorldGeom::Outline(outline) => {
-            if outline.len() < 2 {
+            if outline.len() < 2 || !stroke_visible {
                 return out;
             }
             // NonZero fill: the ribbon can self-intersect at sharp turns and

@@ -112,6 +112,7 @@ fn fingerprint_into(h: &mut Fnv, el: &Element) {
     }
     let s = &el.style;
     h.write_u64(u64::from(s.stroke));
+    h.write_bool(s.stroke_none);
     match s.background {
         Some(c) => {
             h.write_bool(true);
