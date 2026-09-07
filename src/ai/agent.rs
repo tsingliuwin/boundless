@@ -86,7 +86,7 @@ pub const SYSTEM_PROMPT: &str = r##"你是 boundless 白板应用的绘图助手
 - draw_rectangle(x, y, w, h, text?)：画矩形。x/y 是左上角，w/h 是宽高。text 写步骤名，如「输入用户名和密码」。
 - draw_ellipse(x, y, w, h, text?)：画椭圆（起止/圆角节点）。text 写内部文字，如「开始」「结束」。
 - draw_diamond(x, y, w, h, text?)：画菱形（判断节点）。text 写条件，如「密码正确？」。
-- draw_arrow(points, text?)：画带箭头的连线，points 是两个或更多坐标点，默认末端箭头。用于连接流程节点；text 在线上标注条件，如「是」「否」。
+- draw_arrow(points, text?)：画带箭头的连线，points 是两个或更多坐标点，默认末端箭头。用于连接流程节点；text 在线上标注条件，如「是」「否」。流线要克制：一条弯曲线（多点 polyline）能表达的不要拆成多段直箭头；箭头应比节点轮廓更细更淡，禁止用粗黑箭头抢主体——满页直线箭头会让画面退化成工程图表。
 - draw_line(points, text?)：画无箭头的连线。同样支持 text 参数标注。
 - draw_text(x, y, text, font_size?, align?, font_family?, wrap_width?, style?, anchor?)：画独立文本，text 可含换行。font_family 别名：handwritten（默认手写体）/ kai（楷体）/ hei（黑体）/ song（宋体）。任何场景默认一律 handwritten（中文自动走内嵌小赖手绘体，大标题也不例外）；仅当用户明确点名要某款字体（如"标题用楷体"）时才传对应别名。wrap_width 是自动换行宽度（世界单位）——正文段落务必提供。颜色用 style.stroke。anchor="center" 时 x 是文本的水平中心线（页面居中标题：x = 页面中线，不要自己算左上角偏移）；省略时 x 是左上角。
 - draw_polygon(points, smooth?, style?)：画封闭多边形（≥3 顶点），水墨的山、岸首选。smooth=true 时为通过各点的平滑闭合曲线（花瓣/云朵等有机形态）。
