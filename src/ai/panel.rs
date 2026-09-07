@@ -109,8 +109,21 @@ pub struct AiPanel {
 
 /// Default / min / max panel width in px.
 pub const DEFAULT_WIDTH: f32 = 360.0;
-/// Width of the compact bottom bar (the floating conversation input).
+/// Design width of the compact bottom bar (the floating conversation input)
+/// on a roomy window.
 pub const COMPACT_BAR_WIDTH: f32 = 680.0;
+/// Horizontal room the bottom floats need, measured from the bar's center:
+/// the zoom bar (bottom-right, ≈ 290px incl. inset) is the wider of the two
+/// floats, and a centered bar must clear it on both sides plus a gap.
+const FLOATS_RESERVE: f32 = 600.0;
+
+/// Adaptive compact-bar width: full 680px on roomy canvases, shrinking on
+/// narrow ones so the centered bar clears the page/zoom floats instead of
+/// overlapping them. `span` is the width of the area the bar centers in
+/// (window minus the open explorer).
+pub fn compact_bar_width(span: f32) -> f32 {
+    (span - FLOATS_RESERVE).clamp(320.0, COMPACT_BAR_WIDTH)
+}
 /// Visible height of the compact bar's input: exactly one text line. The
 /// input lays its line out at the window default line height (1.5rem = 24px)
 /// regardless of the `line_height(1.25rem)` refinement on its own root, so
@@ -881,7 +894,9 @@ impl Render for AiPanel {
             }
         }
         if self.compact {
-            return self.render_compact(cx).into_any_element();
+            return self
+                .render_compact(f32::from(window.viewport_size().width), cx)
+                .into_any_element();
         }
         let streaming = self.streaming.is_some();
 
@@ -1332,9 +1347,18 @@ impl AiPanel {
     /// a single status line above it (streaming tail / tool in flight / last
     /// reply / error). The agent's actions unfold on the canvas — watching
     /// the board is the point; the full transcript lives one toggle away.
-    fn render_compact(&mut self, cx: &mut Context<Self>) -> Div {
+    fn render_compact(&mut self, win_w: f32, cx: &mut Context<Self>) -> Div {
         let streaming = self.streaming.is_some();
         let reasoning_control = self.render_reasoning_picker(cx);
+
+        // The bar centers over the canvas area (window minus the open
+        // explorer), so its adaptive width must fit that span, not the window.
+        let explorer_w = self
+            .board
+            .upgrade()
+            .map(|b| b.read(cx).explorer_reserved_width())
+            .unwrap_or(0.0);
+        let span = win_w - explorer_w;
 
         // Send/stop: rounded-square per the reference style. Idle = accent
         // blue with an up-arrow; streaming = dark with a light square as the
@@ -1384,7 +1408,7 @@ impl AiPanel {
             .child(Icon::new(IconName::PanelRightOpen));
 
         let bar = div()
-            .w(px(COMPACT_BAR_WIDTH))
+            .w(px(compact_bar_width(span)))
             .max_w_full()
             // Translucent white to match the board's floating chrome (toolbar
             // / zoom / page bars) — the canvas shows through faintly.
@@ -1431,11 +1455,6 @@ impl AiPanel {
         // centers over the space left of the explorer (and right of the
         // docked panel — impossible here, compact mode has no dock), and the
         // bar must shift with it or the two centers drift apart.
-        let explorer_w = self
-            .board
-            .upgrade()
-            .map(|b| b.read(cx).explorer_reserved_width())
-            .unwrap_or(0.0);
         let wrapper = div()
             .absolute()
             .bottom_0()
@@ -1447,7 +1466,7 @@ impl AiPanel {
             .gap_1()
             .pb_3()
             .px_3();
-        match self.compact_status_line() {
+        match self.compact_status_line(span) {
             Some(line) => wrapper.child(line).child(bar),
             None => wrapper.child(bar),
         }
@@ -1456,7 +1475,7 @@ impl AiPanel {
     /// The one line above the compact bar: the streaming tail (reasoning /
     /// tool / text), then the last reply once done, with errors and panel
     /// notices taking precedence. None = keep the canvas clean.
-    fn compact_status_line(&mut self) -> Option<AnyElement> {
+    fn compact_status_line(&mut self, span: f32) -> Option<AnyElement> {
         let (text, color) = if let Some(err) = &self.error {
             (err.clone(), rgb(0xc92a2a))
         } else if let Some(notice) = &self.notice {
@@ -1498,7 +1517,7 @@ impl AiPanel {
         };
         Some(
             div()
-                .w(px(COMPACT_BAR_WIDTH))
+                .w(px(compact_bar_width(span)))
                 .max_w_full()
                 .px_1()
                 .text_xs()

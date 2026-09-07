@@ -2451,9 +2451,20 @@ impl BoardView {
             if f32::from(position.y) < win_h - 120.0 {
                 return false;
             }
-            let half = crate::ai::panel::COMPACT_BAR_WIDTH / 2.0 + 12.0;
-            let left = (win_w / 2.0 - half).max(0.0);
-            let right = (win_w / 2.0 + half).min(win_w);
+            let half = {
+                // The bar centers over the canvas span (right of the open
+                // explorer) — mirror render_compact's geometry.
+                let explorer_left = if self.explorer_open {
+                    Self::EXPLORER_W
+                } else {
+                    0.0
+                };
+                let span = win_w - explorer_left;
+                crate::ai::panel::compact_bar_width(span) / 2.0 + 12.0
+            };
+            let center = win_w / 2.0 + if self.explorer_open { Self::EXPLORER_W / 2.0 } else { 0.0 };
+            let left = (center - half).max(0.0);
+            let right = (center + half).min(win_w);
             return f32::from(position.x) >= left && f32::from(position.x) <= right;
         }
         let panel_w = self.ai_panel_width(cx);
@@ -6600,7 +6611,7 @@ fn bar_button(label: &'static str, active: bool) -> Stateful<Div> {
         .items_center()
         .justify_center()
         .h_7()
-        .px_2()
+        .px_1()
         .rounded_md()
         .text_sm()
         .cursor_pointer()
@@ -6663,7 +6674,7 @@ fn bar_icon_button(
         .flex()
         .items_center()
         .justify_center()
-        .size_7()
+        .size_6()
         .rounded_md()
         .cursor_pointer()
         .child(div().size(px(crate::icons::S)).child(icon_child));
@@ -8240,7 +8251,7 @@ impl BoardView {
                     .child(
                         div()
                             .id("zoom-percent")
-                            .w_12()
+                            .w_10()
                             .text_center()
                             .text_sm()
                             .cursor_pointer()
