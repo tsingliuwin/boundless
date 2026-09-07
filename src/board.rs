@@ -332,6 +332,11 @@ pub struct BoardView {
     /// settle detector (a resize counts as settled after a quiet period).
     last_seen_viewport: Option<(f64, f64)>,
     present_resize_at: Option<std::time::Instant>,
+    /// Page-follow state: camera + viewport size of the last page fit
+    /// (flip / exit show / AI page focus). While the user leaves the camera
+    /// untouched, a window resize re-fits the current page automatically;
+    /// any manual pan/zoom drops the follow.
+    page_fit: Option<(Camera, (f64, f64))>,
     /// Index of the currently open top-level menu in the Windows in-app menu
     /// bar (None = all collapsed). Unused on macOS, which uses the native
     /// `set_menus` bar; the field compiles everywhere because the menu-bar
@@ -460,6 +465,7 @@ impl BoardView {
             present_debut: false,
             last_seen_viewport: None,
             present_resize_at: None,
+            page_fit: None,
             menubar_open: None,
             settings_page,
             settings_open: false,
@@ -3757,6 +3763,10 @@ impl BoardView {
         };
         let vp = self.viewport_bounds(cx);
         self.camera.zoom_to_rect_exact(p.bounds(), vp.size);
+        self.page_fit = Some((
+            self.camera,
+            (vp.size.width.to_f64(), vp.size.height.to_f64()),
+        ));
         cx.notify();
     }
 
@@ -3834,9 +3844,14 @@ impl BoardView {
         match self.page_exact_camera(i, cx) {
             Some(mut to) => {
                 if !presenting {
-                    // Editing flips keep the fit margin.
+                    // Editing flips keep the fit margin, and arm the
+                    // resize-follow state at the glide's endpoint.
                     let vp = self.viewport_bounds(cx);
                     to.zoom_to_fit(self.scene.pages[i].bounds(), vp.size);
+                    self.page_fit = Some((
+                        to,
+                        (vp.size.width.to_f64(), vp.size.height.to_f64()),
+                    ));
                 }
                 self.animate_camera_to(to, 300, cx);
             }
@@ -6163,6 +6178,35 @@ impl Render for BoardView {
             }
         }
 
+        // Page-fit follow: after a flip (or exiting a show) the camera sits
+        // on the current page. While the user leaves it untouched, a window
+        // resize re-fits automatically — the manual 翻页-to-recenter dance,
+        // made automatic. Any manual pan/zoom drops the follow instead of
+        // yanking the user back.
+        if self.presenting.is_none() && self.page_anim.is_none() {
+            if let Some((fit_cam, fit_size)) = self.page_fit {
+                let vp = self.viewport_bounds(cx);
+                let size = (vp.size.width.to_f64(), vp.size.height.to_f64());
+                if size != fit_size {
+                    if self.camera == fit_cam {
+                        if let Some(i) = self.current_page_index() {
+                            if let Some(p) = self.scene.pages.get(i) {
+                                let mut cam = self.camera;
+                                cam.zoom_to_fit(p.bounds(), vp.size);
+                                self.camera = cam;
+                                self.page_fit = Some((cam, size));
+                            }
+                        } else {
+                            self.page_fit = None;
+                        }
+                    } else {
+                        // The user panned/zoomed away — stop following.
+                        self.page_fit = None;
+                    }
+                }
+            }
+        }
+
         // Bring the camera to a freshly AI-created page. Deferred from
         // apply_canvas_op (which runs inside the AiPanel's update, where
         // reading the panel's width would panic); render runs outside any
@@ -6176,6 +6220,9 @@ impl Render for BoardView {
                     let mut cam = self.camera;
                     cam.zoom_to_fit(bounds, vp.size);
                     self.camera = cam;
+                    // Arm resize-follow from this fit (covers exiting a show,
+                    // where the fullscreen restore lands frames later).
+                    self.page_fit = Some((cam, (vp.size.width.to_f64(), vp.size.height.to_f64())));
                 }
             }
         }
