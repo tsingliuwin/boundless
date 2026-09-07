@@ -53,6 +53,86 @@ fn sets_of(drawable: &rough_piet::KurboDrawable<f64>) -> Vec<RoughOpSet> {
         .collect()
 }
 
+/// Brush variants for sampled (non-roughr) strokes: 铅笔 = thin translucent
+/// grainy passes, 飞白 = a faint continuous underline broken by deterministic
+/// dry-brush gaps (density / width tunable via `style.dry_*`), 钢笔 (None) =
+/// passes unchanged at the base style.
+fn brush_sampled_passes(
+    style: &ElementStyle,
+    seed: u64,
+    passes: Vec<Vec<WPoint>>,
+) -> Vec<SampledPass> {
+    match style.brush {
+        Some(crate::scene::Brush::Pencil) => {
+            let wf = (style.stroke_width as f64 * 0.3).max(0.5);
+            let color = color_u32(style.stroke, style.opacity * 0.6);
+            passes
+                .into_iter()
+                .map(|points| SampledPass {
+                    points,
+                    paint: Some(PaintOverride {
+                        color: Some(color),
+                        width: Some(wf),
+                    }),
+                })
+                .collect()
+        }
+        Some(crate::scene::Brush::DryBrush) => {
+            let density = style.dry_density.map_or(6.0 / 9.0, |v| v.clamp(0.05, 0.95));
+            let wf = (style.dry_width.map_or(0.5, |v| v.clamp(0.2, 2.0))
+                * style.stroke_width as f64)
+                .max(0.6);
+            let color = color_u32(style.stroke, style.opacity * 0.85);
+            let mut runs: Vec<SampledPass> = Vec::new();
+            for points in passes {
+                // 一条细的连续底线 + 断续的主笔触（确定性断点）
+                let under = SampledPass {
+                    points: points.clone(),
+                    paint: Some(PaintOverride {
+                        color: Some(color_u32(style.stroke, style.opacity * 0.45)),
+                        width: Some((style.stroke_width as f64 * 0.22).max(0.4)),
+                    }),
+                };
+                runs.push(under);
+                let mut run: Vec<WPoint> = Vec::new();
+                for (i, p) in points.iter().enumerate() {
+                    let keep = (((i + seed as usize) % 9) as f64 / 9.0) < density || i == 0;
+                    if keep {
+                        run.push(*p);
+                    } else if run.len() > 1 {
+                        runs.push(SampledPass {
+                            points: std::mem::take(&mut run),
+                            paint: Some(PaintOverride {
+                                color: Some(color),
+                                width: Some(wf),
+                            }),
+                        });
+                    } else {
+                        run.clear();
+                    }
+                }
+                if run.len() > 1 {
+                    runs.push(SampledPass {
+                        points: run,
+                        paint: Some(PaintOverride {
+                            color: Some(color),
+                            width: Some(wf),
+                        }),
+                    });
+                }
+            }
+            runs
+        }
+        _ => passes
+            .into_iter()
+            .map(|points| SampledPass {
+                points,
+                paint: None,
+            })
+            .collect(),
+    }
+}
+
 /// World-space render geometry: the expensive, camera-independent part of an
 /// element's paint (roughr seeded generation, spline sampling, ribbon/dot
 /// outlines). Deterministic per (seed, style, geometry), so it caches cleanly
@@ -636,7 +716,11 @@ pub fn world_geometry(el: &Element) -> WorldGeom {
         // ribbon outline instead of stroking a centerline. This arm must sit
         // before the generic point-based arm below, which keeps legacy
         // uniform strokes (empty widths) on the original rough path.
-        ElementKind::Freedraw { .. } if !el.ink_widths().is_empty() => {
+        // 钢笔（brush = None）ink 笔迹走变宽 ribbon 轮廓；铅笔/飞白故意
+        // 落到下方通用笔迹分支，让 brush 变体（细颗粒 / 断续干笔）生效。
+        ElementKind::Freedraw { .. }
+            if !el.ink_widths().is_empty() && style.brush.is_none() =>
+        {
             let points = el.absolute_points();
             if points.len() < 2 {
                 return dot_geometry(el, &points);
@@ -703,81 +787,8 @@ pub fn world_geometry(el: &Element) -> WorldGeom {
                     passes.push(samples.iter().map(offset_fn).collect());
                 }
                 // 笔刷变体：铅笔 = 细颗粒多道半透明线；飞白 = 断续干笔。
-                let sampled: Vec<SampledPass> = match style.brush {
-                    Some(crate::scene::Brush::Pencil) => {
-                        let wf = (style.stroke_width as f64 * 0.3).max(0.5);
-                        let color = color_u32(style.stroke, style.opacity * 0.6);
-                        passes
-                            .into_iter()
-                            .map(|points| SampledPass {
-                                points,
-                                paint: Some(PaintOverride {
-                                    color: Some(color),
-                                    width: Some(wf),
-                                }),
-                            })
-                            .collect()
-                    }
-                    Some(crate::scene::Brush::DryBrush) => {
-                        // 参数化：断续密度（保留采样点比例，默认 9 点保 6）
-                        // 与主笔宽度系数可由 agent 覆盖（style.dry_*）。
-                        let density = style
-                            .dry_density
-                            .map_or(6.0 / 9.0, |v| v.clamp(0.05, 0.95));
-                        let wf = (style.dry_width.map_or(0.5, |v| v.clamp(0.2, 2.0))
-                            * style.stroke_width as f64)
-                            .max(0.6);
-                        let color = color_u32(style.stroke, style.opacity * 0.85);
-                        let mut runs: Vec<SampledPass> = Vec::new();
-                        for points in passes {
-                            // 一条细的连续底线 + 断续的主笔触（确定性断点）
-                            let under = SampledPass {
-                                points: points.clone(),
-                                paint: Some(PaintOverride {
-                                    color: Some(color_u32(style.stroke, style.opacity * 0.45)),
-                                    width: Some((style.stroke_width as f64 * 0.22).max(0.4)),
-                                }),
-                            };
-                            runs.push(under);
-                            let mut run: Vec<WPoint> = Vec::new();
-                            for (i, p) in points.iter().enumerate() {
-                                let keep =
-                                    (((i + el.seed as usize) % 9) as f64 / 9.0) < density
-                                        || i == 0;
-                                if keep {
-                                    run.push(*p);
-                                } else if run.len() > 1 {
-                                    runs.push(SampledPass {
-                                        points: std::mem::take(&mut run),
-                                        paint: Some(PaintOverride {
-                                            color: Some(color),
-                                            width: Some(wf),
-                                        }),
-                                    });
-                                } else {
-                                    run.clear();
-                                }
-                            }
-                            if run.len() > 1 {
-                                runs.push(SampledPass {
-                                    points: run,
-                                    paint: Some(PaintOverride {
-                                        color: Some(color),
-                                        width: Some(wf),
-                                    }),
-                                });
-                            }
-                        }
-                        runs
-                    }
-                    _ => passes
-                        .into_iter()
-                        .map(|points| SampledPass {
-                            points,
-                            paint: None,
-                        })
-                        .collect(),
-                };
+                let sampled: Vec<SampledPass> =
+                    brush_sampled_passes(style, el.seed, passes);
                 WorldGeom::Sampled(sampled)
             } else {
                 let gen = KurboGenerator::new(options_for(style, el.seed, false));

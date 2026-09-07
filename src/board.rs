@@ -296,6 +296,8 @@ pub struct BoardView {
     present_last_move: Option<std::time::Instant>,
     /// Paper-grain material over the canvas (渲染为噪点贴图平铺).
     canvas_texture: Option<PaperTexture>,
+    /// Zoom-bar texture picker popup is open (直接点选，不做循环切换).
+    texture_picker_open: bool,
     /// Precomputed 256×256 BGRA noise tiles, one per material.
     paper_tiles: [Arc<RenderImage>; 3],
     /// Embedded-image asset store (图片字节 + 解码缓存).
@@ -443,6 +445,7 @@ impl BoardView {
             present_chrome_visible: false,
             present_last_move: None,
             canvas_texture: None,
+            texture_picker_open: false,
             paper_tiles: [
                 paper_tile(PaperTexture::Grain),
                 paper_tile(PaperTexture::Kraft),
@@ -3703,6 +3706,19 @@ impl BoardView {
         cx.notify();
     }
 
+    /// Apply a named surface preset: background color + matching paper
+    /// texture (黑板 = 墨绿底 + 粉笔灰，牛皮 = 牛皮纸底色 + 纤维…).
+    /// Background and texture stay independently settable via the swatches.
+    fn apply_surface(
+        &mut self,
+        texture: Option<PaperTexture>,
+        bg: Option<u32>,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_canvas_background(bg, cx);
+        self.set_canvas_texture(texture, cx);
+    }
+
     /// Set the paper-grain material (None = plain surface).
     pub fn set_canvas_texture(&mut self, texture: Option<PaperTexture>, cx: &mut Context<Self>) {
         if self.canvas_texture == texture {
@@ -3714,31 +3730,12 @@ impl BoardView {
             Some(PaperTexture::Grain) => "水彩纸",
             Some(PaperTexture::Kraft) => "牛皮纸",
             Some(PaperTexture::Chalkboard) => "黑板",
-            None => "无",
+            None => "白板",
         };
         self.set_notice(format!("画布材质：{label}"), cx);
     }
 
-    /// Cycle 无 → 水彩纸 → 牛皮纸 → 黑板 → 无 (zoom-bar button).
-    fn cycle_canvas_texture(&mut self, cx: &mut Context<Self>) {
-        let order = [
-            None,
-            Some(PaperTexture::Grain),
-            Some(PaperTexture::Kraft),
-            Some(PaperTexture::Chalkboard),
-        ];
-        let cur = self.canvas_texture;
-        let next = match self.canvas_texture {
-            None => order[1],
-            Some(t) => {
-                let i = order.iter().position(|o| *o == Some(t)).unwrap_or(0);
-                order[(i + 1) % order.len()]
-            }
-        };
-        let _ = cur;
-        self.set_canvas_texture(next, cx);
-    }
-
+    /// Cycle 白板 → 水彩纸 → 牛皮纸 → 黑板 → 白板 (zoom-bar button).
     // ------------------------------------------------------------------
     // slide pages: flip / present / add
 
@@ -6570,7 +6567,7 @@ fn paint_text_item(item: &TextPaintItem, window: &mut Window, cx: &mut App) {
 // Chrome: toolbar / style bar / zoom bar / notice bar
 // ---------------------------------------------------------------------
 
-const STROKE_COLORS: [u32; 5] = [0x1e1e1e, 0xe03131, 0x2f9e44, 0x1971c2, 0xf08c00];
+const STROKE_COLORS: [u32; 6] = [0x1e1e1e, 0xffffff, 0xe03131, 0x2f9e44, 0x1971c2, 0xf08c00];
 const BG_COLORS: [Option<u32>; 5] = [
     None,
     Some(0xffc9c9),
@@ -7352,7 +7349,9 @@ impl BoardView {
             // （色块）。选中或预设均可切换，作用于 shape 的 background 填充。
             // 高亮跟随**所选形状**的实际填充（整组一致时），没有选择时才
             // 回退到"最近使用"的预设样式。
-            if show_shape_options {
+            // 填充样式只对有可填充内部的形状生效。开放折线（线/箭头/笔迹）
+            // 渲染不出任何填充，与背景色行同条件隐藏，避免「点了没反应」。
+            if show_background {
                 let mut fs_row = div().flex().flex_row().gap_1();
                 let active_fill = self.selection_fill_style().unwrap_or(self.style.fill_style);
                 for (ix, (label, fs)) in [
@@ -7395,13 +7394,17 @@ impl BoardView {
                 bar = bar.child(fs_row);
             }
 
-            // 笔刷（钢笔工具或选中笔迹时）：钢笔（实心墨迹）/ 铅笔
-            // （颗粒细线）/ 飞白（断续干笔）。画完一笔工具会自动回到
-            // 选择模式，所以"选中笔迹"也必须能看到笔刷行。
-            // 笔刷（常驻）：钢笔（实心墨迹）/ 铅笔（颗粒细线）/ 飞白
-            // （断续干笔）。作用于选中的笔迹；无选中时作为后续笔迹的
-            // 预设。常驻显示，避免各类状态下忽隐忽现。
-            {
+            // 笔刷（钢笔/铅笔/飞白）只作用于手绘笔迹（Freedraw）：钢笔 =
+            // 实心墨迹、铅笔 = 颗粒细线、飞白 = 断续干笔。对文字和形状
+            // 无效，所以只在画笔工具激活（作为后续笔迹预设）或选中了
+            // 笔迹时显示，避免选中文字时点了没反应的困惑。
+            let stroke_sel = !self.selection.is_empty()
+                && self.selection.iter().any(|id| {
+                    self.scene
+                        .get(*id)
+                        .is_some_and(|e| matches!(e.kind, ElementKind::Freedraw { .. }))
+                });
+            if matches!(self.tool, ActiveTool::Pen) || stroke_sel {
                 let mut br_row = div().flex().flex_row().gap_1();
                 for (ix, (label, br)) in [
                     ("钢笔", None),
@@ -7437,7 +7440,7 @@ impl BoardView {
                     );
                 }
                 bar = bar.child(br_row);
-        }
+            }
 
         // Text options: font size presets + font family + alignment, shown
         // as glyph icons. With no selection (Text tool active) the buttons
@@ -8225,7 +8228,7 @@ impl BoardView {
             Some(PaperTexture::Grain) => "水彩",
             Some(PaperTexture::Kraft) => "牛皮",
             Some(PaperTexture::Chalkboard) => "黑板",
-            _ => "无",
+            _ => "白板",
         };
 
         div()
@@ -8236,15 +8239,101 @@ impl BoardView {
             .flex()
             .child(
                 bar_container()
-                    .child(
-                        bar_button(tex_label, self.canvas_texture.is_some()).on_click(
-                            move |_, _, cx| {
-                                weak_tex
-                                    .update(cx, |this, cx| this.cycle_canvas_texture(cx))
-                                    .ok();
-                            },
-                        ),
-                    )
+                    .child({
+                        // Texture picker: a popover like the AI bar's 低/中/高 —
+                        // the button toggles the panel, options pick directly;
+                        // no cycling through states.
+                        let mut tex_button = div()
+                            .id("texture-picker")
+                            .relative()
+                            .child(
+                                // No active tint on the button itself — every
+                                // texture state reads the same (白板 included).
+                                bar_button(tex_label, false).on_click(
+                                    move |_, _, cx| {
+                                        weak_tex
+                                            .update(cx, |this, cx| {
+                                                this.texture_picker_open =
+                                                    !this.texture_picker_open;
+                                                cx.notify();
+                                            })
+                                            .ok();
+                                    },
+                                ),
+                            );
+                        if self.texture_picker_open {
+                            let mut card = div()
+                                .absolute()
+                                .bottom_full()
+                                // Center the card over the button: the popup
+                                // is wider than the button, so shift left by
+                                // half the difference (both are fixed-width).
+                                .left(px(-6.0))
+                                .mb_1p5()
+                                .w_12()
+                                .bg(rgb(0xffffff))
+                                .border_1()
+                                .border_color(rgb(0xe3e2df))
+                                .rounded_md()
+                                .shadow_lg()
+                                .p_1()
+                                .flex()
+                                .flex_col()
+                                .gap_0p5()
+                                // Clicks on the card's padding don't fall through.
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                // Any mouse-down outside the card closes it.
+                                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                    this.texture_picker_open = false;
+                                    cx.notify();
+                                }));
+                            for (i, (label, texture, bg)) in [
+                                // 表面预设：底色 + 纹理成对出现，名字即效果。
+                                ("白板", None, None),
+                                ("水彩", Some(PaperTexture::Grain), Some(0xf7f2e8)),
+                                ("牛皮", Some(PaperTexture::Kraft), Some(0xc9a66b)),
+                                ("黑板", Some(PaperTexture::Chalkboard), Some(0x2a5240)),
+                            ]
+                            .into_iter()
+                            .enumerate()
+                            {
+                                let active = self.canvas_texture == texture;
+                                let weak_pick = weak.clone();
+                                let mut row = div()
+                                    .id(("texture-opt", i))
+                                    .px_1()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .text_sm()
+                                    .text_center()
+                                    .cursor_pointer()
+                                    .child(label);
+                                if active {
+                                    row = row.bg(rgb(0xe8f0fe)).text_color(rgb(0x1a5fd7));
+                                } else {
+                                    row = row
+                                        .hover(|s| s.bg(rgb(0xf0efec)))
+                                        .text_color(rgb(0x555555));
+                                }
+                                // Select on mouse-down (not click): the popup
+                                // unmounts on selection, swallowing the click's up.
+                                card = card.child(row.on_mouse_down(
+                                    MouseButton::Left,
+                                    move |_, _, cx| {
+                                        cx.stop_propagation();
+                                        weak_pick
+                                            .update(cx, |this, cx| {
+                                                this.texture_picker_open = false;
+                                                this.apply_surface(texture, bg, cx);
+                                            })
+                                            .ok();
+                                    },
+                                ));
+                            }
+                            tex_button = tex_button.child(card);
+                        }
+                        tex_button
+                    })
                     .child(bar_button("−", false).on_click(move |_, _, cx| {
                         weak_out.update(cx, |this, cx| this.zoom_by(0.8, cx)).ok();
                     }))
@@ -8756,27 +8845,22 @@ fn paper_tile(kind: PaperTexture) -> std::sync::Arc<RenderImage> {
     for i in 0..(N * N) {
         let v = rand();
         let (r, g, b, a): (u8, u8, u8, u8) = match kind {
-            // 水彩纸：极细的明暗颗粒
+            // 水彩纸：暖白底上的深色细颗粒（4–17% alpha 冷压纸纹）
             PaperTexture::Grain => {
-                let dark = v & 1 == 0;
-                let lum = if dark { 0x40 } else { 0xf2 };
-                (lum, lum, lum, ((v >> 8) % 13) as u8)
+                let a = ((v >> 8) % 34 + 10) as u8;
+                (0x40, 0x3e, 0x3a, a)
             }
-            // 牛皮纸：暖色纤维，横向成行
+            // 牛皮纸：暖棕纤维横向成行，铺在牛皮纸底色上
             PaperTexture::Kraft => {
                 let row = i / N;
-                let boost: f32 = if row % 3 == 0 { 2.0 } else { 1.0 };
-                let a = ((v >> 7) as f32 % 30.0 * boost) as u8;
+                let boost: f32 = if row % 3 == 0 { 2.2 } else { 1.3 };
+                let a = ((v >> 7) as f32 % 32.0 * boost) as u8;
                 (0x5a, 0x40, 0x22, a)
             }
-            // 黑板：白色粉笔粉尘
+            // 黑板：墨绿底上的白色粉笔粉尘（8–33% alpha，经典黑板质感）
             PaperTexture::Chalkboard => {
-                let lum = 0xe6;
-                let a = if v % 11 == 0 {
-                    ((v >> 8) % 34) as u8
-                } else {
-                    0
-                };
+                let lum = 0xf2;
+                let a = if v % 6 == 0 { ((v >> 8) % 64 + 20) as u8 } else { 0 };
                 (lum, lum, lum, a)
             }
         };
