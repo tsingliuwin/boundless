@@ -128,3 +128,10 @@ strip = true
 # `minisign-verify` (a normal dep above). Dev-only so it never ships in a
 # release binary.
 minisign = "0.9.1"
+
+# Vendored gpui 0.2.2 (crates.io source, pruned examples/docs) with one local
+# patch: trackpad pinch (NSEventTypeMagnify) is synthesized into a cmd+scroll
+# so the canvas can zoom at the cursor — stock 0.2.2 drops the gesture. See
+# vendor/gpui/src/platform/mac/events.rs.
+[patch.crates-io]
+gpui = { path = "vendor/gpui" }
