@@ -2,7 +2,7 @@
 
 <img src="logo.png" width="120" alt="boundless logo"/>
 
-# boundless
+# 无界白板 · boundless
 
 **An infinite hand-drawn whiteboard on GPUI — with an AI agent that draws directly onto the canvas.**
 
@@ -15,7 +15,7 @@ Excalidraw 风格的无限手绘白板，AI 智能体直接在画布上作画。
 
 ---
 
-boundless 是一个用 Rust + [GPUI](https://gpui.rs) 写的无限白板：笔迹带压感、图形自带手绘抖动（rough.js 风格）、多页面放映，内置一个 rig 驱动的 AI 智能体——你说"画一份讲递归的 PPT"，它就调用工具直接把元素画到画布上，而不是给你一张图或一段代码。
+无界白板（boundless）是一个用 Rust + [GPUI](https://gpui.rs) 写的无限白板：笔迹带压感、图形自带手绘抖动（rough.js 风格）、多页面放映，内置一个 rig 驱动的 AI 智能体——你说"画一份讲递归的 PPT"，它就调用工具直接把元素画到画布上，而不是给你一张图或一段代码。
 
 ## 特性
 
