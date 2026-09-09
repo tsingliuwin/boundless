@@ -542,3 +542,21 @@ pub fn trash(c: Hsla) -> impl IntoElement {
         b.ln(11.5, 13.5);
     })
 }
+
+/// Download/update: an arrow dropping into a tray — the title-bar glyph that
+/// appears while an update downloads or is ready to apply.
+pub fn download(c: Hsla) -> impl IntoElement {
+    icon(c, |b| {
+        // Arrow shaft + head.
+        b.mv(10.0, 3.5);
+        b.ln(10.0, 12.5);
+        b.mv(6.0, 8.5);
+        b.ln(10.0, 12.5);
+        b.ln(14.0, 8.5);
+        // Tray.
+        b.mv(4.5, 13.5);
+        b.ln(4.5, 16.5);
+        b.ln(15.5, 16.5);
+        b.ln(15.5, 13.5);
+    })
+}

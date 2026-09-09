@@ -92,8 +92,21 @@ pub fn platform_key() -> &'static str {
     "unsupported"
 }
 
-/// The app's current version, baked in at compile time.
+/// The app's current version, baked in at compile time. Debug builds honor
+/// `BOUNDLESS_FAKE_VERSION` so the real manifest can drive the update UI
+/// (title-bar icon → dialog → restart prompt) from an older pretended version.
 pub fn current_version() -> &'static str {
+    if cfg!(debug_assertions) {
+        static FAKE: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+        if let Some(s) = FAKE.get_or_init(|| {
+            std::env::var("BOUNDLESS_FAKE_VERSION")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|s| Box::leak(s.into_boxed_str()) as &str)
+        }) {
+            return s;
+        }
+    }
     env!("CARGO_PKG_VERSION")
 }
 
@@ -113,6 +126,12 @@ pub fn is_newer(latest: &str, current: &str) -> Result<bool> {
 fn http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(concat!("boundless-updater/", env!("CARGO_PKG_VERSION")))
+        // Direct connection only. reqwest 0.12 picks up the Windows system
+        // proxy by default, and a stale/broken system proxy (clash not
+        // running, say) then silently kills every update check — the CDN is
+        // self-hosted on a directly-reachable domain, so the proxy adds
+        // failure modes without upside here.
+        .no_proxy()
         .build()
         .context("build reqwest client")
 }

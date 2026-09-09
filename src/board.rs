@@ -378,6 +378,9 @@ pub struct BoardView {
     /// Auto-update flow state (check / download / ready-to-restart). Driven by
     /// the `CheckForUpdates` action + a delayed startup poll; see `src/updater.rs`.
     update_state: crate::updater::UpdateState,
+    /// Whether the update confirm dialog is open (opened by clicking the
+    /// title-bar download icon; restart only happens after the user confirms).
+    update_dialog_open: bool,
     /// Per-element world-geometry cache (render/cache.rs): skips roughr
     /// generation and spline/ribbon rebuilds for unchanged elements. Pan/zoom
     /// never invalidates it; invalidation is by element fingerprint.
@@ -480,6 +483,7 @@ impl BoardView {
             explorer_sessions: HashMap::new(),
             chat_compact: true,
             update_state: crate::updater::UpdateState::default(),
+            update_dialog_open: false,
             render_cache: crate::render::cache::RenderCache::new(),
             text_cache: crate::render::cache::TextCache::new(),
         };
@@ -2280,6 +2284,7 @@ impl BoardView {
 
         cx.spawn(async move |this, cx| {
             let res = rx.await;
+            upd_trace(format!("check finished (silent={silent}): {res:?}"));
             this.update(cx, |this, cx| {
                 use crate::updater::UpdateState;
                 match res {
@@ -2289,11 +2294,14 @@ impl BoardView {
                         this.download_update(url, sig, version, notes, cx);
                     }
                     Ok(Ok(None)) => {
-                        this.update_state = if silent {
-                            UpdateState::Idle
-                        } else {
-                            UpdateState::UpToDate
-                        };
+                        // Manual check: report via the bottom-left notice line
+                        // (the bottom banner is gone); the silent startup poll
+                        // stays invisible either way.
+                        this.update_state = UpdateState::Idle;
+                        if !silent {
+                            let v = crate::updater::current_version();
+                            this.set_notice(format!("已是最新版本 v{v}"), cx);
+                        }
                         cx.notify();
                     }
                     Ok(Err(e)) => {
@@ -2344,6 +2352,7 @@ impl BoardView {
         let url_c = url.clone();
         let dest_c = dest.clone();
         let sig_c = signature.clone();
+        upd_trace(format!("download begin: {url}"));
         crate::ai::client::tokio_runtime().spawn(async move {
             let tx2 = tx.clone();
             let res = crate::updater::download(&url_c, &dest_c, move |done, total| {
@@ -2356,7 +2365,9 @@ impl BoardView {
             })
             .await;
             let res = res.and_then(|()| crate::updater::verify(&dest_c, &sig_c).map(|()| dest_c));
-            let _ = tx.unbounded_send(DownloadMsg::Done(res.map_err(|e| e.to_string())));
+            // "{e:#}" carries the full anyhow chain — the top context alone
+            // ("download request") hides the actual cause.
+            let _ = tx.unbounded_send(DownloadMsg::Done(res.map_err(|e| format!("{e:#}"))));
         });
 
         cx.spawn(async move |this, cx| {
@@ -2372,6 +2383,11 @@ impl BoardView {
                         .ok();
                     }
                     DownloadMsg::Done(res) => {
+                        upd_trace(format!(
+                            "download finished: {}",
+                            res.as_ref().map(|a| a.display().to_string())
+                                .unwrap_or_else(|e| format!("FAILED: {e}"))
+                        ));
                         this.update(cx, |this, cx| {
                             this.update_state = match res {
                                 Ok(artifact) => UpdateState::Ready {
@@ -2427,7 +2443,6 @@ impl BoardView {
         self.update_state = crate::updater::UpdateState::Idle;
         cx.notify();
     }
-
     /// True if `position` (window/content coordinates) lies over the AI panel.
     /// The panel docks against the right edge, so this is "right of the panel's
     /// left edge". Used to make the canvas's mouse/scroll handlers ignore events
@@ -6587,7 +6602,6 @@ impl Render for BoardView {
                             .child(self.render_zoom_bar(cx))
                             .child(self.render_page_bar(cx))
                             .child(self.render_notice_bar())
-                            .children(self.render_update_banner(cx))
                             .children(self.render_context_menu(cx))
                             .when(self.explorer_open, |d| d.child(self.render_explorer(cx)))
                             .children(self.ai_panel.clone())
@@ -6598,6 +6612,9 @@ impl Render for BoardView {
             )
             // Dropdown overlay rendered last so it paints above the canvas.
             .when_some(menubar_dropdown, |d, dd| d.child(dd))
+            // Update confirm dialog paints above everything (menu bar
+            // included); it's an explicit user-opened modal.
+            .children(self.render_update_dialog(cx))
     }
 }
 
@@ -6738,6 +6755,18 @@ fn bar_icon_button(
 /// Icon color: blue when active, dark gray otherwise.
 fn icon_color(active: bool) -> Hsla {
     color_u32(if active { ICON_ACTIVE } else { ICON_NORMAL }, 1.0)
+}
+
+/// Debug-build tracing for the auto-update flow. stderr goes nowhere in
+/// release builds (windows_subsystem), so this is compiled out there.
+fn upd_trace(msg: impl std::fmt::Display) {
+    if cfg!(debug_assertions) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        eprintln!("[updater {ts}] {msg}");
+    }
 }
 
 /// A horizontal separator for the context menu.
@@ -6903,6 +6932,79 @@ impl BoardView {
         } else {
             IconName::WindowMaximize
         };
+        // Update indicator, left of the gear: a download glyph while an update
+        // downloads / is ready / failed. Ready (with a blue-dot badge) and
+        // Error open the confirm dialog on click; download progress is purely
+        // informational. Replaces the old bottom-center banner, which overlapped
+        // the compact AI chat bar.
+        use crate::icons as ic;
+        use crate::updater::UpdateState;
+        let update_indicator: Option<AnyElement> = match &self.update_state {
+            UpdateState::Ready { .. } | UpdateState::Error { .. } => {
+                let failed = matches!(self.update_state, UpdateState::Error { .. });
+                let tint = if failed {
+                    color_u32(0xcf222e, 1.0)
+                } else {
+                    icon_color(false)
+                };
+                Some(
+                    div()
+                        .id("upd-title")
+                        .w(px(WIN_BTN_W))
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .hover(|s| s.bg(rgb(0xf1f0ee)))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.update_dialog_open = true;
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .relative()
+                                .w(px(ic::S))
+                                .h(px(ic::S))
+                                .child(ic::download(tint))
+                                // Blue dot badge only for "ready to restart" —
+                                // that's the state that needs the user's eye.
+                                .when(!failed, |d| {
+                                    d.child(
+                                        div()
+                                            .absolute()
+                                            .top(px(0.0))
+                                            .right(px(0.0))
+                                            .w(px(7.0))
+                                            .h(px(7.0))
+                                            .rounded_full()
+                                            .bg(rgb(0x1a5fd7)),
+                                    )
+                                }),
+                        )
+                        .into_any_element(),
+                )
+            }
+            UpdateState::Downloading { fraction } => Some(
+                div()
+                    .w(px(64.0))
+                    .h_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_center()
+                    .gap_1()
+                    .text_color(rgb(0x888888))
+                    .child(div().w(px(ic::S)).h(px(ic::S)).child(ic::download(icon_color(false))))
+                    .child(
+                        div()
+                            .text_xs()
+                            .child(format!("{}%", (fraction * 100.0) as u32)),
+                    )
+                    .into_any_element(),
+            ),
+            _ => None,
+        };
         // Settings gear, left of the minimize caption button: opens the
         // full-area settings page. Same size and neutral hover as the caption
         // buttons (no close-red); stops mouse-down propagation like they do so
@@ -6924,6 +7026,7 @@ impl BoardView {
             .flex_row()
             .items_center()
             .h_full()
+            .children(update_indicator)
             .child(gear)
             .child(window_control_button(
                 "win-min",
@@ -8740,105 +8843,150 @@ impl BoardView {
             .child(text)
     }
 
-    /// A small bottom-center banner for the auto-update flow: download
-    /// progress, a "ready to restart" prompt, or an error. Hidden when idle /
-    /// checking / available (transient states).
-    fn render_update_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// Centered confirm dialog for the update flow, opened by clicking the
+    /// title-bar download icon: a ready update asks "restart now?"; a failed
+    /// update shows the error. The backdrop click only closes the dialog — the
+    /// underlying state (and the icon) stays, so a ready update never restarts
+    /// without an explicit 重启应用 click.
+    fn render_update_dialog(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         use crate::updater::UpdateState;
+        if !self.update_dialog_open {
+            return None;
+        }
         let weak = cx.weak_entity();
-        let is_restart = matches!(self.update_state, UpdateState::Ready { .. });
-        let (text, has_action): (String, bool) = match &self.update_state {
-            UpdateState::Idle | UpdateState::Checking => return None,
-            UpdateState::Downloading { fraction } => (
-                format!("正在下载更新 {}%", (fraction * 100.0) as u32),
-                false,
-            ),
+        let (title, body, restartable) = match &self.update_state {
             UpdateState::Ready { version, notes, .. } => {
-                let mut t = format!("新版本 v{} 已就绪，重启以应用", version);
-                // Append the first line of the release notes, truncated, so the
-                // banner stays compact.
+                let mut body = format!("新版本 v{version} 已下载并通过签名校验，重启后生效。");
+                // First line of the release notes, char-safe truncated (the
+                // old banner sliced bytes, which panics mid-UTF-8 on Chinese).
                 if let Some(line) = notes.lines().next() {
                     let line = line.trim();
                     if !line.is_empty() {
-                        t.push_str("  ·  ");
-                        let max = 60;
-                        if line.len() > max {
-                            t.push_str(&line[..max]);
-                            t.push('…');
-                        } else {
-                            t.push_str(line);
+                        let max = 48usize;
+                        let short: String = line.chars().take(max).collect();
+                        body.push_str("\n更新内容：");
+                        body.push_str(&short);
+                        if line.chars().count() > max {
+                            body.push('…');
                         }
                     }
                 }
-                (t, true)
+                (format!("新版本 v{version} 已就绪"), body, true)
             }
-            UpdateState::UpToDate => (
-                format!("已是最新版本 v{}", crate::updater::current_version()),
-                true,
-            ),
-            UpdateState::Installing => ("正在安装，即将重启…".to_string(), false),
-            UpdateState::Error { message } => (format!("更新失败：{}", message), true),
+            UpdateState::Error { message } => ("更新失败".to_string(), message.clone(), false),
+            // State changed while the dialog was open (e.g. install started) —
+            // drop the dialog.
+            _ => return None,
         };
-        let action_label = if is_restart { "重启应用" } else { "关闭" };
 
-        let mut card = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
+        let later_btn = div()
+            .id("upd-later")
             .px_3()
-            .py_2()
-            .bg(rgb(0xffffff))
-            .border_1()
-            .border_color(rgb(0xe3e2df))
-            .rounded_lg()
-            .shadow_lg()
+            .py_1()
+            .rounded_md()
+            .bg(rgb(0xf1f0ee))
+            .hover(|s| s.bg(rgb(0xebeaea)))
+            .cursor_pointer()
             .text_sm()
             .text_color(rgb(0x1e1e1e))
-            .child(text);
-        if has_action {
-            let bg = if is_restart {
-                rgb(0x1a5fd7)
-            } else {
-                rgb(0xf1f0ee)
-            };
-            let fg = if is_restart {
-                rgb(0xffffff)
-            } else {
-                rgb(0x1e1e1e)
-            };
-            card = card.child(
-                div()
-                    .id("upd-action")
-                    .px_2()
-                    .py_0p5()
-                    .rounded_md()
-                    .text_color(fg)
-                    .cursor_pointer()
-                    .when(is_restart, |d| d.bg(bg))
-                    .when(!is_restart, |d| d.hover(|s| s.bg(rgb(0xebeaea))))
-                    .on_click(move |_, _, cx| {
-                        let _ = weak.update(cx, |this, cx| {
-                            if is_restart {
-                                this.install_and_restart(cx);
-                            } else {
-                                this.dismiss_update(cx);
-                            }
-                        });
-                    })
-                    .child(action_label),
-            );
+            .on_click({
+                let weak = weak.clone();
+                move |_, _, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        // Keep the Ready state (icon stays); just close.
+                        this.update_dialog_open = false;
+                        cx.notify();
+                    });
+                }
+            })
+            .child("稍后");
+        let restart_btn = div()
+            .id("upd-restart")
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .bg(rgb(0x1a5fd7))
+            .hover(|s| s.bg(rgb(0x154bb0)))
+            .cursor_pointer()
+            .text_sm()
+            .text_color(rgb(0xffffff))
+            .on_click({
+                let weak = weak.clone();
+                move |_, _, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.update_dialog_open = false;
+                        this.install_and_restart(cx);
+                    });
+                }
+            })
+            .child("重启应用");
+        let ok_btn = div()
+            .id("upd-ok")
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .bg(rgb(0xf1f0ee))
+            .hover(|s| s.bg(rgb(0xebeaea)))
+            .cursor_pointer()
+            .text_sm()
+            .text_color(rgb(0x1e1e1e))
+            .on_click({
+                let weak = weak.clone();
+                move |_, _, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.update_dialog_open = false;
+                        // Error is transient — acknowledge it back to Idle so
+                        // the red title-bar icon goes away.
+                        this.dismiss_update(cx);
+                    });
+                }
+            })
+            .child("知道了");
+
+        let buttons = if restartable {
+            div().flex().flex_row().justify_end().gap_2()
+        } else {
+            div()
         }
+        .when(restartable, |d| d.child(later_btn).child(restart_btn))
+        .when(!restartable, |d| d.child(ok_btn));
 
         Some(
             div()
                 .absolute()
-                .bottom_3()
-                .left_0()
-                .right_0()
+                .inset_0()
+                .bg(gpui::black().opacity(0.28))
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.update_dialog_open = false;
+                    cx.notify();
+                }))
                 .flex()
+                .items_center()
                 .justify_center()
-                .child(card)
+                .child(
+                    div()
+                        // Clicks inside the card never reach the backdrop.
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .w(px(380.0))
+                        .bg(rgb(0xffffff))
+                        .border_1()
+                        .border_color(rgb(0xe3e2df))
+                        .rounded_lg()
+                        .shadow_lg()
+                        .p_4()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div().text_sm().font_weight(FontWeight::SEMIBOLD).child(title),
+                        )
+                        .child(
+                            div().text_sm().text_color(rgb(0x666666)).child(body),
+                        )
+                        .child(
+                            div().flex().flex_row().justify_end().gap_2().mt_1().child(buttons),
+                        ),
+                )
                 .into_any_element(),
         )
     }
