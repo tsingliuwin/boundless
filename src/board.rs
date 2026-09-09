@@ -17,8 +17,9 @@ use crate::history::History;
 use crate::render::rough::{color_u32, paths_for_element, ReadyPath};
 use crate::render::{dot_grid, handle_rects, measure_text, point_handle_rects, ShapedTextLine};
 use crate::scene::{
-    pages::PageRatio, Brush, Element, ElementId, ElementKind, ElementStyle, LineType, PaperTexture,
-    Scene, SceneFile, StrokeStyle, TextAlign, WBounds, WPoint, DEFAULT_FONT_SIZE, LINE_HEIGHT,
+    pages::PageRatio, CanvasBrush, CanvasStroke, CanvasStrokeStyle, Element, ElementId,
+    ElementKind, ElementStyle, LineType, PaperTexture, Scene, SceneFile, StrokeStyle, TextAlign,
+    WBounds, WPoint, DEFAULT_FONT_SIZE, LINE_HEIGHT,
 };
 use crate::settings_page::SettingsPage;
 use crate::text::{utf16_to_utf8, utf8_to_utf16, TextEditSession};
@@ -91,6 +92,8 @@ actions!(
         InsertImage,
         /// 粘贴：剪贴板为图片时嵌入画布；为图片文件路径时嵌入该文件。
         PasteImage,
+        /// 插入位图画布：画布中央放置一块可水彩/飞白绘画的光栅画板。
+        InsertCanvas,
     ]
 );
 
@@ -388,6 +391,12 @@ pub struct BoardView {
     /// Shaped-text cache: skips per-frame text shaping (wrapped paragraphs
     /// shape per character). Keyed by shaping fingerprint incl. zoom.
     text_cache: crate::render::cache::TextCache,
+    /// Per-canvas texture cache (位图画布像素缓冲 → GPU 纹理)，with stale
+    /// tracking so the paint phase can free replaced atlas textures.
+    canvas_cache: crate::render::raster::CanvasCache,
+    /// Pixel brush for the next stroke drawn into a raster canvas element
+    /// (水彩/钢笔/飞白). Freedraw strokes keep using `style.brush`.
+    canvas_brush: CanvasBrush,
 }
 
 impl BoardView {
@@ -486,6 +495,8 @@ impl BoardView {
             update_dialog_open: false,
             render_cache: crate::render::cache::RenderCache::new(),
             text_cache: crate::render::cache::TextCache::new(),
+            canvas_cache: crate::render::raster::CanvasCache::new(),
+            canvas_brush: CanvasBrush::Ink,
         };
         // Auto-update: poll silently 30s after launch, then every 4h. Only a
         // real available update surfaces (silent = no "up to date" / transient
@@ -567,6 +578,56 @@ impl BoardView {
         DragState::Freedraw {
             collector,
             seed: crate::scene::new_seed(),
+        }
+    }
+
+    /// Topmost raster canvas element whose surface contains `world` — pen
+    /// strokes landing there rasterize into it instead of becoming
+    /// board-level freedraw elements.
+    fn canvas_at(&self, world: WPoint) -> Option<ElementId> {
+        self.scene
+            .elements
+            .iter()
+            .rev()
+            .find(|e| matches!(e.kind, ElementKind::Canvas { .. }) && e.bounds.contains(world))
+            .map(|e| e.id)
+    }
+
+    /// Start a stroke into a raster canvas. Capture mirrors freedraw; the
+    /// style is snapshotted here so later board-style changes never affect
+    /// the in-progress stroke.
+    fn begin_canvas_draw(&self, element_id: ElementId, world: WPoint) -> DragState {
+        let hw = self.hw_pressure();
+        let mut collector = crate::ink::InkCollector::new(self.camera.zoom, self.pen_taper);
+        collector.push_with_pressure(world, hw);
+        DragState::CanvasDraw {
+            element_id,
+            collector,
+            style: CanvasStrokeStyle {
+                color: self.style.stroke,
+                width: self.style.stroke_width,
+                opacity: self.style.opacity,
+                brush: self.canvas_brush,
+            },
+        }
+    }
+
+    /// Snapshot of an in-progress canvas stroke (collector state → stroke
+    /// payload relative to the canvas origin) for live rasterized preview.
+    fn live_canvas_stroke(
+        &self,
+        el: &Element,
+        collector: &crate::ink::InkCollector,
+        style: &CanvasStrokeStyle,
+    ) -> CanvasStroke {
+        let origin = WPoint::new(el.bounds.x, el.bounds.y);
+        CanvasStroke {
+            points: collector.points().iter().map(|p| *p - origin).collect(),
+            widths: collector.widths().to_vec(),
+            color: style.color,
+            width: style.width,
+            brush: style.brush,
+            opacity: style.opacity,
         }
     }
 
@@ -1204,6 +1265,74 @@ impl BoardView {
                     h as i64,
                     iw as i64,
                     ih as i64,
+                    x,
+                    y
+                ))
+            }
+            CanvasOp::AddCanvas {
+                x,
+                y,
+                w,
+                h,
+                background,
+                strokes,
+            } => {
+                let w = w.unwrap_or(480.0).clamp(80.0, 2000.0);
+                let h = h.unwrap_or(320.0).clamp(80.0, 2000.0);
+                let vis = self.visible_world_bounds();
+                let x = x.unwrap_or(vis.center().x - w / 2.0);
+                let y = y.unwrap_or(vis.center().y - h / 2.0);
+                let origin = WPoint::new(x, y);
+                let mut el_strokes = Vec::with_capacity(strokes.len());
+                for (si, s) in strokes.iter().enumerate() {
+                    if s.points.len() < 2 {
+                        return Err(CanvasOpError::invalid_args(format!(
+                            "第 {} 笔至少需要 2 个点",
+                            si + 1
+                        )));
+                    }
+                    if s.points
+                        .iter()
+                        .any(|p| !(p.x.is_finite() && p.y.is_finite()))
+                    {
+                        return Err(CanvasOpError::invalid_args(format!(
+                            "第 {} 笔含有非法坐标",
+                            si + 1
+                        )));
+                    }
+                    el_strokes.push(CanvasStroke {
+                        points: s
+                            .points
+                            .iter()
+                            .map(|p| WPoint::new(p.x - origin.x, p.y - origin.y))
+                            .collect(),
+                        widths: Vec::new(),
+                        color: s.color.unwrap_or(0x1e1e1e),
+                        width: s.width.unwrap_or(6.0).clamp(1.0, 40.0),
+                        brush: s.brush.unwrap_or(CanvasBrush::Watercolor),
+                        opacity: s.opacity.unwrap_or(1.0).clamp(0.05, 1.0),
+                    });
+                }
+                self.history.record(&self.scene);
+                let style = ElementStyle {
+                    background: Some(background.unwrap_or(0xfffdf6)),
+                    ..ElementStyle::default()
+                };
+                let el = Element::new_with_id(
+                    pre_assigned_id.unwrap_or_else(uuid::Uuid::new_v4),
+                    ElementKind::Canvas {
+                        strokes: el_strokes,
+                    },
+                    WBounds::new(x, y, w, h),
+                    style,
+                );
+                let added = self.scene.add(el);
+                Ok(format!(
+                    "已添加位图画布 id={} {}×{}，{} 笔水彩/墨迹（落笔自动裁剪在画布内），位置 ({:.0},{:.0})",
+                    &added.to_string()[..8],
+                    w as i64,
+                    h as i64,
+                    strokes.len(),
                     x,
                     y
                 ))
@@ -2001,6 +2130,9 @@ impl BoardView {
                     ElementKind::Freedraw { .. } => ("freedraw", None),
                     ElementKind::Polygon { .. } => ("polygon", None),
                     ElementKind::Image { asset } => ("image", Some(asset.clone())),
+                    ElementKind::Canvas { strokes } => {
+                        ("canvas", Some(format!("{} 笔", strokes.len())))
+                    }
                 };
                 ElementSnapshot {
                     id: el.id.to_string()[..8].to_string(),
@@ -2708,6 +2840,31 @@ impl BoardView {
             .camera
             .screen_to_world(point(origin.x + vp.width, origin.y + vp.height), origin);
         WBounds::from_corners(tl, br)
+    }
+
+    /// 插入位图画布：视图中央放置一块暖纸底的光栅画板（默认 480×320
+    /// 世界单位，上限为可见范围的 60%）。插入后自动选中，样式栏随即
+    /// 给出水彩/钢笔/飞白笔刷选择。
+    fn insert_canvas(&mut self, cx: &mut Context<Self>) {
+        let vis = self.visible_world_bounds();
+        let w = 480.0_f64.min(vis.w * 0.6).max(120.0);
+        let h = 320.0_f64.min(vis.h * 0.6).max(80.0);
+        let (x, y) = (vis.center().x - w / 2.0, vis.center().y - h / 2.0);
+        self.history.record(&self.scene);
+        let style = ElementStyle {
+            background: Some(0xfffdf6),
+            ..ElementStyle::default()
+        };
+        let el = Element::new(
+            ElementKind::Canvas { strokes: Vec::new() },
+            WBounds::new(x, y, w, h),
+            style,
+        );
+        let id = el.id;
+        self.scene.add(el);
+        self.selection = vec![id];
+        self.mark_dirty();
+        cx.notify();
     }
 
     /// 插入图片：文件对话框选择后嵌入当前画布。
@@ -4207,9 +4364,13 @@ impl BoardView {
         if self.editing.is_none() {
             if shift && self.tool != ActiveTool::Pen {
                 // Shift + left-drag: temporary freehand stroke (Excalidraw's
-                // "hold to sketch"). Reuses the Pen tool's drag path.
+                // "hold to sketch"). Reuses the Pen tool's drag path — over a
+                // raster canvas the stroke rasterizes into it.
                 self.temp_pen = true;
-                self.drag = self.begin_freedraw(world);
+                self.drag = match self.canvas_at(world) {
+                    Some(id) => self.begin_canvas_draw(id, world),
+                    None => self.begin_freedraw(world),
+                };
                 cx.notify();
                 return;
             } else if ctrl && self.tool != ActiveTool::Hand {
@@ -4250,7 +4411,13 @@ impl BoardView {
                 if crate::platform::latest_pen_sample().is_some_and(|s| s.eraser) {
                     self.begin_erase(world, cx);
                 } else {
-                    self.drag = self.begin_freedraw(world);
+                    // Pen-down inside a raster canvas rasterizes into it
+                    // (watercolor/dry-brush live preview); elsewhere it is an
+                    // ordinary board-level freedraw stroke.
+                    self.drag = match self.canvas_at(world) {
+                        Some(id) => self.begin_canvas_draw(id, world),
+                        None => self.begin_freedraw(world),
+                    };
                 }
             }
             ActiveTool::Text => {
@@ -4654,6 +4821,24 @@ impl BoardView {
                 }
                 self.drag = DragState::Freedraw { collector, seed };
             }
+            DragState::CanvasDraw {
+                element_id,
+                mut collector,
+                style,
+            } => {
+                // Same capture pipeline as Freedraw; the build_paint canvas
+                // arm rasterizes the collector state into the surface each
+                // frame, so the live preview IS the pixel result.
+                let hw = self.hw_pressure();
+                if collector.push_with_pressure(world, hw) {
+                    cx.notify();
+                }
+                self.drag = DragState::CanvasDraw {
+                    element_id,
+                    collector,
+                    style,
+                };
+            }
             DragState::Moving {
                 mut last_world,
                 mut recorded,
@@ -5046,6 +5231,40 @@ impl BoardView {
                     // Keep the pen active and don't select the stroke
                     // (Excalidraw behavior): the user can continue writing
                     // the next stroke immediately.
+                }
+            }
+            DragState::CanvasDraw {
+                element_id,
+                collector,
+                style,
+            } => {
+                // Commit the stroke into the canvas's pixel-buffer journal
+                // (an undoable mutation of that element, not a new element).
+                // A single sample commits as a dot, same as freedraw.
+                let alive = self
+                    .scene
+                    .get(element_id)
+                    .is_some_and(|e| matches!(e.kind, ElementKind::Canvas { .. }));
+                if alive && collector.len() >= 1 {
+                    let stroke = collector.finish();
+                    self.history.record(&self.scene);
+                    if let Some(el) = self.scene.get_mut(element_id) {
+                        let origin = WPoint::new(el.bounds.x, el.bounds.y);
+                        let s = CanvasStroke {
+                            points: stroke.points.iter().map(|p| *p - origin).collect(),
+                            widths: stroke.widths,
+                            color: style.color,
+                            width: style.width,
+                            brush: style.brush,
+                            opacity: style.opacity,
+                        };
+                        if let Some(strokes) = el.canvas_strokes_mut() {
+                            strokes.push(s);
+                        }
+                    }
+                    self.mark_dirty();
+                    // Like freedraw: keep drawing without changing tool or
+                    // selection.
                 }
             }
             _ => {}
@@ -5639,6 +5858,9 @@ struct BoardPaint {
     paths: Vec<ReadyPath>,
     /// Embedded images (Image elements), painted under the vector paths.
     images: Vec<ImagePaintItem>,
+    /// Raster canvases paint their surface through `images` too; these frame
+    /// borders go on top of the surfaces but under the vector ink.
+    canvas_frames: Vec<PaintQuad>,
     texts: Vec<TextPaintItem>,
     editing: Option<EditingPaint>,
     selection_outline: Option<PaintQuad>,
@@ -5749,7 +5971,12 @@ impl BoardView {
         let editing_id = self.editing.as_ref().map(|e| e.element_id);
         let mut paths = Vec::new();
         let mut images = Vec::new();
+        let mut canvas_frames = Vec::new();
         let mut texts = Vec::new();
+
+        // Free textures of canvases that left the scene (deleted / swapped
+        // by undo) before rebuilding any canvas image this frame.
+        self.canvas_cache.retain_scene(&self.scene);
 
         for el in &self.scene.elements {
             if !el.bounds.inflate(40.0, 40.0).intersects(&view_world) {
@@ -5813,6 +6040,60 @@ impl BoardView {
                             },
                             image: img,
                         });
+                    }
+                }
+                ElementKind::Canvas { .. } => {
+                    // Live stroke: while drawing into this canvas, append the
+                    // in-progress stroke to a clone and rasterize the whole
+                    // element — the preview IS the pixel result (web-canvas
+                    // feel), not a vector approximation. The cache re-uses
+                    // one texture between finger-down frames that captured
+                    // nothing (decimation), and swaps in a fresh one (one
+                    // full upload) when the fingerprint changes. Idle frames
+                    // pass the element as-is: no clone, no raster.
+                    let image = match &self.drag {
+                        DragState::CanvasDraw {
+                            element_id,
+                            collector,
+                            style,
+                        } if *element_id == el.id => {
+                            let mut live = el.clone();
+                            if let Some(strokes) = live.canvas_strokes_mut() {
+                                strokes.push(self.live_canvas_stroke(el, collector, style));
+                            }
+                            self.canvas_cache.image(&live)
+                        }
+                        _ => self.canvas_cache.image(el),
+                    };
+                    let screen_origin = self
+                        .camera
+                        .world_to_screen(WPoint::new(el.bounds.x, el.bounds.y), origin);
+                    images.push(ImagePaintItem {
+                        bounds: Bounds {
+                            origin: screen_origin,
+                            size: size(
+                                self.camera.scale(el.bounds.w.max(0.5)),
+                                self.camera.scale(el.bounds.h.max(0.5)),
+                            ),
+                        },
+                        image,
+                    });
+                    // Frame border: vector quads (crisp at any zoom, not
+                    // baked into the buffer) so the surface reads as a
+                    // bounded region on the board. World-unit thickness so
+                    // it zooms with content, like page frames.
+                    const T: f64 = 1.5;
+                    let strips = [
+                        WBounds::new(el.bounds.x, el.bounds.y, el.bounds.w, T),
+                        WBounds::new(el.bounds.x, el.bounds.y + el.bounds.h - T, el.bounds.w, T),
+                        WBounds::new(el.bounds.x, el.bounds.y, T, el.bounds.h),
+                        WBounds::new(el.bounds.x + el.bounds.w - T, el.bounds.y, T, el.bounds.h),
+                    ];
+                    for s in strips {
+                        canvas_frames.push(gpui::fill(
+                            self.world_bounds_to_screen(s),
+                            color_u32(0xb0a95f, 0.9),
+                        ));
                     }
                 }
                 _ => {
@@ -5971,6 +6252,7 @@ impl BoardView {
             page_labels,
             paths,
             images,
+            canvas_frames,
             texts,
             editing,
             selection_outline,
@@ -6377,6 +6659,7 @@ impl Render for BoardView {
                     }
                     // Embedded images: under the vector ink (a flat layer —
                     // z-order actions reorder images among themselves only).
+                    // Raster canvas surfaces paint in this same layer.
                     for item in &paint.images {
                         let _ = window.paint_image(
                             item.bounds,
@@ -6385,6 +6668,20 @@ impl Render for BoardView {
                             0,
                             false,
                         );
+                    }
+                    // Canvas frame borders: over the surfaces, under the ink.
+                    for q in paint.canvas_frames {
+                        window.paint_quad(q);
+                    }
+                    // Free sprite-atlas textures replaced or evicted during
+                    // build_paint (new stroke / resize / deletion). Safe here:
+                    // the stale images are never referenced by this frame's
+                    // scene, and this runs after every paint_image above.
+                    // A fresh short-lived read: the paper-tile `view` borrow
+                    // above must not extend past this point.
+                    let stale = this.read(cx).canvas_cache.take_stale();
+                    for img in stale {
+                        let _ = window.drop_image(img);
                     }
                     for rp in paint.paths {
                         window.paint_path(rp.path, rp.color);
@@ -6542,6 +6839,9 @@ impl Render for BoardView {
             }))
             .on_action(cx.listener(|this, _: &PasteImage, _window, cx| {
                 this.paste_image(cx);
+            }))
+            .on_action(cx.listener(|this, _: &InsertCanvas, _window, cx| {
+                this.insert_canvas(cx);
             }))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_left_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_down))
@@ -7266,6 +7566,18 @@ impl BoardView {
             ),
         );
 
+        // 插入位图画布（非工具：放置一块可水彩/飞白绘画的光栅画板）。
+        let weak_canvas = weak.clone();
+        bar = bar.child(
+            bar_icon_button("画布", false, ic::canvas_board(icon_color(false))).on_click(
+                move |_, _, cx| {
+                    weak_canvas
+                        .update(cx, |this, cx| this.insert_canvas(cx))
+                        .ok();
+                },
+            ),
+        );
+
         let weak_undo = weak.clone();
         let weak_redo = weak.clone();
         let weak_save = weak.clone();
@@ -7627,6 +7939,55 @@ impl BoardView {
                 bar = bar.child(br_row);
             }
 
+            // 位图画布笔刷（水彩/钢笔/飞白）：像素级笔刷，只作用于画进
+            // 位图画布的笔迹（下一个笔画进画布时生效）。水彩 = 半透明
+            // 分层晕染 + 边缘沉色，飞白 = 干笔断续颗粒。选中画布时显示
+            // （插入画布后自动选中，立刻可挑笔刷）。
+            let canvas_sel = !self.selection.is_empty()
+                && self.selection.iter().any(|id| {
+                    self.scene
+                        .get(*id)
+                        .is_some_and(|e| matches!(e.kind, ElementKind::Canvas { .. }))
+                });
+            if canvas_sel {
+                let mut cbr_row = div().flex().flex_row().gap_1();
+                for (ix, (label, br)) in [
+                    ("水彩", crate::scene::CanvasBrush::Watercolor),
+                    ("钢笔", crate::scene::CanvasBrush::Ink),
+                    ("飞白", crate::scene::CanvasBrush::DryBrush),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let weak = weak.clone();
+                    let active = self.canvas_brush == br;
+                    cbr_row = cbr_row.child(
+                        div()
+                            .id(gpui::ElementId::named_usize("canvas-brush", ix))
+                            .px_1p5()
+                            .h_5()
+                            .rounded_sm()
+                            .border_1()
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_xs()
+                            .child(label)
+                            .when(active, |d| d.border_color(rgb(SELECTION_COLOR)).border_2())
+                            .when(!active, |d| d.border_color(rgb(0xcccccc)))
+                            .on_click(move |_, _, cx| {
+                                weak.update(cx, |this, cx| {
+                                    this.canvas_brush = br;
+                                    cx.notify();
+                                })
+                                .ok();
+                            }),
+                    );
+                }
+                bar = bar.child(cbr_row);
+            }
+
         // Text options: font size presets + font family + alignment, shown
         // as glyph icons. With no selection (Text tool active) the buttons
         // reflect and change the defaults applied to newly created text;
@@ -7897,6 +8258,7 @@ impl BoardView {
             ElementKind::Freedraw { .. } => "手绘",
             ElementKind::Polygon { .. } => "多边形",
             ElementKind::Image { .. } => "图片",
+            ElementKind::Canvas { .. } => "位图画布",
         };
         let short_id = &el_ref.id.to_string()[..8];
         let b = &el_ref.bounds;

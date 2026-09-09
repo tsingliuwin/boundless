@@ -199,6 +199,24 @@ fn fingerprint_into(h: &mut Fnv, el: &Element) {
             h.write_u64(9);
             h.write_str(asset);
         }
+        ElementKind::Canvas { strokes } => {
+            h.write_u64(10);
+            h.write_u64(strokes.len() as u64);
+            for s in strokes {
+                hash_points(h, &s.points);
+                for w in &s.widths {
+                    h.write_f64(*w);
+                }
+                h.write_u64(u64::from(s.color));
+                h.write_f64(s.width);
+                h.write_u64(match s.brush {
+                    crate::scene::CanvasBrush::Ink => 0,
+                    crate::scene::CanvasBrush::Watercolor => 1,
+                    crate::scene::CanvasBrush::DryBrush => 2,
+                });
+                h.write_f64(f64::from(s.opacity));
+            }
+        }
         ElementKind::Text {
             text,
             font_size,
@@ -399,6 +417,7 @@ impl TextCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scene::WBounds;
     fn sample_element() -> Element {
         let mut el = Element::from_absolute_points(
             |points| ElementKind::Freedraw {
@@ -538,6 +557,55 @@ mod tests {
             *text = "world".into();
         }
         assert_ne!(before, fingerprint(&el));
+    }
+
+    #[test]
+    fn fingerprint_changes_on_canvas_stroke_fields() {
+        // Canvas strokes are pure payload: every rendering-relevant field —
+        // points, widths, color, width, brush, opacity — participates.
+        let mk = |brush: crate::scene::CanvasBrush, color: u32, width: f64| {
+            let mut el = Element::new(
+                crate::scene::ElementKind::Canvas {
+                    strokes: vec![crate::scene::CanvasStroke {
+                        points: vec![WPoint::new(0.0, 0.0), WPoint::new(50.0, 20.0)],
+                        widths: vec![0.5, 1.0],
+                        color,
+                        width,
+                        brush,
+                        opacity: 1.0,
+                    }],
+                },
+                WBounds::new(0.0, 0.0, 100.0, 80.0),
+                crate::scene::ElementStyle::default(),
+            );
+            el.seed = 7;
+            el
+        };
+        let base = fingerprint(&mk(crate::scene::CanvasBrush::Ink, 0x000000, 4.0));
+        assert_ne!(
+            base,
+            fingerprint(&mk(crate::scene::CanvasBrush::Watercolor, 0x000000, 4.0)),
+            "brush"
+        );
+        assert_ne!(
+            base,
+            fingerprint(&mk(crate::scene::CanvasBrush::Ink, 0xff0000, 4.0)),
+            "color"
+        );
+        assert_ne!(base, fingerprint(&mk(crate::scene::CanvasBrush::Ink, 0x000000, 5.0)), "width");
+
+        // Appending a stroke (the live-drawing path) invalidates.
+        let mut el = mk(crate::scene::CanvasBrush::Ink, 0x000000, 4.0);
+        let before = fingerprint(&el);
+        el.canvas_strokes_mut().unwrap().push(crate::scene::CanvasStroke {
+            points: vec![WPoint::new(1.0, 1.0), WPoint::new(2.0, 2.0)],
+            widths: Vec::new(),
+            color: 0x000000,
+            width: 4.0,
+            brush: crate::scene::CanvasBrush::Ink,
+            opacity: 1.0,
+        });
+        assert_ne!(before, fingerprint(&el), "appended stroke");
     }
 
     #[test]

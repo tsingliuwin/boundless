@@ -668,6 +668,9 @@ pub fn world_geometry(el: &Element) -> WorldGeom {
         // Images paint via the board's image layer (decoded RenderImage),
         // not the vector path pipeline.
         ElementKind::Image { .. } => WorldGeom::Empty,
+        // Raster canvases likewise paint via the board's image layer (CPU
+        // pixel buffer → RenderImage); the vector pipeline never sees them.
+        ElementKind::Canvas { .. } => WorldGeom::Empty,
         ElementKind::Rectangle => {
             if b.w < 0.01 || b.h < 0.01 {
                 return WorldGeom::Empty;

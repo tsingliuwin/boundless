@@ -430,7 +430,9 @@ fn rotate_element(el: &Element, c: WPoint, theta: f64) -> Element {
                 style,
             )
         }
-        ElementKind::Image { .. } | ElementKind::Text { .. } => {
+        ElementKind::Image { .. } | ElementKind::Text { .. } | ElementKind::Canvas { .. } => {
+            // Raster canvases join images/text: pixels can't rotate, so only
+            // the center is moved to the rotated position.
             let mut out = el.clone();
             out.style = style;
             let b = el.bounds;

@@ -1,6 +1,7 @@
 //! Painting helpers: dot grid, text shaping, selection overlay geometry.
 
 pub mod cache;
+pub mod raster;
 pub mod rough;
 
 use gpui::{

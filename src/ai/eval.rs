@@ -423,6 +423,47 @@ pub fn apply(
             c.ops_applied += 1;
             msg = format!("已添加图片 id={id8}");
         }
+        CanvasOp::AddCanvas {
+            x,
+            y,
+            w,
+            h,
+            background,
+            strokes,
+        } => {
+            // The virtual canvas mirrors the board's layout/validation only;
+            // pixels are rasterized on the real board.
+            let w = w.unwrap_or(480.0).clamp(80.0, 2000.0);
+            let h = h.unwrap_or(320.0).clamp(80.0, 2000.0);
+            let x = x.unwrap_or(800.0 - w / 2.0);
+            let y = y.unwrap_or(500.0 - h / 2.0);
+            for (i, s) in strokes.iter().enumerate() {
+                if s.points.len() < 2 {
+                    c.ops_failed += 1;
+                    return Err(format!("第 {} 笔至少需要 2 个点", i + 1));
+                }
+            }
+            let id = assigned_id
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("cvs{}", c.elements.len()));
+            let id8 = id[..id.len().min(8)].to_string();
+            c.elements.push(VirtualElement {
+                id,
+                kind: "canvas",
+                x,
+                y,
+                w,
+                h,
+                text: Some(format!("{} 笔", strokes.len())),
+                font_size: 0.0,
+                stroke: background.unwrap_or(0xfffdf6),
+                fill: None,
+                opacity: 1.0,
+                points: None,
+            });
+            c.ops_applied += 1;
+            msg = format!("已添加位图画布 id={id8}，{} 笔", strokes.len());
+        }
         CanvasOp::Diamond {
             x,
             y,

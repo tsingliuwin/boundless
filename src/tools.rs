@@ -107,6 +107,16 @@ pub enum DragState {
         collector: crate::ink::InkCollector,
         seed: u64,
     },
+    /// Freehand stroke being drawn INTO a raster canvas element. Capture is
+    /// identical to Freedraw; on release the stroke rasterizes into the
+    /// canvas's pixel buffer (an undoable mutation of that element, not a
+    /// new element). Style is captured at drag start so mid-drag board
+    /// style changes never bleed into the in-progress stroke.
+    CanvasDraw {
+        element_id: ElementId,
+        collector: crate::ink::InkCollector,
+        style: crate::scene::CanvasStrokeStyle,
+    },
     /// Moving the current selection.
     Moving {
         last_world: WPoint,

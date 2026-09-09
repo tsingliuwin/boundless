@@ -280,6 +280,62 @@ pub enum TextAlign {
     Right,
 }
 
+/// Pixel brush for strokes on a raster canvas element. Unlike the vector
+/// [`Brush`] (which only modulates the freedraw stroke pipeline), these
+/// select the CPU rasterization in `crate::render::raster` — effects the
+/// tessellated-path renderer cannot express: translucent layered washes,
+/// edge pooling, stippled dry strokes.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CanvasBrush {
+    /// Solid ink with distance-field anti-aliasing — the raster twin of the
+    /// vector pen.
+    #[default]
+    Ink,
+    /// Watercolor wash: several translucent jittered layers with darker edge
+    /// pooling and a faint outer halo.
+    Watercolor,
+    /// 飞白 dry brush: seeded stipple along the path with a faint core.
+    DryBrush,
+}
+
+/// One committed stroke on a raster canvas element. `points` are relative to
+/// the element origin in world units (they may extend past the bounds — the
+/// rasterizer clips to the pixel buffer); `widths` are per-point ratios of
+/// `width` from the ink pipeline, exactly like freedraw strokes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CanvasStroke {
+    pub points: Vec<WPoint>,
+    #[serde(default)]
+    pub widths: Vec<f64>,
+    /// Stroke color, 0xRRGGBB — captured from the board pen style at commit
+    /// time so later board-style changes leave committed strokes stable.
+    pub color: u32,
+    /// Base stroke width in world units (ratios in `widths` scale it).
+    pub width: f64,
+    #[serde(default)]
+    pub brush: CanvasBrush,
+    /// Stroke opacity 0..1, captured at commit.
+    #[serde(default = "default_canvas_opacity")]
+    pub opacity: f32,
+}
+
+fn default_canvas_opacity() -> f32 {
+    1.0
+}
+
+/// Stroke style captured when a canvas drag starts, so mid-drag board style
+/// changes never bleed into the in-progress stroke.
+#[derive(Clone, Copy, Debug)]
+pub struct CanvasStrokeStyle {
+    pub color: u32,
+    pub width: f64,
+    pub opacity: f32,
+    pub brush: CanvasBrush,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ElementKind {
@@ -332,6 +388,19 @@ pub enum ElementKind {
     Image {
         /// Asset file name, e.g. `img-<uuid>.png`.
         asset: String,
+    },
+    /// Raster drawing canvas: a bounded region whose strokes are pixel-
+    /// rasterized (watercolor washes, dry-brush stipple — effects the vector
+    /// pipeline cannot express) into a backing buffer sized from `bounds`.
+    /// `style.background` fills the surface (None = transparent), `bounds`
+    /// is the world rect, and strokes are replayed deterministically into
+    /// pixels by `crate::render::raster`. Pen strokes that land inside the
+    /// bounds are routed here instead of becoming board-level freedraw.
+    Canvas {
+        /// Committed strokes, oldest first; points relative to the element
+        /// origin. Re-rendered into the buffer in order (later on top).
+        #[serde(default)]
+        strokes: Vec<CanvasStroke>,
     },
     Text {
         text: String,
@@ -581,6 +650,17 @@ impl Element {
                     p.y *= sy.abs();
                 }
             }
+            // Canvas strokes stretch with the surface (points are relative
+            // to the origin like any point-based element); width ratios stay
+            // put, consistent with freedraw rescale.
+            ElementKind::Canvas { strokes } => {
+                for s in strokes.iter_mut() {
+                    for p in &mut s.points {
+                        p.x *= sx.abs();
+                        p.y *= sy.abs();
+                    }
+                }
+            }
             ElementKind::Text {
                 font_size,
                 wrap_width,
@@ -794,6 +874,9 @@ impl Element {
             }
             ElementKind::Text { .. } => self.bounds.inflate(tol, tol).contains(p),
             ElementKind::Image { .. } => self.bounds.inflate(tol, tol).contains(p),
+            // Raster canvas: the whole surface rect is hit-testable (select/
+            // move like an image); pen-down inside routes strokes into it.
+            ElementKind::Canvas { .. } => self.bounds.inflate(tol, tol).contains(p),
         }
     }
 
@@ -817,6 +900,22 @@ impl Element {
         match &self.kind {
             ElementKind::Freedraw { widths, .. } => widths,
             _ => &[],
+        }
+    }
+
+    /// Committed strokes of a canvas element; empty for all other kinds.
+    pub fn canvas_strokes(&self) -> &[CanvasStroke] {
+        match &self.kind {
+            ElementKind::Canvas { strokes } => strokes,
+            _ => &[],
+        }
+    }
+
+    /// Mutable strokes of a canvas element. Other kinds return None.
+    pub fn canvas_strokes_mut(&mut self) -> Option<&mut Vec<CanvasStroke>> {
+        match &mut self.kind {
+            ElementKind::Canvas { strokes } => Some(strokes),
+            _ => None,
         }
     }
 }
@@ -1409,5 +1508,65 @@ mod tests {
         el.insert_absolute_point_after(0, WPoint::new(5.0, 5.0));
         el.remove_point(0);
         assert_eq!(el.bounds, WBounds::new(0.0, 0.0, 100.0, 50.0));
+    }
+
+    fn canvas_element() -> Element {
+        let mut el = Element::new(
+            ElementKind::Canvas { strokes: Vec::new() },
+            WBounds::new(10.0, 20.0, 200.0, 120.0),
+            rect_style(),
+        );
+        if let Some(strokes) = el.canvas_strokes_mut() {
+            strokes.push(CanvasStroke {
+                points: vec![WPoint::new(0.0, 0.0), WPoint::new(80.0, 60.0)],
+                widths: vec![0.6, 1.0],
+                color: 0x8b2f2f,
+                width: 6.0,
+                brush: CanvasBrush::Watercolor,
+                opacity: 0.85,
+            });
+        }
+        el
+    }
+
+    #[test]
+    fn canvas_serde_roundtrip() {
+        let el = canvas_element();
+        let json = serde_json::to_string(&el).unwrap();
+        let back: Element = serde_json::from_str(&json).unwrap();
+        assert_eq!(el, back);
+        assert_eq!(back.canvas_strokes().len(), 1);
+        assert_eq!(back.canvas_strokes()[0].brush, CanvasBrush::Watercolor);
+        assert_eq!(back.canvas_strokes()[0].color, 0x8b2f2f);
+    }
+
+    #[test]
+    fn canvas_without_strokes_loads_empty() {
+        // "kind":"canvas" with no strokes field (serde default) parses as an
+        // empty canvas; a bare stroke without widths/brush/opacity takes the
+        // documented defaults (uniform, ink, opaque).
+        let json = r#"{"id":"00000000-0000-0000-0000-000000000003","x":0.0,"y":0.0,"w":100.0,"h":50.0,"seed":1,"stroke":1973790,"background":null,"stroke_width":2.0,"roughness":1.0,"stroke_style":"solid","opacity":1.0,"kind":"canvas"}"#;
+        let el: Element = serde_json::from_str(json).unwrap();
+        assert!(el.canvas_strokes().is_empty());
+
+        let json = r#"{"id":"00000000-0000-0000-0000-000000000004","x":0.0,"y":0.0,"w":100.0,"h":50.0,"seed":1,"stroke":1973790,"background":null,"stroke_width":2.0,"roughness":1.0,"stroke_style":"solid","opacity":1.0,"kind":"canvas","strokes":[{"points":[{"x":0.0,"y":0.0},{"x":10.0,"y":0.0}],"color":16711680,"width":4.0}]}"#;
+        let el: Element = serde_json::from_str(json).unwrap();
+        let s = &el.canvas_strokes()[0];
+        assert!(s.widths.is_empty());
+        assert_eq!(s.brush, CanvasBrush::Ink);
+        assert_eq!(s.opacity, 1.0);
+    }
+
+    #[test]
+    fn canvas_hit_test_is_bounds_and_rescale_stretches_strokes() {
+        let mut el = canvas_element();
+        assert!(el.hit_test(WPoint::new(100.0, 60.0), 1.0));
+        assert!(!el.hit_test(WPoint::new(300.0, 60.0), 1.0));
+
+        el.rescale(2.0, 2.0, WPoint::new(0.0, 0.0));
+        assert_eq!(el.bounds.w, 400.0);
+        assert_eq!(el.canvas_strokes()[0].points[1], WPoint::new(160.0, 120.0));
+        // Width ratios are untouched (consistent with freedraw).
+        assert_eq!(el.canvas_strokes()[0].widths, vec![0.6, 1.0]);
     }
 }

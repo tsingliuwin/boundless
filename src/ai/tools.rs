@@ -1247,6 +1247,102 @@ impl Tool for AddImageTool {
     }
 }
 
+/// Arguments for `add_canvas`.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct AddCanvasArgs {
+    /// Left edge in world coordinates. Omit = horizontally centered on the
+    /// current view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x: Option<f64>,
+    /// Top edge in world coordinates. Omit = vertically centered on the
+    /// current view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<f64>,
+    /// Width in world units (80~2000). Omit = 480.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub w: Option<f64>,
+    /// Height in world units (80~2000). Omit = 320.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h: Option<f64>,
+    /// Surface fill color, 0xRRGGBB. Omit = warm paper (0xfffdf6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<u32>,
+    /// Initial strokes in world coordinates (≥2 points each, clipped to the
+    /// surface). brush per stroke: watercolor / ink / dry_brush.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub strokes: Vec<super::canvas_ops::OpCanvasStroke>,
+}
+
+/// Place a raster painting canvas (水彩晕染 / 干笔飞白 / 墨迹).
+pub struct AddCanvasTool {
+    pub events: UnboundedSender<AgentEvent>,
+}
+
+impl Tool for AddCanvasTool {
+    const NAME: &'static str = "add_canvas";
+    type Error = ToolError;
+    type Args = AddCanvasArgs;
+    type Output = String;
+
+    fn definition(
+        &self,
+        _prompt: String,
+    ) -> impl std::future::Future<Output = ToolDefinition> + Send {
+        let def = tool_def::<AddCanvasArgs>(
+            Self::NAME,
+            "放一块位图画布并画上水彩/墨迹笔触（像素级渲染：半透明分层晕染+边缘沉色、干笔飞白颗粒——矢量画不出的效果）。适合水彩天空、水墨山水、晕染小品。strokes 每笔 ≥2 个点，落笔自动裁剪在画布内。",
+        );
+        async move { def }
+    }
+
+    fn call(
+        &self,
+        args: Self::Args,
+    ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
+        let events = self.events.clone();
+        let name = Self::NAME;
+        async move {
+            let id = next_tool_id(name);
+            let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
+            for v in [&args.w, &args.h] {
+                if let Some(v) = v {
+                    if !(80.0..=2000.0).contains(v) {
+                        return fail_tool(
+                            &events,
+                            id,
+                            name,
+                            args_json,
+                            ToolError::invalid_args("画布宽高需在 80~2000 之间"),
+                        )
+                        .await;
+                    }
+                }
+            }
+            for (i, s) in args.strokes.iter().enumerate() {
+                if s.points.len() < 2 {
+                    return fail_tool(
+                        &events,
+                        id,
+                        name,
+                        args_json,
+                        ToolError::invalid_args(&format!("第 {} 笔至少需要 2 个点", i + 1)),
+                    )
+                    .await;
+                }
+            }
+            let op = CanvasOp::AddCanvas {
+                x: args.x,
+                y: args.y,
+                w: args.w,
+                h: args.h,
+                background: args.background,
+                strokes: args.strokes,
+            };
+            run_canvas_op(&events, id, name, args_json, op, Some(new_element_id())).await
+        }
+    }
+}
+
 /// Arguments for `draw_smooth_shape`.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SmoothShapeArgs {
@@ -2500,6 +2596,9 @@ pub fn all_tools(
             events: events.clone(),
         }),
         Box::new(AddImageTool {
+            events: events.clone(),
+        }),
+        Box::new(AddCanvasTool {
             events: events.clone(),
         }),
         Box::new(SmoothShapeTool {

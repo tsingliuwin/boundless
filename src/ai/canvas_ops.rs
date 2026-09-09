@@ -265,6 +265,38 @@ pub enum CanvasOp {
         #[serde(skip_serializing_if = "Option::is_none")]
         width: Option<f64>,
     },
+    /// Place a raster drawing canvas (位图画布)：a bounded surface whose
+    /// strokes are pixel-rasterized — translucent watercolor washes with
+    /// edge pooling, dry-brush 飞白 stipple — effects the vector pipeline
+    /// cannot express. The painting surface for 水彩晕染/天空水洗/水墨小品.
+    /// Strokes are clipped to the surface automatically.
+    AddCanvas {
+        /// Left edge in world coordinates. Omit = horizontally centered on
+        /// the current view.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        x: Option<f64>,
+        /// Top edge in world coordinates. Omit = vertically centered on the
+        /// current view.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        y: Option<f64>,
+        /// Width in world units (80~2000). Omit = 480.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        w: Option<f64>,
+        /// Height in world units (80~2000). Omit = 320.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        h: Option<f64>,
+        /// Surface fill color, 0xRRGGBB. Omit = warm paper (0xfffdf6).
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "de_color"
+        )]
+        background: Option<u32>,
+        /// Initial strokes in world coordinates (painted in order, later on
+        /// top). The user (or a later op) can keep painting into it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        strokes: Vec<OpCanvasStroke>,
+    },
     /// Delete every element on the canvas (clear it for a fresh start).
     Clear,
     /// Closed polygon through the given absolute points (≥3) — irregular
@@ -378,9 +410,36 @@ pub enum CanvasOp {
 pub struct OpMindmapNode {
     /// Node label: a short keyword phrase (≤ 20 chars, single line).
     pub text: String,
-    /// Child branches/leaves. Omit for a leaf node.
+    /// Child branches/leaves. Omit for a leaf.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<OpMindmapNode>,
+}
+
+/// One rasterized stroke on a canvas element (`add_canvas`). Points are in
+/// WORLD coordinates and may extend past the surface — the rasterizer clips
+/// them to the canvas.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct OpCanvasStroke {
+    /// ≥2 points in drawing order (2 = a straight stroke; more = curved).
+    pub points: Vec<OpPoint>,
+    /// Stroke color 0xRRGGBB (integer or "#RRGGBB" string). Omit = dark ink.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_color"
+    )]
+    pub color: Option<u32>,
+    /// Base stroke width in world units (1~40). Omit = 6.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<f64>,
+    /// Pixel brush: `watercolor` (translucent layered wash + edge pooling —
+    /// the headline effect), `ink` (solid), `dry_brush` (断续干笔颗粒).
+    /// Omit = watercolor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brush: Option<crate::scene::CanvasBrush>,
+    /// Opacity 0..1. Omit = 1.0 (watercolor is translucent by itself).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<f32>,
 }
 
 impl From<&OpMindmapNode> for crate::scene::mindmap::MindmapNodeInput {
@@ -529,6 +588,7 @@ impl CanvasOp {
             CanvasOp::Arrow { .. } => "箭头",
             CanvasOp::Polygon { .. } => "多边形",
             CanvasOp::AddImage { .. } => "图片",
+            CanvasOp::AddCanvas { .. } => "画布",
             CanvasOp::Text { .. } => "文本",
             CanvasOp::UpdateElement { .. } => "修改",
             CanvasOp::DeleteElement { .. } => "删除",

@@ -10,10 +10,10 @@
 
 use boundless::board::{
     ArrowTool, BoardView, BringForward, BringToFront, CancelOp, CheckForUpdates, DeleteSelection,
-    DiamondTool, EllipseTool, EraserTool, GotoNextPage, GotoPrevPage, HandTool, InsertImage,
-    LineTool, OpenScene, OpenSettings, PasteImage, PenTool, PresentExit, PresentStart, Quit,
-    RectTool, Redo, SaveScene, SelectTool, SendBackward, SendToBack, TextTool, ToggleAi,
-    ToggleExplorer, Undo, ZoomIn, ZoomOut, ZoomReset,
+    DiamondTool, EllipseTool, EraserTool, GotoNextPage, GotoPrevPage, HandTool, InsertCanvas,
+    InsertImage, LineTool, OpenScene, OpenSettings, PasteImage, PenTool, PresentExit,
+    PresentStart, Quit, RectTool, Redo, SaveScene, SelectTool, SendBackward, SendToBack, TextTool,
+    ToggleAi, ToggleExplorer, Undo, ZoomIn, ZoomOut, ZoomReset,
 };
 use gpui::*;
 use gpui_component::Root;
@@ -218,6 +218,7 @@ fn main() {
                         MenuItem::action("打开场景…", OpenScene),
                         MenuItem::action("保存场景", SaveScene),
                         MenuItem::action("插入图片…", InsertImage),
+                        MenuItem::action("插入位图画布", InsertCanvas),
                     ],
                 },
                 Menu {
