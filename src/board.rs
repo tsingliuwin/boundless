@@ -1318,6 +1318,8 @@ impl BoardView {
                     background: Some(background.unwrap_or(0xfffdf6)),
                     ..ElementStyle::default()
                 };
+                let wet_brushes: Vec<CanvasBrush> =
+                    el_strokes.iter().map(|s| s.brush).collect();
                 let el = Element::new_with_id(
                     pre_assigned_id.unwrap_or_else(uuid::Uuid::new_v4),
                     ElementKind::Canvas {
@@ -1327,6 +1329,9 @@ impl BoardView {
                     style,
                 );
                 let added = self.scene.add(el);
+                // AI 画进来的水彩同样落纸晕开（一批同时开始，整幅一起沉
+                // 定下来）。
+                self.canvas_cache.seed_wet(added, &wet_brushes);
                 Ok(format!(
                     "已添加位图画布 id={} {}×{}，{} 笔水彩/墨迹（落笔自动裁剪在画布内），位置 ({:.0},{:.0})",
                     &added.to_string()[..8],
@@ -5262,6 +5267,9 @@ impl BoardView {
                             strokes.push(s);
                         }
                     }
+                    // 水彩笔落纸晕开：湿笔计时从抬笔开始（落笔期间预览已
+                    // 是稳定渲染，晕开只在提交后演）。
+                    self.canvas_cache.stroke_committed(element_id, style.brush);
                     self.mark_dirty();
                     // Like freedraw: keep drawing without changing tool or
                     // selection.
@@ -6063,7 +6071,20 @@ impl BoardView {
                             }
                             self.canvas_cache.image(&live)
                         }
-                        _ => self.canvas_cache.image(el),
+                        // 落纸晕开（阶段二）：抬笔后的水彩在 WET_MS 内持续
+                        // 绽放/沉降，每帧重光栅并请求下一动画帧；期间画布
+                        // 不在视口内就自然暂停（build_paint 不触达它），回
+                        // 到视口时按墙钟直接落到已沉降态。动画帧绕开指纹
+                        // 缓存，结束后无缝交回稳定缓存条目。
+                        _ => match self.canvas_cache.image_animated(el) {
+                            Some((frame, still_animating)) => {
+                                if still_animating {
+                                    window.request_animation_frame();
+                                }
+                                frame
+                            }
+                            None => self.canvas_cache.image(el),
+                        },
                     };
                     let screen_origin = self
                         .camera

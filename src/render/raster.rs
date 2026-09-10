@@ -37,10 +37,44 @@ pub fn canvas_pixel_size(el: &Element) -> (u32, u32) {
     (w, h)
 }
 
+/// How long a committed watercolor stroke stays "wet" (blooming outward,
+/// diluting, its pooled edges settling) after the pen lifts. Live-only
+/// nicety: loaded scenes render settled.
+pub const WET_MS: u64 = 2500;
+
+/// Ease-out cubic for the wet→settled transition: fast initial bloom, long
+/// gentle settle.
+pub fn wet_ease(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(3)
+}
+
+/// Per-stroke settling factors (0 = just committed, 1 = settled) for a
+/// canvas's strokes, from their commit instants. The vec is parallel to
+/// `strokes` (missing/None entries count as settled — undo/redo restoring
+/// older stroke counts degrades gracefully, and strokes loaded from disk
+/// never animate).
+pub fn wet_profile(committed: &[Option<std::time::Instant>], now: std::time::Instant) -> Vec<f32> {
+    committed
+        .iter()
+        .map(|c| match c {
+            Some(t) => wet_ease(now.duration_since(*t).as_millis() as f32 / WET_MS as f32),
+            None => 1.0,
+        })
+        .collect()
+}
+
 /// Rasterize a canvas element: surface fill + every stroke in order.
 /// Deterministic in the element's seed (jittered brushes are seeded per
 /// stroke), so the same element always rasterizes to the same pixels.
 pub fn rasterize(el: &Element) -> image::RgbaImage {
+    rasterize_with(el, &[])
+}
+
+/// [`rasterize`] with per-stroke wet factors (`wet[i] < 1` makes stroke i
+/// render mid-bloom: narrower but more concentrated, edges uneven). An
+/// empty/short profile renders every stroke settled.
+pub fn rasterize_with(el: &Element, wet: &[f32]) -> image::RgbaImage {
     let (pw, ph) = canvas_pixel_size(el);
     let mut buf = vec![0u8; pw as usize * ph as usize * 4];
     if let Some(bg) = el.style.background {
@@ -69,7 +103,8 @@ pub fn rasterize(el: &Element) -> image::RgbaImage {
             .seed
             .wrapping_add((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
             ^ ((s.points.len() as u64) << 3);
-        draw_stroke(&mut buf, pw, ph, s, sx, sy, wscale, seed);
+        let settle = wet.get(i).copied().unwrap_or(1.0);
+        draw_stroke(&mut buf, pw, ph, s, sx, sy, wscale, seed, settle);
     }
     image::RgbaImage::from_raw(pw, ph, buf).expect("canvas buffer size")
 }
@@ -140,6 +175,7 @@ fn draw_stroke(
     sy: f32,
     wscale: f32,
     seed: u64,
+    settle: f32,
 ) {
     if s.points.is_empty() {
         return;
@@ -173,21 +209,30 @@ fn draw_stroke(
             // width so overlaps cloud like real pigment; a pooling band at
             // each layer's rim darkens edges (pigment gathering at the
             // boundary); a final wide halo pass bleeds the wet edge outward.
+            //
+            // Wet strokes (settle < 1, the 落纸晕开 bloom after the pen
+            // lifts) start narrower but more concentrated, with stronger
+            // uneven spread; over WET_MS they bloom to full width while
+            // diluting to the settled wash. Ink/dry ignore `settle`.
+            let bloom = 0.72 + 0.28 * settle; // width: blooms outward
+            let dilute = 1.18 - 0.18 * settle; // alpha: lightens as it spreads
             let mut rng = Rng::new(seed);
-            let amp = half.iter().copied().fold(0.5, f32::max) * 0.3;
+            let amp = half.iter().copied().fold(0.5, f32::max)
+                * 0.3
+                * (1.6 - 0.6 * settle); // wet spread is uneven
             for _ in 0..4 {
                 let off = (rng.signed(amp), rng.signed(amp));
-                let ws = rng.range(0.85, 1.15);
-                let base = rng.range(0.08, 0.13);
+                let ws = rng.range(0.85, 1.15) * bloom;
+                let base = rng.range(0.08, 0.13) * dilute;
                 for_each_near_path(&pts, &half, off, ws, |x, y, d, h| {
                     let rim = (h + 1.0 - d).clamp(0.0, 1.0);
                     let pool = 1.0 + 0.9 * ((d - (h - 2.5)) / 2.5).clamp(0.0, 1.0);
                     blend(buf, pw, ph, x, y, r, g, b, base * pool * rim * s.opacity);
                 });
             }
-            for_each_near_path(&pts, &half, (0.0, 0.0), 1.5, |x, y, d, h| {
+            for_each_near_path(&pts, &half, (0.0, 0.0), 1.5 * bloom, |x, y, d, h| {
                 let rim = (h + 1.0 - d).clamp(0.0, 1.0);
-                blend(buf, pw, ph, x, y, r, g, b, 0.04 * rim * s.opacity);
+                blend(buf, pw, ph, x, y, r, g, b, 0.04 * dilute * rim * s.opacity);
             });
         }
         CanvasBrush::DryBrush => {
@@ -422,10 +467,17 @@ struct CanvasEntry {
 /// actually frees the old textures. Draining happens after the new frame's
 /// `paint_image` calls — the stale images are never referenced by the
 /// current scene, so freeing them mid-paint is safe.
+///
+/// Wet-stroke animation (落纸晕开) lives here too, outside the settled
+/// cache: `wet` holds per-stroke commit instants, `anim_frames` holds the
+/// previous animation frame per canvas so exactly one extra atlas texture
+/// exists while blooming — each new frame stales its predecessor.
 #[derive(Default)]
 pub struct CanvasCache {
     entries: RefCell<HashMap<ElementId, CanvasEntry>>,
     stale: RefCell<Vec<Arc<RenderImage>>>,
+    wet: RefCell<HashMap<ElementId, Vec<Option<std::time::Instant>>>>,
+    anim_frames: RefCell<HashMap<ElementId, Arc<RenderImage>>>,
 }
 
 impl CanvasCache {
@@ -461,6 +513,80 @@ impl CanvasCache {
         image
     }
 
+    /// Record that a stroke was just committed to canvas `id`: watercolor
+    /// strokes bloom (Some(now)), the others render settled immediately.
+    /// The wet list is kept parallel to the element's strokes — shorter is
+    /// fine (missing entries count as settled).
+    pub fn stroke_committed(&self, id: ElementId, brush: CanvasBrush) {
+        let mut wet = self.wet.borrow_mut();
+        let list = wet.entry(id).or_default();
+        list.push(match brush {
+            CanvasBrush::Watercolor => Some(std::time::Instant::now()),
+            _ => None,
+        });
+    }
+
+    /// Seed wet state for a batch of AI strokes (same semantics as
+    /// [`stroke_committed`], all starting to bloom now).
+    pub fn seed_wet(&self, id: ElementId, brushes: &[CanvasBrush]) {
+        let now = std::time::Instant::now();
+        let mut wet = self.wet.borrow_mut();
+        let list = wet.entry(id).or_default();
+        for b in brushes {
+            list.push(match b {
+                CanvasBrush::Watercolor => Some(now),
+                _ => None,
+            });
+        }
+    }
+
+    /// Animation frame for `el` when any of its strokes is still wet:
+    /// rasterizes with the current [`wet_profile`] (bypassing the settled
+    /// entries — intermediate frames must not poison the fingerprint cache),
+    /// stales the previous frame, and returns the frame plus `true` (the
+    /// caller should keep requesting animation frames). Returns `None` once
+    /// fully settled, after flushing any last animation frame to stale so
+    /// the settled cache entry becomes the only live texture.
+    pub fn image_animated(&self, el: &Element) -> Option<(Arc<RenderImage>, bool)> {
+        let stroke_count = match &el.kind {
+            ElementKind::Canvas { strokes } => strokes.len(),
+            _ => return None,
+        };
+        let committed = self.wet.borrow().get(&el.id).cloned();
+        let profile = match committed {
+            Some(c) if !c.is_empty() => {
+                // Keep the wet list parallel to the current strokes: undo /
+                // redo / history swaps change the count; missing = settled.
+                let mut c = c;
+                c.truncate(stroke_count);
+                wet_profile(&c, std::time::Instant::now())
+            }
+            _ => return None,
+        };
+        let still_wet = profile.iter().any(|&p| p < 1.0);
+        if !still_wet {
+            // Animation over: flush the last frame (if any) and let the
+            // settled cache entry take over — settle == 1 renders identical
+            // pixels, so the hand-off is seamless.
+            if let Some(last) = self.anim_frames.borrow_mut().remove(&el.id) {
+                self.stale.borrow_mut().push(last);
+            }
+            self.wet.borrow_mut().remove(&el.id);
+            return None;
+        }
+        let frame = Arc::new(RenderImage::new(vec![image::Frame::new(rasterize_with(
+            el, &profile,
+        ))]));
+        let last = self
+            .anim_frames
+            .borrow_mut()
+            .insert(el.id, frame.clone());
+        if let Some(last) = last {
+            self.stale.borrow_mut().push(last);
+        }
+        Some((frame, true))
+    }
+
     /// Drop cache entries for elements that no longer exist in the scene
     /// (deleted, or swapped out by undo/redo): their textures go stale so
     /// the atlas can reclaim them. Runs each frame before painting.
@@ -469,6 +595,14 @@ impl CanvasCache {
             let alive = scene.get(*id).is_some();
             if !alive {
                 self.stale.borrow_mut().push(entry.image.clone());
+            }
+            alive
+        });
+        self.wet.borrow_mut().retain(|id, _| scene.get(*id).is_some());
+        self.anim_frames.borrow_mut().retain(|id, img| {
+            let alive = scene.get(*id).is_some();
+            if !alive {
+                self.stale.borrow_mut().push(img.clone());
             }
             alive
         });
@@ -634,15 +768,149 @@ mod tests {
             opacity: 1.0,
         });
         el.style.background = Some(0xfffdf6);
-        let img = rasterize(&el);
+
+        // Bloom strip: the same watercolor stroke at four settle stages —
+        // just-committed (0) through settled (1) — stacked vertically so
+        // the 落纸晕开 progression is readable in one image.
+        let mut frame = Element::new(
+            ElementKind::Canvas {
+                strokes: vec![CanvasStroke {
+                    points: vec![
+                        WPoint::new(10.0, 8.0),
+                        WPoint::new(40.0, 4.0),
+                        WPoint::new(70.0, 14.0),
+                        WPoint::new(95.0, 10.0),
+                    ],
+                    widths: Vec::new(),
+                    color: 0x3a6ea5,
+                    width: 10.0,
+                    brush: CanvasBrush::Watercolor,
+                    opacity: 1.0,
+                }],
+            },
+            WBounds::new(0.0, 0.0, 100.0, 20.0),
+            ElementStyle {
+                background: Some(0xfffdf6),
+                ..ElementStyle::default()
+            },
+        );
+        frame.seed = 42;
+        let stages = 4;
+        let row_h = 40; // px
+        let mut out = image::RgbaImage::new(200, 200 + row_h * stages);
+        image::imageops::overlay(&mut out, &rasterize(&el), 0, 0);
+        for k in 0..stages {
+            let settle = k as f32 / (stages - 1) as f32;
+            let img = rasterize_with(&frame, &[settle]);
+            image::imageops::overlay(&mut out, &img, 0, 200 + (row_h * k) as i64);
+        }
+
         // The buffer is BGRA (RenderImage's convention); swap to RGBA for a
         // truthful PNG before saving.
-        let mut rgba = img.clone();
-        for p in rgba.pixels_mut() {
+        for p in out.pixels_mut() {
             p.0.swap(0, 2);
         }
-        rgba.save(std::env::temp_dir().join("boundless-canvas-preview.png"))
+        out.save(std::env::temp_dir().join("boundless-canvas-preview.png"))
             .unwrap();
+    }
+
+    #[test]
+    fn wet_profile_progresses_and_settles() {
+        let now = std::time::Instant::now();
+        let ago = |ms: u64| Some(now.checked_sub(std::time::Duration::from_millis(ms)).unwrap());
+        // Fresh commit → 0; past WET_MS → 1; mid-way strictly between.
+        let p = wet_profile(
+            &[
+                Some(now),
+                ago(WET_MS + 100),
+                ago(WET_MS / 2),
+                None,
+            ],
+            now,
+        );
+        assert_eq!(p[0], 0.0);
+        assert_eq!(p[1], 1.0);
+        assert!(p[2] > 0.0 && p[2] < 1.0, "mid-way in (0,1), got {}", p[2]);
+        assert_eq!(p[3], 1.0, "missing/None entries are settled");
+        // Monotone ease.
+        assert!(wet_ease(0.2) < wet_ease(0.5) && wet_ease(0.5) < wet_ease(0.9));
+        assert_eq!(wet_ease(1.0), 1.0);
+        assert_eq!(wet_ease(2.0), 1.0, "clamped past the end");
+    }
+
+    #[test]
+    fn bloom_renders_darker_then_wider() {
+        let el = canvas_with(horizontal_stroke(CanvasBrush::Watercolor));
+        let fresh = rasterize_with(&el, &[0.0]);
+        let settled = rasterize_with(&el, &[1.0]);
+        // Fresh ink is more concentrated at the path center…
+        assert!(
+            alpha_at(&fresh, 100, 100) > alpha_at(&settled, 100, 100) + 8,
+            "wet core is darker: {} vs {}",
+            alpha_at(&fresh, 100, 100),
+            alpha_at(&settled, 100, 100)
+        );
+        // …and blooms outward as it settles (wider column coverage).
+        let extent = |img: &image::RgbaImage| -> usize {
+            (0..img.height())
+                .filter(|&y| alpha_at(img, 100, y) > 0)
+                .count()
+        };
+        assert!(
+            extent(&settled) > extent(&fresh),
+            "settled wash spreads further"
+        );
+        // settle == 1 is exactly the settled raster (seamless hand-off).
+        assert_eq!(rasterize_with(&el, &[1.0]).as_raw(), rasterize(&el).as_raw());
+        // Ink strokes ignore the wet parameter.
+        let ink = canvas_with(horizontal_stroke(CanvasBrush::Ink));
+        assert_eq!(
+            rasterize_with(&ink, &[0.0]).as_raw(),
+            rasterize(&ink).as_raw()
+        );
+    }
+
+    #[test]
+    fn image_animated_lifecycle_without_living_2_5s() {
+        let cache = CanvasCache::new();
+        let mut el = canvas_with(horizontal_stroke(CanvasBrush::Ink));
+        let id = el.id;
+
+        // No wet state → settled path.
+        assert!(cache.image_animated(&el).is_none());
+
+        // Committed ink stroke: recorded but settled → None immediately, no
+        // animation frames allocated.
+        cache.stroke_committed(id, CanvasBrush::Ink);
+        assert!(cache.image_animated(&el).is_none());
+
+        // Watercolor stroke: animates. Two calls → previous frame staled.
+        cache.stroke_committed(id, CanvasBrush::Watercolor);
+        el.canvas_strokes_mut().unwrap().push(horizontal_stroke(
+            CanvasBrush::Watercolor,
+        ));
+        let (f1, still1) = cache.image_animated(&el).unwrap();
+        assert!(still1);
+        assert!(cache.take_stale().is_empty(), "first frame stales nothing");
+        let (f2, still2) = cache.image_animated(&el).unwrap();
+        assert!(still2);
+        assert!(!Arc::ptr_eq(&f1, &f2));
+        let stale = cache.take_stale();
+        assert_eq!(stale.len(), 1);
+        assert!(Arc::ptr_eq(&f1, &stale[0]), "frame N-1 goes stale on frame N");
+
+        // Force the wet instant into the past: fully settled → None, the
+        // last animation frame is flushed to stale, wet state cleared.
+        let past = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(WET_MS + 50))
+            .unwrap();
+        cache
+            .wet
+            .borrow_mut()
+            .insert(id, vec![Some(past), Some(past)]);
+        assert!(cache.image_animated(&el).is_none());
+        assert_eq!(cache.take_stale().len(), 1, "last frame flushed");
+        assert!(cache.wet.borrow().get(&id).is_none(), "wet state cleared");
     }
 
     #[test]
