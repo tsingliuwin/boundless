@@ -1052,6 +1052,120 @@ pub fn curve_samples(points: &[WPoint], samples_per_seg: usize) -> Vec<WPoint> {
     out
 }
 
+/// Split a stroke's absolute points into the runs lying OUTSIDE `b`, with
+/// boundary-intersection points inserted so every run ends exactly on the
+/// surface edge — the rasterized inside part starts at the same points, so
+/// the two halves of a boundary-crossing stroke join seamlessly (one
+/// continuous line instead of a gap at the canvas border). Width ratios are
+/// interpolated onto inserted points (empty widths stay empty).
+pub fn outside_runs(
+    points: &[WPoint],
+    widths: &[f64],
+    b: &WBounds,
+) -> Vec<(Vec<WPoint>, Vec<f64>)> {
+    if points.len() < 2 {
+        return Vec::new();
+    }
+    let inside = |p: WPoint| b.contains(p);
+    let lerp = |p: WPoint, q: WPoint, t: f64| WPoint::new(p.x + (q.x - p.x) * t, p.y + (q.y - p.y) * t);
+    let width_at = |i: usize, t: f64| -> f64 {
+        if widths.len() != points.len() {
+            return 1.0;
+        }
+        let a = widths[i];
+        let c = widths.get(i + 1).copied().unwrap_or(a);
+        a + (c - a) * t
+    };
+    // t-values where segment i crosses the rect border (sorted, open unit
+    // interval): candidate hits on each of the four edge lines, kept when
+    // the hit lies within the edge's span.
+    let crossings = |p: WPoint, q: WPoint| -> Vec<f64> {
+        let d = q - p;
+        let mut ts = Vec::new();
+        let edges: [(f64, bool); 4] = [
+            (b.x, true),
+            (b.right(), true),
+            (b.y, false),
+            (b.bottom(), false),
+        ];
+        for (coord, vertical) in edges {
+            let denom = if vertical { d.x } else { d.y };
+            if denom.abs() < 1e-9 {
+                continue;
+            }
+            let a = if vertical { p.x } else { p.y };
+            let t = (coord - a) / denom;
+            if t <= 1e-6 || t >= 1.0 - 1e-6 {
+                continue;
+            }
+            let hit = lerp(p, q, t);
+            let in_span = if vertical {
+                hit.y >= b.y - 1e-6 && hit.y <= b.bottom() + 1e-6
+            } else {
+                hit.x >= b.x - 1e-6 && hit.x <= b.right() + 1e-6
+            };
+            if in_span {
+                ts.push(t);
+            }
+        }
+        ts.sort_by(|a, c| a.partial_cmp(c).unwrap_or(std::cmp::Ordering::Equal));
+        ts.dedup();
+        ts
+    };
+
+    let mut runs: Vec<(Vec<WPoint>, Vec<f64>)> = Vec::new();
+    let mut cur_pts: Vec<WPoint> = Vec::new();
+    let mut cur_w: Vec<f64> = Vec::new();
+    let mut close = |runs: &mut Vec<(Vec<WPoint>, Vec<f64>)>,
+                     pts: &mut Vec<WPoint>,
+                     ws: &mut Vec<f64>| {
+        if pts.len() >= 2 {
+            runs.push((std::mem::take(pts), std::mem::take(ws)));
+        } else {
+            pts.clear();
+            ws.clear();
+        }
+    };
+    if !inside(points[0]) {
+        cur_pts.push(points[0]);
+        cur_w.push(width_at(0, 0.0));
+    }
+    for (i, w) in points.windows(2).enumerate() {
+        let (p, q) = (w[0], w[1]);
+        let ts = crossings(p, q);
+        let mut marks = vec![0.0f64];
+        marks.extend(ts);
+        marks.push(1.0);
+        for k in 0..marks.len() - 1 {
+            let (t0, t1) = (marks[k], marks[k + 1]);
+            if t1 - t0 < 1e-9 {
+                continue;
+            }
+            let seg_out = !inside(lerp(p, q, (t0 + t1) / 2.0));
+            let p1 = lerp(p, q, t1);
+            if seg_out {
+                if cur_pts.is_empty() {
+                    let p0 = lerp(p, q, t0);
+                    cur_pts.push(p0);
+                    cur_w.push(width_at(i, t0));
+                }
+                cur_pts.push(p1);
+                cur_w.push(width_at(i, t1));
+            } else if !cur_pts.is_empty() {
+                // Entering the surface: the run closes ON the boundary point.
+                let p0 = lerp(p, q, t0);
+                if cur_pts.last() != Some(&p0) {
+                    cur_pts.push(p0);
+                    cur_w.push(width_at(i, t0));
+                }
+                close(&mut runs, &mut cur_pts, &mut cur_w);
+            }
+        }
+    }
+    close(&mut runs, &mut cur_pts, &mut cur_w);
+    runs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1527,6 +1641,46 @@ mod tests {
         el.insert_absolute_point_after(0, WPoint::new(5.0, 5.0));
         el.remove_point(0);
         assert_eq!(el.bounds, WBounds::new(0.0, 0.0, 100.0, 50.0));
+    }
+
+    #[test]
+    fn outside_runs_splits_at_boundary_with_exact_edge_points() {
+        let b = WBounds::new(100.0, 100.0, 200.0, 100.0);
+        // Enters at left edge (100,150), leaves at right edge (300,150).
+        let pts = vec![
+            WPoint::new(50.0, 150.0),
+            WPoint::new(150.0, 150.0),
+            WPoint::new(250.0, 150.0),
+            WPoint::new(350.0, 150.0),
+        ];
+        let runs = outside_runs(&pts, &[], &b);
+        assert_eq!(runs.len(), 2, "entry run + exit run");
+        assert_eq!(runs[0].0, vec![WPoint::new(50.0, 150.0), WPoint::new(100.0, 150.0)]);
+        assert_eq!(runs[1].0, vec![WPoint::new(300.0, 150.0), WPoint::new(350.0, 150.0)]);
+
+        // Fully inside or fully outside strokes degenerate correctly.
+        assert!(outside_runs(
+            &[WPoint::new(150.0, 150.0), WPoint::new(250.0, 150.0)],
+            &[],
+            &b
+        )
+        .is_empty());
+        let out = outside_runs(
+            &[WPoint::new(0.0, 0.0), WPoint::new(50.0, 0.0)],
+            &[],
+            &b,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0.len(), 2);
+
+        // Width ratios interpolate onto the inserted boundary point.
+        let runs = outside_runs(
+            &[WPoint::new(50.0, 150.0), WPoint::new(150.0, 150.0)],
+            &[0.4, 0.8],
+            &b,
+        );
+        assert_eq!(runs.len(), 1);
+        assert!((runs[0].1[1] - 0.6).abs() < 1e-9, "midpoint ratio 0.6");
     }
 
     fn canvas_element() -> Element {

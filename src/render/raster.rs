@@ -104,9 +104,148 @@ pub fn rasterize_with(el: &Element, wet: &[f32]) -> image::RgbaImage {
             .wrapping_add((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
             ^ ((s.points.len() as u64) << 3);
         let settle = wet.get(i).copied().unwrap_or(1.0);
-        draw_stroke(&mut buf, pw, ph, s, sx, sy, wscale, seed, settle);
+        draw_stroke(
+            &mut buf,
+            pw,
+            ph,
+            s,
+            sx,
+            sy,
+            wscale,
+            seed,
+            settle,
+            (0.0, 0.0),
+            None,
+        );
     }
     image::RgbaImage::from_raw(pw, ph, buf).expect("canvas buffer size")
+}
+
+/// Pixel-space bbox (origin x, origin y, width, height) of one stroke's
+/// raster footprint: the points' extent plus margin for bloom, wander and
+/// the halo pass. Clipped to the canvas buffer.
+pub fn stroke_stamp_box(el: &Element, idx: usize) -> Option<(i32, i32, u32, u32)> {
+    let strokes = match &el.kind {
+        ElementKind::Canvas { strokes } => strokes,
+        _ => return None,
+    };
+    let s = strokes.get(idx)?;
+    if s.points.is_empty() {
+        return None;
+    }
+    let (pw, ph) = canvas_pixel_size(el);
+    let sx = pw as f32 / el.bounds.w.max(0.5) as f32;
+    let sy = ph as f32 / el.bounds.h.max(0.5) as f32;
+    let wscale = (sx + sy) * 0.5;
+    let base_half = (s.width as f32 * wscale * 0.5).max(0.6);
+    let max_ratio = s.widths.iter().copied().fold(1.0f64, f64::max).max(1.0) as f32;
+    let half_max = (base_half * max_ratio.clamp(0.05, 8.0)).max(0.5);
+    // halo (1.5×) × layer bloom (1.15×) + wander (0.45×1.6) + AA margin
+    let margin = half_max * 2.45 + 3.0;
+    let mut min_x = f32::MAX;
+    let mut min_y = f32::MAX;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for p in &s.points {
+        let (x, y) = (p.x as f32 * sx, p.y as f32 * sy);
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    }
+    let x0 = (min_x - margin).floor() as i32;
+    let y0 = (min_y - margin).floor() as i32;
+    let x1 = (max_x + margin).ceil() as i32;
+    let y1 = (max_y + margin).ceil() as i32;
+    let cx0 = x0.clamp(0, pw as i32);
+    let cy0 = y0.clamp(0, ph as i32);
+    let cx1 = x1.clamp(0, pw as i32);
+    let cy1 = y1.clamp(0, ph as i32);
+    if cx1 <= cx0 || cy1 <= cy0 {
+        return None;
+    }
+    Some((cx0, cy0, (cx1 - cx0) as u32, (cy1 - cy0) as u32))
+}
+
+/// Rasterize ONE stroke into its own stamp buffer (BGRA, straight alpha),
+/// for incremental compositing: a committed stroke costs its own footprint,
+/// not a full-canvas re-raster. `under` (canvas base pixels + base width,
+/// with the stamp's origin implicit in the caller's bookkeeping) supplies
+/// the wet-on-wet coverage reference; None falls back to the stamp buffer.
+pub fn raster_stamp(
+    el: &Element,
+    idx: usize,
+    settle: f32,
+    under: Option<(&[u8], u32, i32, i32)>,
+) -> Option<(Vec<u8>, i32, i32, u32, u32)> {
+    let (ox, oy, w, h) = stroke_stamp_box(el, idx)?;
+    let strokes = match &el.kind {
+        ElementKind::Canvas { strokes } => strokes,
+        _ => return None,
+    };
+    let s = strokes.get(idx)?;
+    let mut buf = vec![0u8; w as usize * h as usize * 4];
+    let (pw, ph) = canvas_pixel_size(el);
+    let sx = pw as f32 / el.bounds.w.max(0.5) as f32;
+    let sy = ph as f32 / el.bounds.h.max(0.5) as f32;
+    let wscale = (sx + sy) * 0.5;
+    let seed = el
+        .seed
+        .wrapping_add((idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        ^ ((s.points.len() as u64) << 3);
+    draw_stroke(
+        &mut buf,
+        w,
+        h,
+        s,
+        sx,
+        sy,
+        wscale,
+        seed,
+        settle,
+        (ox as f32, oy as f32),
+        under,
+    );
+    Some((buf, ox, oy, w, h))
+}
+
+/// Source-over composite of a stamp rect into a canvas-sized BGRA buffer.
+pub fn composite(
+    dst: &mut [u8],
+    dpw: u32,
+    dph: u32,
+    src: &[u8],
+    spw: u32,
+    sph: u32,
+    ox: i32,
+    oy: i32,
+) {
+    for ry in 0..sph as i32 {
+        let dy = oy + ry;
+        if dy < 0 || dy >= dph as i32 {
+            continue;
+        }
+        for rx in 0..spw as i32 {
+            let dx = ox + rx;
+            if dx < 0 || dx >= dpw as i32 {
+                continue;
+            }
+            let si = ((ry as u32 * spw + rx as u32) * 4) as usize;
+            let sa = src[si + 3] as f32 / 255.0;
+            if sa <= 0.0 {
+                continue;
+            }
+            let di = ((dy as u32 * dpw + dx as u32) * 4) as usize;
+            let da = dst[di + 3] as f32 / 255.0;
+            let out_a = sa + da * (1.0 - sa);
+            for c in 0..3 {
+                dst[di + c] = ((src[si + c] as f32 * sa + dst[di + c] as f32 * da * (1.0 - sa))
+                    / out_a)
+                    .round() as u8;
+            }
+            dst[di + 3] = (out_a * 255.0).round() as u8;
+        }
+    }
 }
 
 fn rgb(color: u32) -> (u8, u8, u8) {
@@ -176,6 +315,8 @@ fn draw_stroke(
     wscale: f32,
     seed: u64,
     settle: f32,
+    origin: (f32, f32),
+    under: Option<(&[u8], u32, i32, i32)>,
 ) {
     if s.points.is_empty() {
         return;
@@ -183,7 +324,7 @@ fn draw_stroke(
     let pts: Vec<(f32, f32)> = s
         .points
         .iter()
-        .map(|p| (p.x as f32 * sx, p.y as f32 * sy))
+        .map(|p| (p.x as f32 * sx - origin.0, p.y as f32 * sy - origin.1))
         .collect();
     // Half-width per point in px: base width × ratio (uniform when `widths`
     // is empty), clamped so hairlines still stamp and spikes stay sane.
@@ -195,6 +336,32 @@ fn draw_stroke(
         })
         .collect();
     let (r, g, b) = rgb(s.color);
+    // Wet-on-wet / dry-over-wash reference: the coverage UNDER this stroke —
+    // the canvas base when rasterizing an incremental stamp, otherwise the
+    // buffer drawn so far.
+    let base_alpha: Vec<u8> = match under {
+        Some((ud, upw, uox, uoy)) => {
+            let uph = ud.len() as u32 / (4 * upw.max(1));
+            let mut v = vec![0u8; pw as usize * ph as usize];
+            for y in 0..ph as i32 {
+                let uy = y + uoy;
+                if uy < 0 || uy >= uph as i32 {
+                    continue;
+                }
+                let srow = (uy as u32 * upw) as i32;
+                let drow = y * pw as i32;
+                for x in 0..pw as i32 {
+                    let ux = x + uox;
+                    if ux < 0 || ux >= upw as i32 {
+                        continue;
+                    }
+                    v[(drow + x) as usize] = ud[((srow + ux) * 4 + 3) as usize];
+                }
+            }
+            v
+        }
+        None => buf.chunks_exact(4).map(|c| c[3]).collect(),
+    };
     // Wash-family brushes draw through a smoothed, densified centerline:
     // raw AI/hand polylines carry hard zigzag corners that read as deco
     // pattern on a wide translucent band (目验 62 分轮的板条感根因之一).
@@ -235,7 +402,6 @@ fn draw_stroke(
             // paper, pigment migrates across the contact instead of
             // pooling at its own rim — stacked bands blend at the seam
             // instead of showing double rims with a pale gap between.
-            let base_alpha: Vec<u8> = buf.chunks_exact(4).map(|c| c[3]).collect();
             for _ in 0..4 {
                 let layer_pts = wander_path(&pts, &half, wander, &mut rng);
                 let layer_half: Vec<f32> = half
@@ -278,7 +444,6 @@ fn draw_stroke(
             // BEFORE this stroke: sampling the live buffer would make the
             // stroke's own overlapping discs scratch each other away (the
             // 74-round regression where glints vanished).
-            let base_alpha: Vec<u8> = buf.chunks_exact(4).map(|c| c[3]).collect();
             dry_stipple(
                 buf, pw, ph, &pts, &half, r, g, b, s.opacity, &mut rng, &base_alpha, pw,
             );
@@ -524,88 +689,17 @@ fn seg_dist(px: f32, py: f32, a: (f32, f32), b: (f32, f32)) -> (f32, f32) {
     ((px - (a.0 + abx * t)).hypot(py - (a.1 + aby * t)), t)
 }
 
-/// Coarse uniform grid bucketing segments so each pixel only tests the few
-/// that could plausibly be near. Segments are registered in every cell
-/// their bbox inflated by `reach` overlaps, which makes a single-cell query
-/// per pixel sufficient (any segment within `reach` of the pixel must cover
-/// the pixel's own cell).
-struct SegGrid {
-    cell: f32,
-    ox: f32,
-    oy: f32,
-    cols: i32,
-    rows: i32,
-    cells: Vec<Vec<u32>>,
-}
-
-impl SegGrid {
-    fn build(pts: &[(f32, f32)], reach: f32) -> Self {
-        let mut min_x = f32::MAX;
-        let mut min_y = f32::MAX;
-        let mut max_x = f32::NEG_INFINITY;
-        let mut max_y = f32::NEG_INFINITY;
-        for p in pts {
-            min_x = min_x.min(p.0);
-            min_y = min_y.min(p.1);
-            max_x = max_x.max(p.0);
-            max_y = max_y.max(p.1);
-        }
-        // Cell size: comfortably larger than the query reach, and large
-        // enough that the grid never explodes for huge bounding boxes.
-        let area = (max_x - min_x + 1.0).max(1.0) * (max_y - min_y + 1.0).max(1.0);
-        let mut cell = (reach * 2.0).max(16.0);
-        if cell * cell < area / 262_144.0 {
-            cell = (area / 262_144.0).sqrt().ceil();
-        }
-        // Origin sits `reach` outside the point bbox: pixels within reach of
-        // the geometry (the only ones that can plot) must map to a valid
-        // cell — an origin ON the bbox would send them to negative rows.
-        let ox = min_x - reach;
-        let oy = min_y - reach;
-        let cols = (((max_x + reach - ox) / cell).ceil() as i32 + 1).max(1);
-        let rows = (((max_y + reach - oy) / cell).ceil() as i32 + 1).max(1);
-        let mut grid = SegGrid {
-            cell,
-            ox,
-            oy,
-            cols,
-            rows,
-            cells: vec![Vec::new(); (cols as usize) * (rows as usize)],
-        };
-        for (i, w) in pts.windows(2).enumerate() {
-            let (ax, ay) = w[0];
-            let (bx, by) = w[1];
-            let (cx0, cx1) = (ax.min(bx) - reach, ax.max(bx) + reach);
-            let (cy0, cy1) = (ay.min(by) - reach, ay.max(by) + reach);
-            let c0 = (((cx0 - grid.ox) / cell).floor() as i32).max(0);
-            let c1 = (((cx1 - grid.ox) / cell).floor() as i32).min(cols - 1);
-            let r0 = (((cy0 - grid.oy) / cell).floor() as i32).max(0);
-            let r1 = (((cy1 - grid.oy) / cell).floor() as i32).min(rows - 1);
-            for row in r0..=r1 {
-                for col in c0..=c1 {
-                    grid.cells[(row * cols + col) as usize].push(i as u32);
-                }
-            }
-        }
-        grid
-    }
-
-    fn at(&self, x: f32, y: f32) -> &[u32] {
-        let col = ((x - self.ox) / self.cell).floor() as i32;
-        let row = ((y - self.oy) / self.cell).floor() as i32;
-        if col < 0 || row < 0 || col >= self.cols || row >= self.rows {
-            &[]
-        } else {
-            &self.cells[(row * self.cols + col) as usize]
-        }
-    }
-}
-
 /// For each buffer pixel near the polyline, call `plot(x, y, dist, half)`
 /// where `dist` is the pixel-center distance to the nearest segment (in
 /// path space), `half` that segment's interpolated half-width scaled by
 /// `width_scale`, and the whole path is shifted by `off` (layer jitter).
 /// Pixels farther from every segment than their own half-width are skipped.
+///
+/// Interval-scan implementation: segments become x-intervals inflated by
+/// the reach, sorted by start; per row a cursor keeps only the intervals
+/// covering the current column (and the row in y), so each pixel tests 1–3
+/// segments. The old per-pixel 2D grid probe cost ~137 ns/px because a
+/// densified stroke put a dozen micro-segments in every cell.
 fn for_each_near_path(
     pts: &[(f32, f32)],
     half: &[f32],
@@ -613,36 +707,68 @@ fn for_each_near_path(
     width_scale: f32,
     mut plot: impl FnMut(i32, i32, f32, f32),
 ) {
+    let n_seg = pts.len().saturating_sub(1);
+    if n_seg == 0 {
+        return;
+    }
     let max_half = half.iter().copied().fold(0.5, f32::max) * width_scale;
     let reach = max_half + 2.0;
-    let grid = SegGrid::build(pts, reach);
-    let mut min_x = f32::MAX;
-    let mut min_y = f32::MAX;
-    let mut max_x = f32::NEG_INFINITY;
-    let mut max_y = f32::NEG_INFINITY;
-    for p in pts {
-        min_x = min_x.min(p.0);
-        min_y = min_y.min(p.1);
-        max_x = max_x.max(p.0);
-        max_y = max_y.max(p.1);
-    }
-    let x0 = ((min_x + off.0 - reach).floor() as i32).max(0);
-    let x1 = ((max_x + off.0 + reach).ceil() as i32).min(i32::MAX / 2);
-    let y0 = ((min_y + off.1 - reach).floor() as i32).max(0);
-    let y1 = ((max_y + off.1 + reach).ceil() as i32).min(i32::MAX / 2);
+    let mut segs: Vec<(i32, i32, u32)> = (0..n_seg)
+        .map(|i| {
+            let (ax, bx) = (pts[i].0, pts[i + 1].0);
+            (
+                (ax.min(bx) - reach).floor() as i32,
+                (ax.max(bx) + reach).ceil() as i32,
+                i as u32,
+            )
+        })
+        .collect();
+    segs.sort_unstable_by_key(|s| s.0);
+    let y_ext: Vec<(i32, i32)> = (0..n_seg)
+        .map(|i| {
+            let (ay, by) = (pts[i].1, pts[i + 1].1);
+            (
+                (ay.min(by) - reach).floor() as i32,
+                (ay.max(by) + reach).ceil() as i32,
+            )
+        })
+        .collect();
+    let y0 = y_ext.iter().map(|e| e.0).min().unwrap().max(0);
+    let y1 = y_ext.iter().map(|e| e.1).max().unwrap();
+    let x0 = segs[0].0.max(0);
+    let x1 = segs.iter().map(|s| s.1).max().unwrap();
+    let mut active: Vec<u32> = Vec::with_capacity(8);
     for y in y0..=y1 {
+        let py = y as f32 + 0.5 - off.1;
+        let mut cursor = 0usize;
         for x in x0..=x1 {
-            // Pixel center mapped into path space (undoing the layer offset).
+            // Intervals are sorted by start: the cursor skips those that
+            // ended left of this column; the admit walk then visits exactly
+            // the intervals covering it (a handful, not the whole path).
+            while cursor < segs.len() && segs[cursor].1 < x {
+                cursor += 1;
+            }
+            active.clear();
+            let mut i = cursor;
+            while i < segs.len() && segs[i].0 <= x {
+                let s = segs[i].2 as usize;
+                if py >= y_ext[s].0 as f32 - 0.5 && py <= y_ext[s].1 as f32 + 0.5 {
+                    active.push(segs[i].2);
+                }
+                i += 1;
+            }
+            if active.is_empty() {
+                continue;
+            }
             let px = x as f32 + 0.5 - off.0;
-            let py = y as f32 + 0.5 - off.1;
             let mut best = f32::INFINITY;
             let mut best_h = 0.0f32;
-            for &si in grid.at(px, py) {
-                let (d, t) = seg_dist(px, py, pts[si as usize], pts[si as usize + 1]);
+            for &si in &active {
+                let s = si as usize;
+                let (d, t) = seg_dist(px, py, pts[s], pts[s + 1]);
                 if d < best {
                     best = d;
-                    best_h = half[si as usize]
-                        + (half[si as usize + 1] - half[si as usize]) * t;
+                    best_h = half[s] + (half[s + 1] - half[s]) * t;
                 }
             }
             if best.is_finite() {
@@ -660,31 +786,50 @@ fn for_each_near_path(
 /// overflow (correct, rare).
 const MAX_ENTRIES: usize = 512;
 
-struct CanvasEntry {
-    fingerprint: u64,
-    image: Arc<RenderImage>,
+/// Persistent pixel state of one canvas element: the committed ("baked")
+/// buffer plus the texture wrapping it. Strokes are rasterized ONCE each
+/// into a stamp and composited in — a commit costs the stroke's footprint,
+/// not a full-canvas re-raster (the old fingerprint cache re-rasterized all
+/// N strokes on every change: O(N²) over a drawing session, and every frame
+/// while drawing or blooming).
+struct CanvasBuffers {
+    pw: u32,
+    ph: u32,
+    base: Vec<u8>,
+    bg: Option<u32>,
+    bounds: [f64; 4],
+    /// Number of strokes baked into `base`.
+    baked: usize,
+    /// Fingerprint of the element with strokes truncated to `baked`: any
+    /// edit/undo/redo touching a baked stroke invalidates → full rebuild.
+    prefix: u64,
+    base_image: Arc<RenderImage>,
+    /// Per-stroke commit instants for the 落纸晕开 bloom (parallel to the
+    /// element's strokes; shorter = missing entries settled).
+    wet: Vec<Option<std::time::Instant>>,
+    /// Last composited frame texture (live stroke / wet tail); kept so the
+    /// atlas holds at most one extra texture per animating canvas.
+    frame_image: Option<Arc<RenderImage>>,
 }
 
-/// Per-canvas texture cache, owned by the board view. Keyed by element id
-/// and validated by the same fingerprint the render cache uses; the pixel
-/// buffer is re-rasterized only when something rendering-relevant changed.
+/// Fingerprint of `el` with its stroke list truncated to `n`.
+fn prefix_fp(el: &Element, n: usize) -> u64 {
+    let mut e = el.clone();
+    if let Some(s) = e.canvas_strokes_mut() {
+        s.truncate(n);
+    }
+    crate::render::cache::fingerprint(&e)
+}
+
+/// Per-canvas texture cache, owned by the board view.
 ///
-/// `stale` collects images that were replaced (new stroke, resize, delete):
-/// the paint phase drains it into `window.drop_image` so the sprite atlas
-/// actually frees the old textures. Draining happens after the new frame's
-/// `paint_image` calls — the stale images are never referenced by the
-/// current scene, so freeing them mid-paint is safe.
-///
-/// Wet-stroke animation (落纸晕开) lives here too, outside the settled
-/// cache: `wet` holds per-stroke commit instants, `anim_frames` holds the
-/// previous animation frame per canvas so exactly one extra atlas texture
-/// exists while blooming — each new frame stales its predecessor.
+/// `stale` collects textures that were replaced (new base after a commit,
+/// superseded animation frames, deleted canvases): the paint phase drains
+/// it into `window.drop_image` so the sprite atlas actually frees them.
 #[derive(Default)]
 pub struct CanvasCache {
-    entries: RefCell<HashMap<ElementId, CanvasEntry>>,
+    entries: RefCell<HashMap<ElementId, CanvasBuffers>>,
     stale: RefCell<Vec<Arc<RenderImage>>>,
-    wet: RefCell<HashMap<ElementId, Vec<Option<std::time::Instant>>>>,
-    anim_frames: RefCell<HashMap<ElementId, Arc<RenderImage>>>,
 }
 
 impl CanvasCache {
@@ -692,127 +837,261 @@ impl CanvasCache {
         Self::default()
     }
 
-    /// Texture for `el`, from cache when the fingerprint matches.
-    pub fn image(&self, el: &Element) -> Arc<RenderImage> {
-        let fp = crate::render::cache::fingerprint(el);
-        if let Some(hit) = self.entries.borrow().get(&el.id) {
-            if hit.fingerprint == fp {
-                return hit.image.clone();
-            }
+    fn settle_of(ent: &CanvasBuffers, i: usize, now: std::time::Instant) -> f32 {
+        match ent.wet.get(i) {
+            Some(Some(t)) => wet_ease(now.duration_since(*t).as_millis() as f32 / WET_MS as f32),
+            _ => 1.0,
         }
-        let image = Arc::new(RenderImage::new(vec![image::Frame::new(rasterize(el))]));
+    }
+
+    /// Bring `ent.base` up to date with the settled prefix of `el`'s
+    /// strokes: append newly-settled strokes as stamps, or full-rebuild
+    /// when size/background/history changed. Returns true when pixels
+    /// changed (caller swaps base_image).
+    fn ensure_base(&self, ent: &mut CanvasBuffers, el: &Element) -> bool {
+        let (pw, ph) = canvas_pixel_size(el);
+        let bounds = [el.bounds.x, el.bounds.y, el.bounds.w, el.bounds.h];
+        let n = el.canvas_strokes().len();
+        let now = std::time::Instant::now();
+        let mut changed = false;
+        let valid = ent.pw == pw
+            && ent.ph == ph
+            && ent.bounds == bounds
+            && ent.bg == el.style.background
+            && ent.baked <= n
+            && ent.prefix == prefix_fp(el, ent.baked);
+        if !valid {
+            ent.pw = pw;
+            ent.ph = ph;
+            ent.bounds = bounds;
+            ent.bg = el.style.background;
+            ent.base = vec![0u8; pw as usize * ph as usize * 4];
+            if let Some(bg) = el.style.background {
+                let (r, g, b) = rgb(bg);
+                for px in ent.base.chunks_exact_mut(4) {
+                    px[0] = b;
+                    px[1] = g;
+                    px[2] = r;
+                    px[3] = 0xff;
+                }
+            }
+            ent.baked = 0;
+            ent.prefix = prefix_fp(el, 0);
+            ent.wet.clear();
+            changed = true;
+        }
+        // Append strokes whose bloom has settled (wet ones stay live until
+        // they settle, then bake in on a later frame).
+        while ent.baked < n && Self::settle_of(ent, ent.baked, now) >= 1.0 {
+            let idx = ent.baked;
+            if stroke_stamp_box(el, idx).is_some() {
+                let under = {
+                    let base = &ent.base;
+                    let (ox, oy, _sw, _sh) = stroke_stamp_box(el, idx).unwrap();
+                    raster_stamp(el, idx, 1.0, Some((base, ent.pw, ox, oy)))
+                };
+                if let Some((stamp, ox, oy, sw, sh)) = under {
+                    composite(&mut ent.base, ent.pw, ent.ph, &stamp, sw, sh, ox, oy);
+                }
+            }
+            ent.baked += 1;
+            ent.prefix = prefix_fp(el, ent.baked);
+            changed = true;
+        }
+        changed
+    }
+
+    fn swap_base_image(&self, ent: &mut CanvasBuffers) {
+        let img = Arc::new(RenderImage::new(vec![image::Frame::new(
+            image::RgbaImage::from_raw(ent.pw.max(1), ent.ph.max(1), ent.base.clone())
+                .expect("canvas buffer size"),
+        )]));
+        let old = std::mem::replace(&mut ent.base_image, img);
+        self.stale.borrow_mut().push(old);
+        if let Some(f) = ent.frame_image.take() {
+            self.stale.borrow_mut().push(f);
+        }
+    }
+
+    /// Texture for `el` in its settled state: bakes any newly-settled
+    /// strokes into the persistent base and returns the base texture.
+    pub fn image(&self, el: &Element) -> Arc<RenderImage> {
         let mut entries = self.entries.borrow_mut();
         if entries.len() >= MAX_ENTRIES {
-            for entry in entries.values() {
-                self.stale.borrow_mut().push(entry.image.clone());
+            for ent in entries.values() {
+                self.stale.borrow_mut().push(ent.base_image.clone());
+                if let Some(f) = &ent.frame_image {
+                    self.stale.borrow_mut().push(f.clone());
+                }
             }
             entries.clear();
         }
-        if let Some(old) = entries.insert(
-            el.id,
-            CanvasEntry {
-                fingerprint: fp,
-                image: image.clone(),
-            },
-        ) {
-            self.stale.borrow_mut().push(old.image);
-        }
-        image
-    }
-
-    /// Record that a stroke was just committed to canvas `id`: watercolor
-    /// strokes bloom (Some(now)), the others render settled immediately.
-    /// The wet list is kept parallel to the element's strokes — shorter is
-    /// fine (missing entries count as settled).
-    pub fn stroke_committed(&self, id: ElementId, brush: CanvasBrush) {
-        let mut wet = self.wet.borrow_mut();
-        let list = wet.entry(id).or_default();
-        list.push(match brush {
-            CanvasBrush::Watercolor => Some(std::time::Instant::now()),
-            _ => None,
+        let ent = entries.entry(el.id).or_insert_with(|| CanvasBuffers {
+            pw: 0,
+            ph: 0,
+            base: Vec::new(),
+            bg: None,
+            bounds: [0.0; 4],
+            baked: 0,
+            prefix: u64::MAX, // force first rebuild
+            base_image: Arc::new(RenderImage::new(vec![image::Frame::new(
+                image::RgbaImage::from_raw(1, 1, vec![0, 0, 0, 0]).expect("1px"),
+            )])),
+            wet: Vec::new(),
+            frame_image: None,
         });
+        if self.ensure_base(ent, el) {
+            self.swap_base_image(ent);
+        }
+        ent.base_image.clone()
     }
 
-    /// Seed wet state for a batch of AI strokes (same semantics as
-    /// [`stroke_committed`], all starting to bloom now).
-    pub fn seed_wet(&self, id: ElementId, brushes: &[CanvasBrush]) {
+    /// Frame texture while a live stroke or wet tail is active: base plus
+    /// the unsettled/live stamps composited into a scratch copy. Returns
+    /// None when nothing is live (caller falls back to [`image`]).
+    pub fn image_with_live(
+        &self,
+        el: &Element,
+        live: Option<&CanvasStroke>,
+    ) -> Option<Arc<RenderImage>> {
         let now = std::time::Instant::now();
-        let mut wet = self.wet.borrow_mut();
-        let list = wet.entry(id).or_default();
+        let mut entries = self.entries.borrow_mut();
+        let ent = entries.get_mut(&el.id)?;
+        let n = el.canvas_strokes().len();
+        let first_wet = (ent.baked..n)
+            .find(|&i| Self::settle_of(ent, i, now) < 1.0);
+        if live.is_none() && first_wet.is_none() {
+            return None;
+        }
+        if self.ensure_base(ent, el) {
+            self.swap_base_image(ent);
+        }
+        let mut scratch = ent.base.clone();
+        // Unsettled (blooming) strokes render live at their current settle.
+        if let Some(from) = first_wet {
+            for i in from..n {
+                let settle = Self::settle_of(ent, i, now);
+                if let Some((ox, oy, _sw, _sh)) = stroke_stamp_box(el, i) {
+                    if let Some((stamp, sx, sy, sw, sh)) =
+                        raster_stamp(el, i, settle, Some((&scratch, ent.pw, ox, oy)))
+                    {
+                        composite(&mut scratch, ent.pw, ent.ph, &stamp, sw, sh, sx, sy);
+                    }
+                }
+            }
+        }
+        if let Some(live) = live {
+            // The in-progress stroke: render it as a temporary extra stroke
+            // on a borrowed element view with it appended.
+            let mut live_el = el.clone();
+            if let Some(strokes) = live_el.canvas_strokes_mut() {
+                strokes.push(live.clone());
+            }
+            let idx = live_el.canvas_strokes().len() - 1;
+            if let Some((ox, oy, _sw, _sh)) = stroke_stamp_box(&live_el, idx) {
+                if let Some((stamp, sx, sy, sw, sh)) =
+                    raster_stamp(&live_el, idx, 1.0, Some((&scratch, ent.pw, ox, oy)))
+                {
+                    composite(&mut scratch, ent.pw, ent.ph, &stamp, sw, sh, sx, sy);
+                }
+            }
+        }
+        let img = Arc::new(RenderImage::new(vec![image::Frame::new(
+            image::RgbaImage::from_raw(ent.pw.max(1), ent.ph.max(1), scratch)
+                .expect("canvas buffer size"),
+        )]));
+        let old = ent.frame_image.replace(img.clone());
+        if let Some(old) = old {
+            self.stale.borrow_mut().push(old);
+        }
+        Some(img)
+    }
+
+    /// True while any stroke of `el` is still blooming (caller keeps
+    /// requesting animation frames).
+    pub fn has_wet(&self, el: &Element) -> bool {
+        let now = std::time::Instant::now();
+        self.entries
+            .borrow()
+            .get(&el.id)
+            .map(|ent| {
+                let n = el.canvas_strokes().len();
+                (ent.baked..n).any(|i| Self::settle_of(ent, i, now) < 1.0)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Record wet state for strokes about to be appended to canvas `id`
+    /// (call BEFORE appending, with `count_before` = the element's current
+    /// stroke count): watercolor strokes bloom (Some(now)), others render
+    /// settled. The wet list stays parallel to the stroke list — earlier
+    /// positions without a record are padded with None (settled).
+    pub fn record_wet(&self, id: ElementId, count_before: usize, brushes: &[CanvasBrush]) {
+        let now = std::time::Instant::now();
+        let mut entries = self.entries.borrow_mut();
+        let ent = entries.entry(id).or_insert_with(|| CanvasBuffers {
+            pw: 0,
+            ph: 0,
+            base: Vec::new(),
+            bg: None,
+            bounds: [0.0; 4],
+            baked: 0,
+            prefix: u64::MAX,
+            base_image: Arc::new(RenderImage::new(vec![image::Frame::new(
+                image::RgbaImage::from_raw(1, 1, vec![0, 0, 0, 0]).expect("1px"),
+            )])),
+            wet: Vec::new(),
+            frame_image: None,
+        });
+        while ent.wet.len() < count_before {
+            ent.wet.push(None);
+        }
         for b in brushes {
-            list.push(match b {
+            ent.wet.push(match b {
                 CanvasBrush::Watercolor => Some(now),
                 _ => None,
             });
         }
     }
 
-    /// Animation frame for `el` when any of its strokes is still wet:
-    /// rasterizes with the current [`wet_profile`] (bypassing the settled
-    /// entries — intermediate frames must not poison the fingerprint cache),
-    /// stales the previous frame, and returns the frame plus `true` (the
-    /// caller should keep requesting animation frames). Returns `None` once
-    /// fully settled, after flushing any last animation frame to stale so
-    /// the settled cache entry becomes the only live texture.
-    pub fn image_animated(&self, el: &Element) -> Option<(Arc<RenderImage>, bool)> {
-        let stroke_count = match &el.kind {
-            ElementKind::Canvas { strokes } => strokes.len(),
-            _ => return None,
-        };
-        let committed = self.wet.borrow().get(&el.id).cloned();
-        let profile = match committed {
-            Some(c) if !c.is_empty() => {
-                // Keep the wet list parallel to the current strokes: undo /
-                // redo / history swaps change the count; missing = settled.
-                let mut c = c;
-                c.truncate(stroke_count);
-                wet_profile(&c, std::time::Instant::now())
-            }
-            _ => return None,
-        };
-        let still_wet = profile.iter().any(|&p| p < 1.0);
-        if !still_wet {
-            // Animation over: flush the last frame (if any) and let the
-            // settled cache entry take over — settle == 1 renders identical
-            // pixels, so the hand-off is seamless.
-            if let Some(last) = self.anim_frames.borrow_mut().remove(&el.id) {
-                self.stale.borrow_mut().push(last);
-            }
-            self.wet.borrow_mut().remove(&el.id);
-            return None;
-        }
-        let frame = Arc::new(RenderImage::new(vec![image::Frame::new(rasterize_with(
-            el, &profile,
-        ))]));
-        let last = self
-            .anim_frames
-            .borrow_mut()
-            .insert(el.id, frame.clone());
-        if let Some(last) = last {
-            self.stale.borrow_mut().push(last);
-        }
-        Some((frame, true))
+    /// One stroke about to be appended (hand pen-up path).
+    pub fn stroke_committed(&self, id: ElementId, count_before: usize, brush: CanvasBrush) {
+        self.record_wet(id, count_before, &[brush]);
+    }
+
+    /// A batch of AI strokes about to be appended (all bloom together).
+    pub fn seed_wet(&self, id: ElementId, count_before: usize, brushes: &[CanvasBrush]) {
+        self.record_wet(id, count_before, brushes);
     }
 
     /// Drop cache entries for elements that no longer exist in the scene
     /// (deleted, or swapped out by undo/redo): their textures go stale so
     /// the atlas can reclaim them. Runs each frame before painting.
     pub fn retain_scene(&self, scene: &Scene) {
-        self.entries.borrow_mut().retain(|id, entry| {
+        self.entries.borrow_mut().retain(|id, ent| {
             let alive = scene.get(*id).is_some();
             if !alive {
-                self.stale.borrow_mut().push(entry.image.clone());
+                self.stale.borrow_mut().push(ent.base_image.clone());
+                if let Some(f) = &ent.frame_image {
+                    self.stale.borrow_mut().push(f.clone());
+                }
             }
             alive
         });
-        self.wet.borrow_mut().retain(|id, _| scene.get(*id).is_some());
-        self.anim_frames.borrow_mut().retain(|id, img| {
-            let alive = scene.get(*id).is_some();
-            if !alive {
-                self.stale.borrow_mut().push(img.clone());
+    }
+
+    /// Test hook: rewind a canvas's wet instants so blooms settle without
+    /// sleeping through WET_MS.
+    #[cfg(test)]
+    pub fn rewind_wet_for_test(&self, id: ElementId, ago: std::time::Duration) {
+        let now = std::time::Instant::now();
+        if let Some(ent) = self.entries.borrow_mut().get_mut(&id) {
+            for w in ent.wet.iter_mut() {
+                if let Some(t) = w {
+                    *t = now.checked_sub(ago).unwrap_or(now);
+                }
             }
-            alive
-        });
+        }
     }
 
     /// Replaced textures pending atlas eviction; drained by the paint phase.
@@ -992,6 +1271,155 @@ mod tests {
             peak > center + 0.08,
             "edge pooling makes the rim darker than the core: peak {peak} vs center {center}"
         );
+    }
+
+    #[test]
+    fn perf_probe() {
+        // Gated timing probe (CANVAS_PERF=1): raster cost vs canvas size and
+        // stroke count — the numbers that decide whether incremental
+        // rasterization is needed.
+        if std::env::var("CANVAS_PERF").is_err() {
+            return;
+        }
+        use std::time::Instant;
+        let bench = |w: f64, h: f64, strokes: usize, wide: bool| {
+            let mut ss = Vec::new();
+            for i in 0..strokes {
+                let y = 10.0 + (i as f64 * 7.0) % h.max(1.0) * 0.8;
+                ss.push(CanvasStroke {
+                    points: vec![
+                        WPoint::new(5.0, y),
+                        WPoint::new(w * 0.33, y + 4.0),
+                        WPoint::new(w * 0.66, y - 4.0),
+                        WPoint::new(w - 5.0, y),
+                    ],
+                    widths: Vec::new(),
+                    color: 0x5f90c2,
+                    width: if wide { 30.0 } else { 6.0 },
+                    brush: CanvasBrush::Watercolor,
+                    opacity: 0.6,
+                });
+            }
+            let el = Element::new(
+                ElementKind::Canvas { strokes: ss },
+                WBounds::new(0.0, 0.0, w, h),
+                ElementStyle::default(),
+            );
+            let t = Instant::now();
+            let img = rasterize(&el);
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            eprintln!(
+                "{w:.0}x{h:.0} world ({}x{}px) strokes={strokes} wide={wide}: {ms:.2} ms",
+                img.width(),
+                img.height()
+            );
+            ms
+        };
+        // Single-stroke phase breakdown at the app's default canvas size.
+        if std::env::var("CANVAS_PERF_DETAIL").is_ok() {
+            let (pw, ph) = (1224u32, 856u32);
+            let stroke = CanvasStroke {
+                points: vec![
+                    WPoint::new(5.0, 200.0),
+                    WPoint::new(200.0, 204.0),
+                    WPoint::new(400.0, 196.0),
+                    WPoint::new(607.0, 200.0),
+                ],
+                widths: Vec::new(),
+                color: 0x5f90c2,
+                width: 30.0,
+                brush: CanvasBrush::Watercolor,
+                opacity: 0.6,
+            };
+            let pts: Vec<(f32, f32)> = stroke
+                .points
+                .iter()
+                .map(|p| (p.x as f32 * 2.0, p.y as f32 * 2.0))
+                .collect();
+            let half = vec![30.0f32; 4];
+            let (spts, shalf) = smooth_centerline(&pts, &half);
+            eprintln!("densified points: {}", spts.len());
+            let mut buf = vec![0u8; pw as usize * ph as usize * 4];
+            let mut rng = Rng::new(1);
+            let t = Instant::now();
+            let layer_pts = wander_path(&spts, &shalf, 1.0, &mut rng);
+            eprintln!("wander: {:.2} ms", t.elapsed().as_secs_f64() * 1000.0);
+            let layer_half: Vec<f32> = shalf.iter().map(|h| h * 1.0).collect();
+            let t = Instant::now();
+            let mut visits = 0u64;
+            for_each_near_path(&layer_pts, &layer_half, (0.0, 0.0), 1.0, |x, y, _d, _h| {
+                visits += 1;
+                let _ = (x, y);
+            });
+            eprintln!(
+                "near_path (count only): {:.2} ms, {} pixel visits",
+                t.elapsed().as_secs_f64() * 1000.0,
+                visits
+            );
+            let t = Instant::now();
+            for_each_near_path(&layer_pts, &layer_half, (0.0, 0.0), 1.0, |x, y, d, h| {
+                let rim = (h + 1.0 - d).clamp(0.0, 1.0);
+                blend(&mut buf, pw, ph, x, y, 95, 144, 194, 0.1 * rim);
+            });
+            eprintln!(
+                "near_path + blend: {:.2} ms",
+                t.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        if std::env::var("CANVAS_PERF_CACHE").is_ok() {
+            let cache = CanvasCache::new();
+            let mut el = Element::new(
+                ElementKind::Canvas { strokes: vec![] },
+                WBounds::new(0.0, 0.0, 612.0, 428.0),
+                ElementStyle::default(),
+            );
+            let mut total = 0.0f64;
+            let mut worst = 0.0f64;
+            for i in 0..20 {
+                let y = 20.0 + i as f64 * 20.0;
+                el.canvas_strokes_mut().unwrap().push(CanvasStroke {
+                    points: vec![
+                        WPoint::new(5.0, y),
+                        WPoint::new(200.0, y + 4.0),
+                        WPoint::new(400.0, y - 4.0),
+                        WPoint::new(607.0, y),
+                    ],
+                    widths: vec![],
+                    color: 0x5f90c2,
+                    width: 30.0,
+                    brush: CanvasBrush::Ink,
+                    opacity: 0.6,
+                });
+                let t = Instant::now();
+                let _ = cache.image(&el);
+                let ms = t.elapsed().as_secs_f64() * 1000.0;
+                total += ms;
+                worst = worst.max(ms);
+            }
+            eprintln!(
+                "incremental: 20 wide commits total {total:.1} ms, worst {worst:.1} ms"
+            );
+            let live = CanvasStroke {
+                points: vec![WPoint::new(5.0, 200.0), WPoint::new(607.0, 210.0)],
+                widths: vec![],
+                color: 0x333333,
+                width: 8.0,
+                brush: CanvasBrush::Watercolor,
+                opacity: 0.8,
+            };
+            let t = Instant::now();
+            let _ = cache.image_with_live(&el, Some(&live));
+            eprintln!(
+                "live frame over 20 strokes: {:.2} ms",
+                t.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        bench(200.0, 130.0, 1, true);
+        bench(612.0, 428.0, 1, true);
+        bench(612.0, 428.0, 5, true);
+        bench(612.0, 428.0, 20, true);
+        bench(612.0, 428.0, 20, false);
+        bench(1600.0, 900.0, 20, true);
     }
 
     #[test]
@@ -1218,46 +1646,87 @@ mod tests {
     }
 
     #[test]
-    fn image_animated_lifecycle_without_living_2_5s() {
+    fn incremental_base_matches_full_raster() {
+        // The incremental stamp path (app) and the full re-raster (tests /
+        // preview / legacy callers) must produce identical pixels.
+        let cache = CanvasCache::new();
+        let mut el = canvas_with(horizontal_stroke(CanvasBrush::Watercolor));
+        el.canvas_strokes_mut().unwrap().push(CanvasStroke {
+            points: vec![WPoint::new(20.0, 70.0), WPoint::new(80.0, 60.0)],
+            widths: vec![],
+            color: 0x8b2f2f,
+            width: 8.0,
+            brush: CanvasBrush::DryBrush,
+            opacity: 0.9,
+        });
+        let full = rasterize(&el);
+        let img = cache.image(&el);
+        // Byte-exact equality is impossible across the two paths: the stamp
+        // round-trips through an 8-bit intermediate (one extra /255 round
+        // per channel). ±2/255 is the quantization bound and invisible.
+        let a = img.as_bytes(0).unwrap();
+        let b = full.as_raw().as_slice();
+        assert_eq!(a.len(), b.len());
+        let worst = a.iter().zip(b).map(|(x, y)| (x.abs_diff(*y))).max().unwrap();
+        if worst > 2 {
+            let pw = 200usize;
+            for (i, (x, y)) in a.iter().zip(b).enumerate() {
+                if x.abs_diff(*y) > 2 {
+                    let px = (i / 4) % pw;
+                    let py = (i / 4) / pw;
+                    eprintln!("first diff at px({px},{py}) ch={} a={x} b={y}", i % 4);
+                    break;
+                }
+            }
+            let nz_a = a.chunks(4).filter(|c| c[3] != 0).count();
+            let nz_b = b.chunks(4).filter(|c| c[3] != 0).count();
+            eprintln!("nonzero px: cache={nz_a} full={nz_b}");
+        }
+        assert!(worst <= 2, "incremental vs full diverges by {worst}/255");
+    }
+
+    #[test]
+    fn incremental_cache_bakes_commits_and_animates_wet_tail() {
         let cache = CanvasCache::new();
         let mut el = canvas_with(horizontal_stroke(CanvasBrush::Ink));
         let id = el.id;
+        let img1 = cache.image(&el);
+        assert!(
+            Arc::ptr_eq(&img1, &cache.image(&el)),
+            "idle frames reuse the base texture"
+        );
 
-        // No wet state → settled path.
-        assert!(cache.image_animated(&el).is_none());
+        // Commit a watercolor stroke: stays wet, so frames animate.
+        cache.stroke_committed(id, 1, CanvasBrush::Watercolor);
+        el.canvas_strokes_mut()
+            .unwrap()
+            .push(horizontal_stroke(CanvasBrush::Watercolor));
+        assert!(cache.has_wet(&el));
+        let f1 = cache.image_with_live(&el, None).unwrap();
+        let f2 = cache.image_with_live(&el, None).unwrap();
+        assert!(!Arc::ptr_eq(&f1, &f2), "fresh texture per animation frame");
+        assert!(
+            cache.take_stale().iter().any(|s| Arc::ptr_eq(s, &f1)),
+            "superseded frame goes stale"
+        );
 
-        // Committed ink stroke: recorded but settled → None immediately, no
-        // animation frames allocated.
-        cache.stroke_committed(id, CanvasBrush::Ink);
-        assert!(cache.image_animated(&el).is_none());
+        // Past the bloom the stroke bakes into the base: frames stop and
+        // the base texture differs from the pre-commit one.
+        cache.rewind_wet_for_test(id, std::time::Duration::from_millis(WET_MS + 100));
+        assert!(!cache.has_wet(&el));
+        assert!(cache.image_with_live(&el, None).is_none());
+        let settled = cache.image(&el);
+        assert!(
+            !Arc::ptr_eq(&img1, &settled),
+            "base rebaked with the new stroke"
+        );
+        assert!(Arc::ptr_eq(&settled, &cache.image(&el)), "then stable");
 
-        // Watercolor stroke: animates. Two calls → previous frame staled.
-        cache.stroke_committed(id, CanvasBrush::Watercolor);
-        el.canvas_strokes_mut().unwrap().push(horizontal_stroke(
-            CanvasBrush::Watercolor,
-        ));
-        let (f1, still1) = cache.image_animated(&el).unwrap();
-        assert!(still1);
-        assert!(cache.take_stale().is_empty(), "first frame stales nothing");
-        let (f2, still2) = cache.image_animated(&el).unwrap();
-        assert!(still2);
-        assert!(!Arc::ptr_eq(&f1, &f2));
-        let stale = cache.take_stale();
-        assert_eq!(stale.len(), 1);
-        assert!(Arc::ptr_eq(&f1, &stale[0]), "frame N-1 goes stale on frame N");
-
-        // Force the wet instant into the past: fully settled → None, the
-        // last animation frame is flushed to stale, wet state cleared.
-        let past = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_millis(WET_MS + 50))
-            .unwrap();
-        cache
-            .wet
-            .borrow_mut()
-            .insert(id, vec![Some(past), Some(past)]);
-        assert!(cache.image_animated(&el).is_none());
-        assert_eq!(cache.take_stale().len(), 1, "last frame flushed");
-        assert!(cache.wet.borrow().get(&id).is_none(), "wet state cleared");
+        // History swap (undo): stroke count drops, prefix mismatches and
+        // the base rebuilds from scratch.
+        el.canvas_strokes_mut().unwrap().pop();
+        let undone = cache.image(&el);
+        assert!(!Arc::ptr_eq(&settled, &undone), "undo rebuilds the base");
     }
 
     #[test]
@@ -1276,8 +1745,10 @@ mod tests {
         let second = cache.image(&changed);
         assert!(!Arc::ptr_eq(&first, &second), "new stroke re-rasterizes");
         let stale = cache.take_stale();
-        assert_eq!(stale.len(), 1);
-        assert!(Arc::ptr_eq(&first, &stale[0]), "replaced texture is stale");
+        assert!(
+            stale.iter().any(|s| Arc::ptr_eq(s, &first)),
+            "replaced base texture is stale"
+        );
         assert!(cache.take_stale().is_empty(), "stale drains once");
 
         // Deleting the element evicts its texture.

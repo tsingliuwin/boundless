@@ -612,6 +612,17 @@ impl BoardView {
         }
     }
 
+    /// Style snapshot for strokes drawn into a raster canvas (board style
+    /// at pen-down; later style changes never affect an in-progress stroke).
+    fn canvas_style_snapshot(&self) -> CanvasStrokeStyle {
+        CanvasStrokeStyle {
+            color: self.style.stroke,
+            width: self.style.stroke_width,
+            opacity: self.style.opacity,
+            brush: self.canvas_brush,
+        }
+    }
+
     /// Snapshot of an in-progress canvas stroke (collector state → stroke
     /// payload relative to the canvas origin) for live rasterized preview.
     fn live_canvas_stroke(
@@ -1340,7 +1351,7 @@ impl BoardView {
                 let added = self.scene.add(el);
                 // AI 画进来的水彩同样落纸晕开（一批同时开始，整幅一起沉
                 // 定下来）。
-                self.canvas_cache.seed_wet(added, &wet_brushes);
+                self.canvas_cache.seed_wet(added, 0, &wet_brushes);
                 Ok(format!(
                     "已添加位图画布 id={} {}×{}，{} 笔水彩/墨迹（落笔自动裁剪在画布内），位置 ({:.0},{:.0})",
                     &added.to_string()[..8],
@@ -4833,7 +4844,18 @@ impl BoardView {
                 if collector.push_with_pressure(world, hw) {
                     cx.notify();
                 }
-                self.drag = DragState::Freedraw { collector, seed };
+                // 一笔连续（割裂感修复）：画布外起笔、运笔进入画布时，
+                // 同一条 collector 接续为画布笔画——抬笔时画布内段光栅、
+                // 画布外段落成矢量笔迹，一笔不断成两截。
+                if let Some(id) = self.canvas_at(world) {
+                    self.drag = DragState::CanvasDraw {
+                        element_id: id,
+                        collector,
+                        style: self.canvas_style_snapshot(),
+                    };
+                } else {
+                    self.drag = DragState::Freedraw { collector, seed };
+                }
             }
             DragState::CanvasDraw {
                 element_id,
@@ -5261,6 +5283,16 @@ impl BoardView {
                     .is_some_and(|e| matches!(e.kind, ElementKind::Canvas { .. }));
                 if alive && collector.len() >= 1 {
                     let stroke = collector.finish();
+                    let stroke_widths = stroke.widths.clone();
+                    // Wet list stays parallel to strokes: record the bloom
+                    // BEFORE appending, keyed at the pre-commit stroke count.
+                    let count_before = self
+                        .scene
+                        .get(element_id)
+                        .map(|e| e.canvas_strokes().len())
+                        .unwrap_or(0);
+                    self.canvas_cache
+                        .stroke_committed(element_id, count_before, style.brush);
                     self.history.record(&self.scene);
                     if let Some(el) = self.scene.get_mut(element_id) {
                         let origin = WPoint::new(el.bounds.x, el.bounds.y);
@@ -5276,9 +5308,31 @@ impl BoardView {
                             strokes.push(s);
                         }
                     }
-                    // 水彩笔落纸晕开：湿笔计时从抬笔开始（落笔期间预览已
-                    // 是稳定渲染，晕开只在提交后演）。
-                    self.canvas_cache.stroke_committed(element_id, style.brush);
+                    // 跨边界一笔的画布外段落成矢量笔迹（同色同宽同宽度
+                    // 比例），端点正好落在画布边界上，与画布内光栅段首尾
+                    // 相接——一笔跨出画布不再断成两截。
+                    if let Some(bounds) = self.scene.get(element_id).map(|e| e.bounds) {
+                        for (run_pts, run_widths) in
+                            crate::scene::outside_runs(&stroke.points, &stroke_widths, &bounds)
+                        {
+                            let mut el = Element::from_absolute_points(
+                                |points| ElementKind::Freedraw {
+                                    points,
+                                    widths: run_widths,
+                                },
+                                run_pts,
+                                self.style.clone(),
+                            );
+                            el.style.stroke = style.color;
+                            el.style.stroke_width = style.width;
+                            el.style.opacity = style.opacity;
+                            el.style.brush = match style.brush {
+                                CanvasBrush::DryBrush => Some(crate::scene::Brush::DryBrush),
+                                _ => None,
+                            };
+                            self.scene.add(el);
+                        }
+                    }
                     self.mark_dirty();
                     // Like freedraw: keep drawing without changing tool or
                     // selection.
@@ -6074,22 +6128,20 @@ impl BoardView {
                             collector,
                             style,
                         } if *element_id == el.id => {
-                            let mut live = el.clone();
-                            if let Some(strokes) = live.canvas_strokes_mut() {
-                                strokes.push(self.live_canvas_stroke(el, collector, style));
-                            }
-                            self.canvas_cache.image(&live)
+                            // Live stroke composites over the persistent
+                            // base buffer — one stamp per frame, not a
+                            // full-canvas re-raster.
+                            let live = self.live_canvas_stroke(el, collector, style);
+                            self.canvas_cache
+                                .image_with_live(el, Some(&live))
+                                .unwrap_or_else(|| self.canvas_cache.image(el))
                         }
-                        // 落纸晕开（阶段二）：抬笔后的水彩在 WET_MS 内持续
-                        // 绽放/沉降，每帧重光栅并请求下一动画帧；期间画布
-                        // 不在视口内就自然暂停（build_paint 不触达它），回
-                        // 到视口时按墙钟直接落到已沉降态。动画帧绕开指纹
-                        // 缓存，结束后无缝交回稳定缓存条目。
-                        _ => match self.canvas_cache.image_animated(el) {
-                            Some((frame, still_animating)) => {
-                                if still_animating {
-                                    window.request_animation_frame();
-                                }
+                        // 落纸晕开：抬笔后的水彩在 WET_MS 内绽放/沉降，
+                        // 每帧只重光栅未沉降的尾笔并合成到 base 副本；
+                        // 画布不在视口内自然暂停，回视口按墙钟落到沉降态。
+                        _ => match self.canvas_cache.image_with_live(el, None) {
+                            Some(frame) => {
+                                window.request_animation_frame();
                                 frame
                             }
                             None => self.canvas_cache.image(el),

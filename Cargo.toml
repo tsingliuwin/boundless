@@ -103,8 +103,11 @@ embed-resource = "=3.0.11"
 unexpected_cfgs = { level = "allow" }
 
 [profile.dev]
-# GPUI is large; keep local codegen fast while iterating.
-opt-level = 1
+# opt-level 2 for the workspace crate: the raster canvas's per-pixel hot
+# loops run ~4x slower at opt-level 1, and `cargo run` (dev) is how the app
+# is used day to day — the difference was user-visible as "位图画布卡".
+# Dependencies keep their own override below.
+opt-level = 2
 
 [profile.dev.package."*"]
 opt-level = 2
