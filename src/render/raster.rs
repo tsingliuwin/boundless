@@ -195,6 +195,14 @@ fn draw_stroke(
         })
         .collect();
     let (r, g, b) = rgb(s.color);
+    // Wash-family brushes draw through a smoothed, densified centerline:
+    // raw AI/hand polylines carry hard zigzag corners that read as deco
+    // pattern on a wide translucent band (目验 62 分轮的板条感根因之一).
+    // Ink keeps the crisp vertex-to-vertex geometry.
+    let (pts, half) = match s.brush {
+        CanvasBrush::Ink => (pts, half),
+        _ => smooth_centerline(&pts, &half),
+    };
     match s.brush {
         CanvasBrush::Ink => {
             // Distance-field anti-aliasing: alpha ramps over the 1px band
@@ -205,32 +213,41 @@ fn draw_stroke(
             });
         }
         CanvasBrush::Watercolor => {
-            // Layered wash: 4 translucent passes, each jittered in offset and
-            // width so overlaps cloud like real pigment; a pooling band at
-            // each layer's rim darkens edges (pigment gathering at the
-            // boundary); a final wide halo pass bleeds the wet edge outward.
+            // Layered wash: 4 translucent passes. Each layer displaces the
+            // whole centerline by a *low-frequency* wander (per-point, smoothed
+            // noise along the path — not a uniform shift: a shifted straight
+            // band is still a straight band, which is exactly the slat
+            // artifact) and modulates its width along the path, so layer
+            // rims cross instead of stacking into parallel stripes. A pooling
+            // band at each layer's rim darkens edges; its width scales with
+            // the stroke (a fixed 2.5px band on a 20px wash reads as an
+            // outline). A final wide halo bleeds the wet edge outward.
             //
             // Wet strokes (settle < 1, the 落纸晕开 bloom after the pen
             // lifts) start narrower but more concentrated, with stronger
             // uneven spread; over WET_MS they bloom to full width while
-            // diluting to the settled wash. Ink/dry ignore `settle`.
+            // diluting to the settled wash.
             let bloom = 0.72 + 0.28 * settle; // width: blooms outward
             let dilute = 1.18 - 0.18 * settle; // alpha: lightens as it spreads
+            let wander = 1.6 - 0.6 * settle; // wet spread is uneven
             let mut rng = Rng::new(seed);
-            let amp = half.iter().copied().fold(0.5, f32::max)
-                * 0.3
-                * (1.6 - 0.6 * settle); // wet spread is uneven
             for _ in 0..4 {
-                let off = (rng.signed(amp), rng.signed(amp));
-                let ws = rng.range(0.85, 1.15) * bloom;
+                let layer_pts = wander_path(&pts, &half, wander, &mut rng);
+                let layer_half: Vec<f32> = half
+                    .iter()
+                    .map(|h| h * bloom * rng.range(0.88, 1.12))
+                    .collect();
                 let base = rng.range(0.08, 0.13) * dilute;
-                for_each_near_path(&pts, &half, off, ws, |x, y, d, h| {
+                let pool_w = half.iter().copied().fold(1.0, f32::max).max(2.5);
+                for_each_near_path(&layer_pts, &layer_half, (0.0, 0.0), 1.0, |x, y, d, h| {
                     let rim = (h + 1.0 - d).clamp(0.0, 1.0);
-                    let pool = 1.0 + 0.9 * ((d - (h - 2.5)) / 2.5).clamp(0.0, 1.0);
+                    let pool = 1.0 + 1.3 * ((d - (h - pool_w)) / pool_w).clamp(0.0, 1.0);
                     blend(buf, pw, ph, x, y, r, g, b, base * pool * rim * s.opacity);
                 });
             }
-            for_each_near_path(&pts, &half, (0.0, 0.0), 1.5 * bloom, |x, y, d, h| {
+            let halo = wander_path(&pts, &half, 0.5 * wander, &mut rng);
+            let halo_half: Vec<f32> = half.iter().map(|h| h * 1.5 * bloom).collect();
+            for_each_near_path(&halo, &halo_half, (0.0, 0.0), 1.0, |x, y, d, h| {
                 let rim = (h + 1.0 - d).clamp(0.0, 1.0);
                 blend(buf, pw, ph, x, y, r, g, b, 0.04 * dilute * rim * s.opacity);
             });
@@ -244,9 +261,153 @@ fn draw_stroke(
                 blend(buf, pw, ph, x, y, r, g, b, a);
             });
             let mut rng = Rng::new(seed);
-            dry_stipple(buf, pw, ph, &pts, &half, r, g, b, s.opacity, &mut rng);
+            // Scratch/deposit decisions must look at the canvas as it was
+            // BEFORE this stroke: sampling the live buffer would make the
+            // stroke's own overlapping discs scratch each other away (the
+            // 74-round regression where glints vanished).
+            let base_alpha: Vec<u8> = buf.chunks_exact(4).map(|c| c[3]).collect();
+            dry_stipple(
+                buf, pw, ph, &pts, &half, r, g, b, s.opacity, &mut rng, &base_alpha, pw,
+            );
         }
     }
+}
+
+/// Corner-rounding + arc-length densification of a stroke centerline for
+/// wash-family brushes. Two stages: one Chaikin corner-cutting pass pulls
+/// hard vertices inward (a Catmull-Rom spline alone would interpolate the
+/// corner exactly and keep the deco zigzag), then the Catmull-Rom spline
+/// (same convention as the vector curve renderer: tightness 0, cubic Bézier
+/// control points at 1/6 of the neighbor span, endpoints duplicated) adds
+/// the intermediate vertices the per-point wander needs to breathe. Widths
+/// interpolate linearly through both stages.
+fn smooth_centerline(pts: &[(f32, f32)], half: &[f32]) -> (Vec<(f32, f32)>, Vec<f32>) {
+    let n = pts.len();
+    if n < 2 {
+        return (pts.to_vec(), half.to_vec());
+    }
+    if n == 2 {
+        // A straight stroke has no corners to cut, but the washes' wander
+        // needs interior points to undulate through — sample the chord.
+        let (p, q) = (pts[0], pts[1]);
+        let (hp, hq) = (half[0], half[1]);
+        let len = (q.0 - p.0).hypot(q.1 - p.1);
+        let k = ((len / 6.0).ceil() as usize).clamp(2, 64);
+        let mut out_pts = Vec::with_capacity(k + 1);
+        let mut out_half = Vec::with_capacity(k + 1);
+        for j in 0..=k {
+            let t = j as f32 / k as f32;
+            out_pts.push((p.0 + (q.0 - p.0) * t, p.1 + (q.1 - p.1) * t));
+            out_half.push(hp + (hq - hp) * t);
+        }
+        return (out_pts, out_half);
+    }
+    // Chaikin: replace each interior vertex by the pair of points 1/4 in
+    // from it along each incident segment (R of the incoming segment, Q of
+    // the outgoing one) — the classic corner cut that pulls sharp zigzags
+    // into curves while endpoints stay put.
+    let mut cut_pts: Vec<(f32, f32)> = Vec::with_capacity(n * 2);
+    let mut cut_half: Vec<f32> = Vec::with_capacity(n * 2);
+    cut_pts.push(pts[0]);
+    cut_half.push(half[0]);
+    for i in 1..n - 1 {
+        let (a, b, c) = (pts[i - 1], pts[i], pts[i + 1]);
+        let (ha, hb, hc) = (half[i - 1], half[i], half[i + 1]);
+        cut_pts.push((a.0 * 0.25 + b.0 * 0.75, a.1 * 0.25 + b.1 * 0.75));
+        cut_half.push(ha * 0.25 + hb * 0.75);
+        cut_pts.push((b.0 * 0.75 + c.0 * 0.25, b.1 * 0.75 + c.1 * 0.25));
+        cut_half.push(hb * 0.75 + hc * 0.25);
+    }
+    cut_pts.push(pts[n - 1]);
+    cut_half.push(half[n - 1]);
+
+    let m = cut_pts.len();
+    let last = m - 1;
+    let mut out_pts = Vec::with_capacity(m * 6);
+    let mut out_half = Vec::with_capacity(m * 6);
+    out_pts.push(cut_pts[0]);
+    out_half.push(cut_half[0]);
+    for seg in 0..last {
+        let p0 = cut_pts[seg.saturating_sub(1)];
+        let p1 = cut_pts[seg];
+        let p2 = cut_pts[seg + 1];
+        let p3 = cut_pts[(seg + 2).min(last)];
+        let h1 = cut_half[seg];
+        let h2 = cut_half[seg + 1];
+        let c1 = (p1.0 + (p2.0 - p0.0) / 6.0, p1.1 + (p2.1 - p0.1) / 6.0);
+        let c2 = (p2.0 - (p3.0 - p1.0) / 6.0, p2.1 + (p3.1 - p1.1) / 6.0);
+        let seg_len = (p2.0 - p1.0).hypot(p2.1 - p1.1);
+        let k = ((seg_len / 6.0).ceil() as usize).clamp(2, 24);
+        for j in 1..=k {
+            let t = j as f32 / k as f32;
+            let u = 1.0 - t;
+            let x = u * u * u * p1.0 + 3.0 * u * u * t * c1.0 + 3.0 * u * t * t * c2.0 + t * t * t * p2.0;
+            let y = u * u * u * p1.1 + 3.0 * u * u * t * c1.1 + 3.0 * u * t * t * c2.1 + t * t * t * p2.1;
+            out_pts.push((x, y));
+            out_half.push(h1 + (h2 - h1) * t);
+        }
+    }
+    (out_pts, out_half)
+}
+
+/// Low-frequency wander: displace each centerline point along the local
+/// normal by smoothed (two box passes) seeded noise scaled to the local
+/// half-width and `strength`. The result is an organic edge line instead of
+/// a rigidly shifted copy of the path.
+fn wander_path(
+    pts: &[(f32, f32)],
+    half: &[f32],
+    strength: f32,
+    rng: &mut Rng,
+) -> Vec<(f32, f32)> {
+    let n = pts.len();
+    if n < 2 {
+        return pts.to_vec();
+    }
+    // Arc-length parameter so noise frequencies scale with the stroke:
+    // point-count-based smoothing gave every stroke the same ~20px scallop
+    // period (the caterpillar rim on long wave bands).
+    let mut arc = vec![0.0f32; n];
+    for i in 1..n {
+        arc[i] = arc[i - 1] + (pts[i].0 - pts[i - 1].0).hypot(pts[i].1 - pts[i - 1].1);
+    }
+    let total = arc[n - 1].max(1.0);
+    // Three incommensurate sine components (long swell + medium + texture)
+    // with seeded phases/frequencies, wavelengths as fractions of the
+    // stroke length…
+    let comps: [(f32, f32, f32); 3] = [
+        (rng.range(0.45, 0.75), rng.range(0.0, 6.283), 1.0),
+        (rng.range(0.20, 0.33), rng.range(0.0, 6.283), 0.55),
+        (rng.range(0.09, 0.15), rng.range(0.0, 6.283), 0.28),
+    ];
+    let norm: f32 = comps.iter().map(|c| c.2).sum();
+    let mut off: Vec<f32> = (0..n)
+        .map(|i| {
+            let s = arc[i] / total;
+            let v: f32 = comps
+                .iter()
+                .map(|(wl, ph, a)| a * (6.283 * s / wl + ph).sin())
+                .sum();
+            v / norm
+        })
+        .collect();
+    // …plus a touch of per-point grain so the edge never looks machined.
+    for i in 0..n {
+        off[i] = (off[i] + 0.18 * rng.signed(1.0)).clamp(-1.0, 1.0);
+    }
+    (0..n)
+        .map(|i| {
+            let (a, b) = (pts[i.saturating_sub(1)], pts[(i + 1).min(n - 1)]);
+            let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+            let len = dx.hypot(dy);
+            let (nx, ny) = if len > 1e-3 { (-dy / len, dx / len) } else { (0.0, 1.0) };
+            // Amplitude grows super-linearly with half-width: a 60px-tall
+            // sky band needs decimetre-scale undulation to stop reading as
+            // a ruler-straight slat, while a 4px line stays controlled.
+            let amp = half[i] * (0.45 + half[i] * 0.02).min(1.1) * strength * off[i];
+            (pts[i].0 + nx * amp, pts[i].1 + ny * amp)
+        })
+        .collect()
 }
 
 /// Seeded 飞白 stipple: AA discs along each segment, scattered across the
@@ -262,6 +423,8 @@ fn dry_stipple(
     b: u8,
     opacity: f32,
     rng: &mut Rng,
+    base_alpha: &[u8],
+    base_pw: u32,
 ) {
     let stamp_disc = |buf: &mut [u8], cx: f32, cy: f32, rad: f32, a0: f32| {
         let x0 = (cx - rad - 1.0).floor() as i32;
@@ -275,6 +438,30 @@ fn dry_stipple(
                 blend(buf, pw, ph, x, y, r, g, b, a);
             }
         }
+    };
+    // Destination-out disc: scale the existing alpha down so the paper shows
+    // through — a dry brush dragging over a wet wash lifts pigment instead
+    // of adding it (真飞白). Color is left in place; only coverage drops.
+    let scratch_disc = |buf: &mut [u8], cx: f32, cy: f32, rad: f32, k0: f32| {
+        let x0 = (cx - rad - 1.0).floor() as i32;
+        let x1 = (cx + rad + 1.0).ceil() as i32;
+        let y0 = (cy - rad - 1.0).floor() as i32;
+        let y1 = (cy + rad + 1.0).ceil() as i32;
+        for y in y0.max(0)..=y1.min(ph as i32 - 1) {
+            for x in x0.max(0)..=x1.min(pw as i32 - 1) {
+                let d = ((x as f32 + 0.5 - cx).hypot(y as f32 + 0.5 - cy) - rad).max(0.0);
+                let k = (1.0 - d).clamp(0.0, 1.0) * k0;
+                let i = ((y as u32 * pw + x as u32) * 4 + 3) as usize;
+                buf[i] = (buf[i] as f32 * (1.0 - k)).round() as u8;
+            }
+        }
+    };
+    let dest_alpha = |x: f32, y: f32| -> f32 {
+        let (xi, yi) = (x as i32, y as i32);
+        if xi < 0 || yi < 0 || xi >= base_pw as i32 || yi >= ph as i32 {
+            return 0.0;
+        }
+        base_alpha[(yi as u32 * base_pw + xi as u32) as usize] as f32 / 255.0
     };
     if pts.len() == 1 {
         stamp_disc(buf, pts[0].0, pts[0].1, half[0], 0.8 * opacity);
@@ -300,8 +487,15 @@ fn dry_stipple(
             let cx = ax + dx * t + nx * spread;
             let cy = ay + dy * t + ny * spread;
             let rad = h * rng.range(0.14, 0.48);
-            let a0 = rng.range(0.25, 0.75) * opacity;
-            stamp_disc(buf, cx, cy, rad, a0);
+            // Adaptive: over existing coverage the dry brush scratches
+            // (streaks of paper); on bare canvas it deposits bold grains so
+            // the stroke never dissolves into an underlying wash.
+            if dest_alpha(cx, cy) > 0.18 {
+                scratch_disc(buf, cx, cy, rad, rng.range(0.35, 0.7) * opacity);
+            } else {
+                let a0 = rng.range(0.45, 0.9) * opacity;
+                stamp_disc(buf, cx, cy, rad, a0);
+            }
         }
     }
 }
@@ -707,6 +901,59 @@ mod tests {
     }
 
     #[test]
+    fn smooth_centerline_rounds_corners_and_densifies() {
+        // A sharp V: the smoothed centerline must stay near the vertices at
+        // the ends but pull the corner inward, and gain samples.
+        let pts = vec![(0.0, 0.0), (50.0, 40.0), (100.0, 0.0)];
+        let half = vec![4.0, 4.0, 4.0];
+        let (sp, sh) = smooth_centerline(&pts, &half);
+        assert!(sp.len() > pts.len() * 3, "densified: {}", sp.len());
+        assert_eq!(sh.len(), sp.len());
+        // Endpoints preserved.
+        assert!((sp[0].0 - 0.0).abs() < 1e-3 && (sp[0].1 - 0.0).abs() < 1e-3);
+        let last = sp[sp.len() - 1];
+        assert!((last.0 - 100.0).abs() < 1e-3 && (last.1 - 0.0).abs() < 1e-3);
+        // The corner vertex (50,40) is pulled toward the chord (y=0 line):
+        // some sample near x=50 sits well below y=40 but above y=0.
+        let near_corner = sp
+            .iter()
+            .filter(|p| (p.0 - 50.0).abs() < 6.0)
+            .map(|p| p.1)
+            .fold(0.0f32, f32::max);
+        assert!(
+            near_corner < 34.0 && near_corner > 5.0,
+            "corner rounded inward, got {near_corner}"
+        );
+        // Straight strokes stay straight (collinear spline == chord).
+        let (lp, _) = smooth_centerline(&[(0.0, 10.0), (100.0, 10.0)], &[3.0, 3.0]);
+        assert!(lp.iter().all(|p| (p.1 - 10.0).abs() < 1e-3));
+    }
+
+    #[test]
+    fn wander_displaces_bands_organically_not_rigidly() {
+        // A straight horizontal band: a rigid shift would move every point
+        // by the same offset; the wander must vary along the path (that is
+        // what breaks the parallel-slat look).
+        let pts: Vec<(f32, f32)> = (0..=20).map(|i| (i as f32 * 10.0, 50.0)).collect();
+        let half = vec![8.0; 21];
+        let mut rng = Rng::new(7);
+        let w = wander_path(&pts, &half, 1.0, &mut rng);
+        let dy: Vec<f32> = w.iter().zip(pts.iter()).map(|(a, b)| a.1 - b.1).collect();
+        let spread = dy.iter().copied().fold(0.0f32, f32::max)
+            - dy.iter().copied().fold(0.0f32, f32::min);
+        assert!(
+            spread > 2.0,
+            "wander varies along the path (spread {spread}px)"
+        );
+        // Amplitude stays bounded by the (super-linear) half-width scaling.
+        let cap = 8.0f32 * (0.45f32 + 8.0 * 0.02).min(1.1) + 1e-3;
+        assert!(dy.iter().all(|d| d.abs() <= cap));
+        // Deterministic for a given seed.
+        let w2 = wander_path(&pts, &half, 1.0, &mut Rng::new(7));
+        assert_eq!(w, w2);
+    }
+
+    #[test]
     fn watercolor_profile_numeric() {
         // Translucency profile of the wash: center must stay well below
         // opaque, and the pooling band must make the rim darker than the
@@ -732,6 +979,42 @@ mod tests {
             peak > center + 0.08,
             "edge pooling makes the rim darker than the core: peak {peak} vs center {center}"
         );
+    }
+
+    #[test]
+    fn rerender_saved_scene() {
+        // Re-render every canvas element of a saved scene through the
+        // current rasterizer (CANVAS_SCENE=<path>): the review loop for
+        // brush-quality changes against real artwork, no app launch needed.
+        let path = match std::env::var("CANVAS_SCENE") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let json = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!("read {path}: {e}");
+        });
+        let file: crate::scene::SceneFile = serde_json::from_str(&json).unwrap();
+        let canvases: Vec<&Element> = file
+            .elements
+            .iter()
+            .filter(|e| matches!(e.kind, ElementKind::Canvas { .. }))
+            .collect();
+        assert!(!canvases.is_empty(), "no canvas elements in {path}");
+        let imgs: Vec<image::RgbaImage> = canvases.iter().map(|e| rasterize(e)).collect();
+        let w = imgs.iter().map(|i| i.width()).max().unwrap();
+        let h: u32 = imgs.iter().map(|i| i.height()).sum();
+        let mut out = image::RgbaImage::new(w, h);
+        let mut y = 0i64;
+        for i in &imgs {
+            image::imageops::overlay(&mut out, i, 0, y);
+            y += i.height() as i64;
+        }
+        for p in out.pixels_mut() {
+            p.0.swap(0, 2);
+        }
+        out.save(std::env::temp_dir().join("boundless-canvas-rerender.png"))
+            .unwrap();
+        eprintln!("rerendered {} canvas(es) → {w}×{h}", canvases.len());
     }
 
     #[test]
@@ -769,9 +1052,52 @@ mod tests {
         });
         el.style.background = Some(0xfffdf6);
 
-        // Bloom strip: the same watercolor stroke at four settle stages —
-        // just-committed (0) through settled (1) — stacked vertically so
-        // the 落纸晕开 progression is readable in one image.
+        // Seascape strip (mirrors the 62-score review piece): a wide
+        // horizontal wash ("sky"), a wide zigzag wash ("wave band") and the
+        // four-stage bloom of a medium wash. Slats/parallel-stripes or hard
+        // zigzag corners would show up here immediately.
+        let sky = Element::new(
+            ElementKind::Canvas {
+                strokes: vec![CanvasStroke {
+                    points: vec![WPoint::new(2.0, 15.0), WPoint::new(98.0, 15.0)],
+                    widths: Vec::new(),
+                    color: 0x6f9fd8,
+                    width: 22.0,
+                    brush: CanvasBrush::Watercolor,
+                    opacity: 1.0,
+                }],
+            },
+            WBounds::new(0.0, 0.0, 100.0, 30.0),
+            ElementStyle {
+                background: Some(0xfffdf6),
+                ..ElementStyle::default()
+            },
+        );
+        let wave = Element::new(
+            ElementKind::Canvas {
+                strokes: vec![CanvasStroke {
+                    points: vec![
+                        WPoint::new(2.0, 18.0),
+                        WPoint::new(18.0, 10.0),
+                        WPoint::new(34.0, 18.0),
+                        WPoint::new(50.0, 10.0),
+                        WPoint::new(66.0, 18.0),
+                        WPoint::new(82.0, 10.0),
+                        WPoint::new(98.0, 18.0),
+                    ],
+                    widths: Vec::new(),
+                    color: 0x8fa8c8,
+                    width: 12.0,
+                    brush: CanvasBrush::Watercolor,
+                    opacity: 1.0,
+                }],
+            },
+            WBounds::new(0.0, 0.0, 100.0, 30.0),
+            ElementStyle {
+                background: Some(0xfffdf6),
+                ..ElementStyle::default()
+            },
+        );
         let mut frame = Element::new(
             ElementKind::Canvas {
                 strokes: vec![CanvasStroke {
@@ -796,13 +1122,21 @@ mod tests {
         );
         frame.seed = 42;
         let stages = 4;
-        let row_h = 40; // px
-        let mut out = image::RgbaImage::new(200, 200 + row_h * stages);
+        let row_h = 60; // px per 30-world-unit band
+        let bloom_h = 40; // px per 20-world-unit bloom row
+        let mut out = image::RgbaImage::new(200, 200 + row_h * 2 + bloom_h * stages);
         image::imageops::overlay(&mut out, &rasterize(&el), 0, 0);
+        image::imageops::overlay(&mut out, &rasterize(&sky), 0, 200);
+        image::imageops::overlay(&mut out, &rasterize(&wave), 0, 200 + row_h as i64);
         for k in 0..stages {
             let settle = k as f32 / (stages - 1) as f32;
             let img = rasterize_with(&frame, &[settle]);
-            image::imageops::overlay(&mut out, &img, 0, 200 + (row_h * k) as i64);
+            image::imageops::overlay(
+                &mut out,
+                &img,
+                0,
+                200 + row_h as i64 * 2 + bloom_h as i64 * k as i64,
+            );
         }
 
         // The buffer is BGRA (RenderImage's convention); swap to RGBA for a

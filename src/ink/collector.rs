@@ -106,8 +106,26 @@ impl InkCollector {
     }
 
     /// Consume the collector into its finished stroke.
-    pub fn finish(self) -> InkStroke {
+    pub fn finish(mut self) -> InkStroke {
+        self.taper_tail();
         self.stroke
+    }
+
+    /// Pen-up tail taper: thin the last few samples so the stroke lands on a
+    /// soft tip instead of a round cap (the capsule end that reads as an
+    /// artifact when a wash stops mid-canvas). The head already tapers in
+    /// via the synthetic start pressure. Only touches tapered strokes —
+    /// uniform (笔锋 off) strokes stay uniform by design.
+    fn taper_tail(&mut self) {
+        let n = self.stroke.widths.len();
+        if n < 3 {
+            return;
+        }
+        let m = n.min(4);
+        for j in 0..m {
+            let f = 0.45 + 0.55 * (j as f64 / m as f64);
+            self.stroke.widths[n - 1 - j] *= f;
+        }
     }
 
     /// Wall-clock capture with velocity-simulated pressure. Prefer
@@ -367,5 +385,33 @@ mod tests {
             "blend {} should stay close to the pen value",
             w[0]
         );
+    }
+
+    #[test]
+    fn finish_tapers_the_tail_to_a_soft_tip() {
+        // Constant full pressure: without the pen-up taper every width
+        // settles near 1.0 and the stroke ends in a round cap.
+        let mut c = InkCollector::new(1.0, true);
+        for i in 0..20 {
+            c.push_at(WPoint::new(i as f64 * 5.0, 0.0), i as f64 * 16.0, Some(1.0));
+        }
+        let stroke = c.finish();
+        let n = stroke.widths.len();
+        let mid = stroke.widths[n / 2];
+        assert!(
+            stroke.widths[n - 1] < mid * 0.6,
+            "tail {} should taper well below mid {}",
+            stroke.widths[n - 1],
+            mid
+        );
+        // The taper window is short: everything before it is untouched.
+        assert!((stroke.widths[n - 5] - mid).abs() < mid * 0.15);
+
+        // Uniform strokes (笔锋 off) stay uniform through finish.
+        let mut u = InkCollector::new(1.0, false);
+        for i in 0..10 {
+            u.push_at(WPoint::new(i as f64 * 5.0, 0.0), i as f64 * 16.0, None);
+        }
+        assert!(u.finish().widths.is_empty());
     }
 }
