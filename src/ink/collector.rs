@@ -117,15 +117,7 @@ impl InkCollector {
     /// via the synthetic start pressure. Only touches tapered strokes —
     /// uniform (笔锋 off) strokes stay uniform by design.
     fn taper_tail(&mut self) {
-        let n = self.stroke.widths.len();
-        if n < 3 {
-            return;
-        }
-        let m = n.min(4);
-        for j in 0..m {
-            let f = 0.45 + 0.55 * (j as f64 / m as f64);
-            self.stroke.widths[n - 1 - j] *= f;
-        }
+        crate::scene::taper_widths_tail(&mut self.stroke.widths);
     }
 
     /// Wall-clock capture with velocity-simulated pressure. Prefer

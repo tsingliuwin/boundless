@@ -326,6 +326,25 @@ fn default_canvas_opacity() -> f32 {
     1.0
 }
 
+/// Pen-up tail taper for canvas stroke width ratios: thin the last few
+/// points so strokes end in a soft tip instead of a round cap. Shared by
+/// the ink collector (hand strokes) and AI `add_canvas` strokes (which
+/// arrive width-uniform — empty `widths` is expanded to 1.0 first).
+pub fn taper_widths_tail(widths: &mut Vec<f64>) {
+    if widths.is_empty() {
+        return;
+    }
+    let n = widths.len();
+    if n < 3 {
+        return;
+    }
+    let m = n.min(4);
+    for j in 0..m {
+        let f = 0.45 + 0.55 * (j as f64 / m as f64);
+        widths[n - 1 - j] *= f;
+    }
+}
+
 /// Stroke style captured when a canvas drag starts, so mid-drag board style
 /// changes never bleed into the in-progress stroke.
 #[derive(Clone, Copy, Debug)]

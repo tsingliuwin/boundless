@@ -1318,6 +1318,15 @@ impl BoardView {
                     background: Some(background.unwrap_or(0xfffdf6)),
                     ..ElementStyle::default()
                 };
+                // AI strokes arrive width-uniform: give them ratios and the
+                // same pen-up tail taper hand strokes get, so wash bands
+                // don't end in visible round capsules.
+                for s in &mut el_strokes {
+                    if s.widths.is_empty() {
+                        s.widths = vec![1.0; s.points.len()];
+                    }
+                    crate::scene::taper_widths_tail(&mut s.widths);
+                }
                 let wet_brushes: Vec<CanvasBrush> =
                     el_strokes.iter().map(|s| s.brush).collect();
                 let el = Element::new_with_id(

@@ -231,6 +231,11 @@ fn draw_stroke(
             let dilute = 1.18 - 0.18 * settle; // alpha: lightens as it spreads
             let wander = 1.6 - 0.6 * settle; // wet spread is uneven
             let mut rng = Rng::new(seed);
+            // Wet-on-wet: where this wash meets pigment already on the
+            // paper, pigment migrates across the contact instead of
+            // pooling at its own rim — stacked bands blend at the seam
+            // instead of showing double rims with a pale gap between.
+            let base_alpha: Vec<u8> = buf.chunks_exact(4).map(|c| c[3]).collect();
             for _ in 0..4 {
                 let layer_pts = wander_path(&pts, &half, wander, &mut rng);
                 let layer_half: Vec<f32> = half
@@ -241,8 +246,16 @@ fn draw_stroke(
                 let pool_w = half.iter().copied().fold(1.0, f32::max).max(2.5);
                 for_each_near_path(&layer_pts, &layer_half, (0.0, 0.0), 1.0, |x, y, d, h| {
                     let rim = (h + 1.0 - d).clamp(0.0, 1.0);
-                    let pool = 1.0 + 1.3 * ((d - (h - pool_w)) / pool_w).clamp(0.0, 1.0);
-                    blend(buf, pw, ph, x, y, r, g, b, base * pool * rim * s.opacity);
+                    let pool0 = 1.3 * ((d - (h - pool_w)) / pool_w).clamp(0.0, 1.0);
+                    let ba = base_alpha
+                        .get((y as u32 * pw + x as u32) as usize)
+                        .copied()
+                        .unwrap_or(0) as f32
+                        / 255.0;
+                    let wet = (ba / 0.35).min(1.0);
+                    let pool = 1.0 + pool0 * (1.0 - 0.7 * wet);
+                    let a = base * pool * rim * s.opacity * (1.0 + 0.35 * wet);
+                    blend(buf, pw, ph, x, y, r, g, b, a);
                 });
             }
             let halo = wander_path(&pts, &half, 0.5 * wander, &mut rng);
