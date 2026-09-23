@@ -64,11 +64,14 @@ pub struct AiPanel {
     error: Option<String>,
     /// Multi-line chat input (auto-grow 3..8 lines) — the docked panel's.
     input: Entity<InputState>,
-    /// The compact bar's input: also multi-line capable, but laid out with a
-    /// one-line minimum (no auto-grow), so pinning the bar's height shows a
-    /// single line with in-place scrolling instead of growing. Separate from
-    /// `input` because auto_grow's min-rows layout would overflow a pinned
-    /// one-line box; drafts are carried across on mode switches.
+    /// The compact bar's input: auto-grow 1..4 lines. At rest the bar is a
+    /// one-line pill; typing more lines grows it (up to 4), and beyond that
+    /// the input scrolls in place. (Pin-the-height + rely on internal scroll
+    /// does NOT work: gpui-component's multi-line `Input` root is `h_auto`,
+    /// so inside a one-line clipping box the element still lays out at full
+    /// content height, concludes everything is visible, and never scrolls —
+    /// only the first line shows.) Separate from `input` because its
+    /// min-rows differ; drafts are carried across on mode switches.
     compact_input: Entity<InputState>,
     /// Transient panel-level notice (e.g. session save/load failures). Shown
     /// as a slim dismissible bar under the header.
@@ -124,12 +127,6 @@ const FLOATS_RESERVE: f32 = 600.0;
 pub fn compact_bar_width(span: f32) -> f32 {
     (span - FLOATS_RESERVE).clamp(320.0, COMPACT_BAR_WIDTH)
 }
-/// Visible height of the compact bar's input: exactly one text line. The
-/// input lays its line out at the window default line height (1.5rem = 24px)
-/// regardless of the `line_height(1.25rem)` refinement on its own root, so
-/// the box must match that or the text sits low and clips. Multi-line
-/// content scrolls inside; the box never grows.
-const INPUT_VISIBLE_H: f32 = 24.0;
 const MIN_WIDTH: f32 = 280.0;
 const MAX_WIDTH: f32 = 640.0;
 
@@ -170,13 +167,12 @@ impl AiPanel {
                 .multi_line(true)
                 .auto_grow(3, 8)
         });
-        // Compact bar's input: multi-line capable but lays out at one line
-        // (PlainText multi-line's min height IS one line), so the bar can pin
-        // a single visible line with internal scrolling.
+        // Compact bar's input: auto-grow from one line (keeps the pill slim
+        // at rest) up to 4 lines; longer content scrolls inside.
         let compact_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("给 AI 发送消息…")
-                .multi_line(true)
+                .auto_grow(1, 4)
         });
 
         let mut subscriptions = Vec::new();
@@ -1427,17 +1423,14 @@ impl AiPanel {
                 div()
                     .flex_1()
                     .min_w_0()
-                    // One visible line: the box is exactly one text line tall
-                    // (1.25rem) so the text fills it flush and centers in the
-                    // pill. The overflow_hidden wrapper clips the input's
-                    // scrolled lines — multi-line content scrolls inside
-                    // instead of growing the bar or bleeding past the pill.
-                    .h(px(INPUT_VISIBLE_H))
-                    .overflow_hidden()
+                    // No pinned height here: the input's auto_grow(1, 4) sizes
+                    // itself — one line at rest, up to four when typing (the
+                    // pill grows with it), internal scroll beyond. Pinning a
+                    // one-line box instead would silently hide lines 2+ (see
+                    // the compact_input field doc).
                     // gpui-component gives the input root a default 8px
                     // vertical padding (input_py); without zeroing it the
-                    // text line paints 8px down inside the pinned box and
-                    // clips at the bottom.
+                    // text line paints 8px low inside the pill.
                     .child(Input::new(&self.compact_input).appearance(false).py_0()),
             )
             .child(
