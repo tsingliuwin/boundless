@@ -1474,32 +1474,7 @@ impl AiPanel {
         } else if let Some(notice) = &self.notice {
             (notice.clone(), rgb(0xe8590c))
         } else if let Some(stream) = &self.streaming {
-            let text = if !stream.buffer.trim().is_empty() {
-                tail_chars(&stream.buffer, 64)
-            } else if let Some(step) = stream.steps.last() {
-                match step {
-                    super::client::AssistantStep::Reasoning { text } => {
-                        if text.trim().is_empty() {
-                            "思考中…".to_string()
-                        } else {
-                            tail_chars(text, 64)
-                        }
-                    }
-                    super::client::AssistantStep::Tool { name, .. } => {
-                        format!("正在调用工具：{}", tool_label(name))
-                    }
-                    super::client::AssistantStep::Text { text } => {
-                        if text.trim().is_empty() {
-                            "生成中…".to_string()
-                        } else {
-                            tail_chars(text, 64)
-                        }
-                    }
-                }
-            } else {
-                "正在思考…".to_string()
-            };
-            (text, rgb(0x555555))
+            (streaming_status_text(&stream.steps, &stream.buffer), rgb(0x555555))
         } else {
             // Idle: keep the last reply visible (tail) until the next send.
             let last = self.messages.last()?;
@@ -1521,9 +1496,45 @@ impl AiPanel {
     }
 }
 
+/// The compact bar's streaming status text: the agent's CURRENT activity.
+/// `steps` is in execution order, so the last step is what is happening
+/// right now. A trailing Reasoning step means the model is mid-thought —
+/// its tail shows even if narration text (`buffer`) arrived earlier in the
+/// turn. Drawing agents narrate first ("马上开画…") and then think between
+/// tool calls; a buffer-first priority hid every one of those reasoning
+/// rounds — the user never saw the thinking once any text had streamed.
+fn streaming_status_text(steps: &[super::client::AssistantStep], buffer: &str) -> String {
+    if let Some(step) = steps.last() {
+        match step {
+            super::client::AssistantStep::Reasoning { text } => {
+                if text.trim().is_empty() {
+                    "思考中…".to_string()
+                } else {
+                    tail_chars(text, 64)
+                }
+            }
+            super::client::AssistantStep::Tool { name, .. } => {
+                format!("正在调用工具：{}", tool_label(name))
+            }
+            super::client::AssistantStep::Text { text } => {
+                if text.trim().is_empty() {
+                    "生成中…".to_string()
+                } else {
+                    tail_chars(text, 64)
+                }
+            }
+        }
+    } else if !buffer.trim().is_empty() {
+        // Text deltas can land ahead of the flush that creates the Text
+        // step; mirror them here so the tail never stalls.
+        tail_chars(buffer, 64)
+    } else {
+        "正在思考…".to_string()
+    }
+}
+
 /// Last `n` characters of `s`, newlines flattened so it reads as one line.
-fn tail_chars(s: &str, n: usize) -> String {
-    let one_line: String = s
+fn tail_chars(s: &str, n: usize) -> String {    let one_line: String = s
         .trim()
         .chars()
         .map(|c| if c == '\n' { ' ' } else { c })
@@ -2529,7 +2540,8 @@ fn push_style(out: &mut String, style: Option<&serde_json::Value>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        tool_body_text, tool_call_detail, tool_chip_preview, tool_header, tool_op, ToolOp,
+        streaming_status_text, tool_body_text, tool_call_detail, tool_chip_preview, tool_header,
+        tool_op, ToolOp,
     };
 
     #[test]
@@ -2689,4 +2701,61 @@ mod tests {
         );
         assert_eq!(tool_op("list_elements"), ToolOp::Query);
     }
+    #[test]
+    fn compact_status_shows_latest_reasoning_even_after_text() {
+        use super::super::client::AssistantStep;
+        // 画图场景：模型先叙述（text 已进 buffer），再开始新一轮思考。
+        // 旧实现 buffer 优先，之后的思考全部被遮蔽——本测试锁定修复。
+        let steps = vec![
+            AssistantStep::Text {
+                text: "马上开画…".into(),
+            },
+            AssistantStep::Reasoning {
+                text: "先画一个圆角矩形作为标题底".into(),
+            },
+        ];
+        assert_eq!(
+            streaming_status_text(&steps, "马上开画…"),
+            "先画一个圆角矩形作为标题底"
+        );
+    }
+
+    #[test]
+    fn compact_status_follows_step_sequence() {
+        use super::super::client::AssistantStep;
+        // 空 → 正在思考
+        assert_eq!(streaming_status_text(&[], ""), "正在思考…");
+        // buffer 已有字但 step 尚未 flush → 显示 buffer 尾
+        assert_eq!(streaming_status_text(&[], "hello"), "hello");
+        // 空思考步 → 思考中
+        assert_eq!(
+            streaming_status_text(&[AssistantStep::Reasoning { text: "".into() }], ""),
+            "思考中…"
+        );
+        // 工具步 → 工具名
+        assert!(streaming_status_text(
+            &[
+                AssistantStep::Reasoning { text: "想".into() },
+                AssistantStep::Tool {
+                    name: "draw_rectangle".into(),
+                    args: serde_json::Value::Null,
+                    done: false,
+                    error: false,
+                    id: "1".into(),
+                    result: String::new(),
+                }
+            ],
+            ""
+        )
+        .starts_with("正在调用工具"));
+        // 文本步 → 文本尾
+        assert_eq!(
+            streaming_status_text(
+                &[AssistantStep::Text { text: "done".into() }],
+                "done"
+            ),
+            "done"
+        );
+    }
+
 }
