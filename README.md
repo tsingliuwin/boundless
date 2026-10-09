@@ -110,4 +110,4 @@ vendor/gpui/      vendored GPUI + 触摸板捏合补丁
 
 ## License
 
-暂未附开源许可证，如需使用请先联系作者。
+[AGPL-3.0](LICENSE) © boundless contributors。你的定制部署、二次分发均须遵守 AGPL-3.0 条款（含网络使用义务）。
