@@ -9,9 +9,9 @@
 #![windows_subsystem = "windows"]
 
 use boundless::board::{
-    ArrowTool, BoardView, BringForward, BringToFront, CancelOp, CheckForUpdates, DeleteSelection,
-    DiamondTool, EllipseTool, EraserTool, GotoNextPage, GotoPrevPage, HandTool, InsertCanvas,
-    InsertImage, LineTool, OpenScene, OpenSettings, PasteImage, PenTool, PresentExit,
+    About, ArrowTool, BoardView, BringForward, BringToFront, CancelOp, CheckForUpdates,
+    DeleteSelection, DiamondTool, EllipseTool, EraserTool, GotoNextPage, GotoPrevPage, HandTool,
+    InsertCanvas, InsertImage, LineTool, OpenScene, OpenSettings, PasteImage, PenTool, PresentExit,
     PresentStart, Quit, RectTool, Redo, SaveScene, SelectTool, SendBackward, SendToBack, TextTool,
     ToggleAi, ToggleExplorer, Undo, ZoomIn, ZoomOut, ZoomReset,
 };
@@ -223,7 +223,10 @@ fn main() {
                 },
                 Menu {
                     name: "帮助".into(),
-                    items: vec![MenuItem::action("检查更新…", CheckForUpdates)],
+                    items: vec![
+                        MenuItem::action("检查更新", CheckForUpdates),
+                        MenuItem::action("关于", About),
+                    ],
                 },
             ]);
 

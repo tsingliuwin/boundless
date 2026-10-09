@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use futures::StreamExt;
 use gpui::prelude::*;
 use gpui::*;
-use gpui_component::button::Button;
+use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::text::TextView;
 use gpui_component::{Icon, IconName, Sizable};
@@ -863,12 +863,6 @@ impl AiPanel {
         cx.notify();
     }
 
-    fn insert_to_canvas(&mut self, content: String, cx: &mut Context<Self>) {
-        self.board
-            .update(cx, |board, cx| board.insert_ai_text(content, cx))
-            .ok();
-    }
-
     fn clear_chat(&mut self, cx: &mut Context<Self>) {
         // "清空" starts a fresh conversation; the previous session's history
         // is preserved on disk and remains selectable from the session list.
@@ -919,12 +913,12 @@ impl Render for AiPanel {
                     .gap_1()
                     .child(
                         // Collapse back to the compact bottom bar.
-                        panel_button("收起", false).on_click(
-                            cx.listener(|this, _, window, cx| this.set_compact(true, window, cx)),
-                        ),
+                        header_action("收起").on_click(cx.listener(
+                            |this, _, window, cx| this.set_compact(true, window, cx),
+                        )),
                     )
                     .child(
-                        panel_button("新建", false)
+                        header_action("新建")
                             .on_click(cx.listener(|this, _, _, cx| this.clear_chat(cx))),
                     ),
             );
@@ -953,7 +947,7 @@ impl Render for AiPanel {
         };
 
         // ---- messages ----
-        let mut messages = div().flex().flex_col().gap_2().p_3().w_full();
+        let mut messages = div().flex().flex_col().gap_3().px_4().py_4().w_full();
         if self.messages.is_empty() && !streaming {
             messages =
                 messages.child(div().text_sm().text_color(rgb(0x999999)).child(
@@ -1053,6 +1047,7 @@ impl Render for AiPanel {
                 IconName::ArrowUp
             })
             .small()
+            .primary()
             .on_click(cx.listener(move |this, _, _window, cx| {
                 if streaming_now {
                     this.stop_streaming(cx);
@@ -1101,8 +1096,8 @@ impl Render for AiPanel {
             .mt_1()
             .bg(rgb(0xffffff))
             .border_1()
-            .border_color(rgb(0xd6d4d0))
-            .rounded_md()
+            .border_color(rgb(0xe3e2df))
+            .rounded_lg()
             .child(Input::new(&self.input).appearance(false))
             .child(toolbar);
 
@@ -1630,22 +1625,24 @@ impl AiPanel {
                 // the status glyph distinguishes pending / done / failed.
                 let open = self.open_stream_steps.contains(&idx);
                 let body_text = tool_body_text(name, args, result, *error);
-                let (status, status_color) = if !*done {
-                    ("⏳", rgb(0x999999))
+                // Success stays silent — a long drawing session reads calmer
+                // without a column of green ticks. Only pending / failed mark.
+                let status = if !*done {
+                    Some(("…", rgb(0xaaaaaa)))
                 } else if *error {
-                    ("✕", rgb(0xc92a2a))
+                    Some(("✕", rgb(0xc92a2a)))
                 } else {
-                    ("✓", rgb(0x2f9e44))
+                    None
                 };
                 let (title, title_color) = tool_header(name, args);
                 step_toggle(
                     ElementId::named_usize("tool-toggle", idx),
                     format!("tool-header-{idx}"),
-                    None,
+                    Some(tool_op(name).glyph()),
                     title,
                     open,
                     title_color,
-                    Some(div().text_color(status_color).child(status)),
+                    status.map(|(g, c)| div().text_color(c).child(g)),
                     cx.listener(move |this, _, _, cx| {
                         if this.open_stream_steps.contains(&idx) {
                             this.open_stream_steps.remove(&idx);
@@ -1750,22 +1747,24 @@ impl AiPanel {
             } => {
                 let open = self.open_done_steps.contains(&key);
                 let body_text = tool_body_text(name, args, result, *error);
-                let (status, status_color) = if !*done {
-                    ("⏳", rgb(0x999999))
+                // Success stays silent — a long drawing session reads calmer
+                // without a column of green ticks. Only pending / failed mark.
+                let status = if !*done {
+                    Some(("…", rgb(0xaaaaaa)))
                 } else if *error {
-                    ("✕", rgb(0xc92a2a))
+                    Some(("✕", rgb(0xc92a2a)))
                 } else {
-                    ("✓", rgb(0x2f9e44))
+                    None
                 };
                 let (title, title_color) = tool_header(name, args);
                 step_toggle(
                     ElementId::named_usize("tool-toggle-done", msg_idx * 100000 + step_idx),
                     format!("tool-header-done-{msg_idx}-{step_idx}"),
-                    None,
+                    Some(tool_op(name).glyph()),
                     title,
                     open,
                     title_color,
-                    Some(div().text_color(status_color).child(status)),
+                    status.map(|(g, c)| div().text_color(c).child(g)),
                     cx.listener(move |this, _, _, cx| {
                         if this.open_done_steps.contains(&key) {
                             this.open_done_steps.remove(&key);
@@ -1814,16 +1813,6 @@ impl AiPanel {
         let is_user = msg.role == "user";
         let content = msg.content.clone();
         let steps = msg.normalized_steps();
-        let insert_button = if !is_user {
-            let content = content.clone();
-            Some(
-                panel_button("插入画布", false).on_click(cx.listener(move |this, _, _, cx| {
-                    this.insert_to_canvas(content.clone(), cx);
-                })),
-            )
-        } else {
-            None
-        };
 
         // For assistant messages with reasoning/tool steps, render them inside
         // a step bubble (same style as the streaming step) so the thinking
@@ -1831,10 +1820,35 @@ impl AiPanel {
         if !is_user && !steps.is_empty() {
             let mut step = div().flex().flex_col().gap_1().w_full().px_1().py_1();
 
-            // Render each step in order — no grouping. Each tool call is its
-            // own full-width expandable step, matching the streaming bubble.
-            for (i, item) in steps.iter().enumerate() {
-                step = step.child(self.render_done_step(idx, i, item, window, cx));
+            // Consecutive tool runs collapse into one quiet summary row
+            // ("画布操作 · 15 步") that expands to the individual steps —
+            // a long drawing session otherwise floods the conversation with
+            // near-identical rows. Single tools and other steps render as-is.
+            let mut i = 0;
+            let mut group_ord = 0usize;
+            while i < steps.len() {
+                let mut j = i;
+                if matches!(steps[i], super::client::AssistantStep::Tool { .. }) {
+                    while j < steps.len()
+                        && matches!(steps[j], super::client::AssistantStep::Tool { .. })
+                    {
+                        j += 1;
+                    }
+                }
+                if j - i >= 2 {
+                    step = step.child(self.render_tool_group(
+                        idx,
+                        group_ord,
+                        i,
+                        &steps[i..j],
+                        window,
+                        cx,
+                    ));
+                    group_ord += 1;
+                } else {
+                    step = step.child(self.render_done_step(idx, i, &steps[i], window, cx));
+                }
+                i = j.max(i + 1);
             }
 
             // Text response: render content as a final text block iff the steps
@@ -1856,15 +1870,59 @@ impl AiPanel {
                 );
             }
 
-            let mut col = div().flex().flex_col().gap_1().items_start();
-            col = col.child(step);
-            if let Some(extra) = insert_button {
-                col = col.child(extra);
-            }
-            return col.into_any_element();
+            return step.into_any_element();
         }
 
-        message_bubble(idx, &msg.role, content, insert_button, window, cx).into_any_element()
+        message_bubble(idx, &msg.role, content, window, cx).into_any_element()
+    }
+
+    /// Collapsed summary of a run of consecutive tool calls: one quiet row
+    /// ("画布操作 · N 步", red failure count when any) that expands to the
+    /// individual step rows. Keeps long drawing sessions readable.
+    fn render_tool_group(
+        &self,
+        msg_idx: usize,
+        group_ord: usize,
+        base_idx: usize,
+        steps: &[super::client::AssistantStep],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // Group keys live above any real step index in the same namespace.
+        let key = (msg_idx, 90_000 + group_ord);
+        let open = self.open_done_steps.contains(&key);
+        let errs = steps
+            .iter()
+            .filter(|s| matches!(s, super::client::AssistantStep::Tool { error: true, .. }))
+            .count();
+        let trailing =
+            (errs > 0).then(|| div().text_color(rgb(0xc92a2a)).child(format!("{errs} 失败")));
+        let body = open.then(|| {
+            let mut col = div().flex().flex_col().gap_1().pl_3();
+            for (n, item) in steps.iter().enumerate() {
+                col = col.child(self.render_done_step(msg_idx, base_idx + n, item, window, cx));
+            }
+            col
+        });
+        step_toggle(
+            ElementId::named_usize("tool-group-toggle", msg_idx * 100000 + group_ord),
+            format!("tool-group-header-{msg_idx}-{group_ord}"),
+            Some(IconName::Frame),
+            format!("画布操作 · {} 步", steps.len()),
+            open,
+            rgb(0x888888),
+            trailing,
+            cx.listener(move |this, _, _, cx| {
+                if this.open_done_steps.contains(&key) {
+                    this.open_done_steps.remove(&key);
+                } else {
+                    this.open_done_steps.insert(key);
+                }
+                cx.notify();
+            }),
+            body,
+        )
+        .into_any_element()
     }
 }
 
@@ -1872,7 +1930,6 @@ fn message_bubble(
     idx: usize,
     role: &str,
     content: String,
-    extra: Option<Stateful<Div>>,
     window: &mut Window,
     cx: &mut App,
 ) -> Div {
@@ -1893,7 +1950,7 @@ fn message_bubble(
             .max_w(px(360.0))
             .min_w_0()
             .child(TextView::markdown(id, content, window, cx).selectable(true))
-            .bg(rgb(0xdce8ff))
+            .bg(rgb(0xf0efec))
     } else {
         // AI messages: plain text, no card background/border — content flows
         // naturally (reasoning → tools → text) without a visual container.
@@ -1915,30 +1972,20 @@ fn message_bubble(
         col = col.items_start();
     }
     col = col.child(bubble);
-    if let Some(extra) = extra {
-        col = col.child(extra);
-    }
     col
 }
 
-fn panel_button(label: &'static str, active: bool) -> Stateful<Div> {
-    let mut b = div()
+/// Quiet header action: bare text that darkens on hover — no button chrome.
+fn header_action(label: &'static str) -> Stateful<Div> {
+    div()
         .id(label)
-        .flex()
-        .items_center()
-        .justify_center()
-        .h_7()
-        .px_2()
-        .rounded_md()
-        .text_sm()
+        .px_1()
+        .py(px(2.0))
+        .text_xs()
+        .text_color(rgb(0x908e8a))
+        .hover(|s| s.text_color(rgb(0x1e1e1e)))
         .cursor_pointer()
-        .child(label);
-    if active {
-        b = b.bg(rgb(0xdce8ff)).text_color(rgb(0x1a5fd7));
-    } else {
-        b = b.hover(|s| s.bg(rgb(0xefeeec)));
-    }
-    b
+        .child(label)
 }
 
 /// Map an internal rig tool name to a short Chinese label for the live status.
@@ -1994,18 +2041,6 @@ fn tool_op(name: &str) -> ToolOp {
 }
 
 impl ToolOp {
-    fn icon(&self) -> &'static str {
-        match self {
-            ToolOp::Add => "➕",
-            ToolOp::Update => "✎",
-            ToolOp::Delete => "🗑",
-            ToolOp::Clear => "🧹",
-            ToolOp::Query => "📋",
-            ToolOp::Config => "🎨",
-            ToolOp::Skill => "📖",
-            ToolOp::Other => "🔧",
-        }
-    }
     fn verb(&self) -> &'static str {
         match self {
             ToolOp::Add => "新增",
@@ -2018,16 +2053,23 @@ impl ToolOp {
             ToolOp::Other => "操作",
         }
     }
+    /// One neutral ink color for every operation: the verb in the title
+    /// already says what happened, and a rainbow of per-op colors reads as
+    /// noise in a long drawing session. Kept as a method so call sites stay.
     fn color(&self) -> Rgba {
+        rgb(0x555555)
+    }
+    /// Monochrome leading glyph per operation — a quiet visual anchor for
+    /// each step row now that the emoji icons are gone.
+    fn glyph(&self) -> IconName {
         match self {
-            ToolOp::Add => rgb(0x2f9e44),    // green
-            ToolOp::Update => rgb(0x1a5fd7), // blue
-            ToolOp::Delete => rgb(0xc92a2a), // red
-            ToolOp::Clear => rgb(0xc92a2a),  // red
-            ToolOp::Query => rgb(0x888888),  // gray
-            ToolOp::Config => rgb(0x1a5fd7),
-            ToolOp::Skill => rgb(0x7048e8), // violet: scenario-skill loading
-            ToolOp::Other => rgb(0x1a5fd7),
+            ToolOp::Add => IconName::Plus,
+            ToolOp::Update => IconName::Replace,
+            ToolOp::Delete | ToolOp::Clear => IconName::Delete,
+            ToolOp::Query => IconName::Search,
+            ToolOp::Config => IconName::Palette,
+            ToolOp::Skill => IconName::BookOpen,
+            ToolOp::Other => IconName::Settings2,
         }
     }
 }
@@ -2042,18 +2084,18 @@ fn tool_header(name: &str, args: &serde_json::Value) -> (String, Rgba) {
             let label = tool_label(name);
             let preview = tool_chip_preview(name, args);
             if preview.is_empty() {
-                format!("{} {}{}", op.icon(), op.verb(), label)
+                format!("{}{}", op.verb(), label)
             } else {
-                format!("{} {}{} {}", op.icon(), op.verb(), label, preview)
+                format!("{}{} {}", op.verb(), label, preview)
             }
         }
         ToolOp::Update => {
             let id = short_id(args);
             let change = update_change_preview(args);
             if change.is_empty() {
-                format!("{} {} #{}", op.icon(), op.verb(), id)
+                format!("{} #{}", op.verb(), id)
             } else {
-                format!("{} {} #{} {}", op.icon(), op.verb(), id, change)
+                format!("{} #{} {}", op.verb(), id, change)
             }
         }
         ToolOp::Delete if name == "delete_page" => {
@@ -2062,17 +2104,17 @@ fn tool_header(name: &str, args: &serde_json::Value) -> (String, Rgba) {
                 .and_then(|v| v.as_u64())
                 .map(|n| format!("第 {n} 页"))
                 .unwrap_or_else(|| "最后一页".to_string());
-            format!("{} {}{}", op.icon(), op.verb(), n)
+            format!("{}{}", op.verb(), n)
         }
-        ToolOp::Delete => format!("{} {} #{}", op.icon(), op.verb(), short_id(args)),
-        ToolOp::Clear => format!("{} {}画布", op.icon(), op.verb()),
-        ToolOp::Query => format!("{} {}元素", op.icon(), op.verb()),
+        ToolOp::Delete => format!("{} #{}", op.verb(), short_id(args)),
+        ToolOp::Clear => format!("{}画布", op.verb()),
+        ToolOp::Query => format!("{}元素", op.verb()),
         ToolOp::Skill => {
             let skill = args.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-            format!("{} 加载技能 {skill}", op.icon())
+            format!("加载技能 {skill}")
         }
         ToolOp::Config | ToolOp::Other => {
-            format!("{} {}{}", op.icon(), op.verb(), tool_label(name))
+            format!("{}{}", op.verb(), tool_label(name))
         }
     };
     (title, op.color())
@@ -2311,6 +2353,8 @@ fn step_toggle<B: IntoElement>(
                 .flex()
                 .items_center()
                 .justify_center()
+                // A shade lighter than the title: anchor, not competition.
+                .text_color(rgb(0x9a9894))
                 .child(gpui_component::Icon::new(name)),
         );
     }
@@ -2548,7 +2592,7 @@ mod tests {
     fn use_skill_step_shows_skill_name() {
         let args: serde_json::Value = serde_json::from_str(r#"{"name":"mindmap"}"#).unwrap();
         let (title, _) = tool_header("use_skill", &args);
-        assert_eq!(title, "📖 加载技能 mindmap");
+        assert_eq!(title, "加载技能 mindmap");
         let detail = tool_call_detail("use_skill", &args);
         assert!(detail.contains("mindmap"));
     }
@@ -2646,61 +2690,44 @@ mod tests {
 
     #[test]
     fn tool_header_distinguishes_add_update_delete_query() {
-        // Add: "➕ 新增矩形 (100,200)"
+        // Add: "新增矩形 (100,200)"
         let (title, _) = tool_header(
             "draw_rectangle",
             &serde_json::from_str(r#"{"x":100.0,"y":200.0,"w":10.0,"h":20.0}"#).unwrap(),
         );
-        assert_eq!(title, "➕ 新增矩形 (100,200)");
+        assert_eq!(title, "新增矩形 (100,200)");
 
         // Update carries the id + what changed (position, no arrow).
         let (title, _) = tool_header(
             "update_element",
             &serde_json::from_str(r#"{"id":"abc12345-aaaa-bbbb","x":5.0,"y":6.0}"#).unwrap(),
         );
-        assert_eq!(title, "✎ 修改 #abc12345 位置 (5,6)");
+        assert_eq!(title, "修改 #abc12345 位置 (5,6)");
 
         // Update of text only.
         let (title, _) = tool_header(
             "update_element",
             &serde_json::from_str(r#"{"id":"abc12345","text":"开始"}"#).unwrap(),
         );
-        assert_eq!(title, "✎ 修改 #abc12345 文字「开始」");
+        assert_eq!(title, "修改 #abc12345 文字「开始」");
 
         // Delete carries the id.
         let (title, _) = tool_header(
             "delete_element",
             &serde_json::from_str(r#"{"id":"abc12345-aaaa-bbbb"}"#).unwrap(),
         );
-        assert_eq!(title, "🗑 删除 #abc12345");
+        assert_eq!(title, "删除 #abc12345");
 
         // Query needs no args.
         let (title, _) = tool_header("list_elements", &serde_json::Value::Null);
-        assert_eq!(title, "📋 查询元素");
+        assert_eq!(title, "查询元素");
 
         // Clear canvas.
         let (title, _) = tool_header("clear_canvas", &serde_json::Value::Null);
-        assert_eq!(title, "🧹 清空画布");
+        assert_eq!(title, "清空画布");
         assert_eq!(tool_op("clear_canvas"), ToolOp::Clear);
     }
 
-    #[test]
-    fn tool_op_colors_differ_by_operation() {
-        // Add (green) != Update (blue) != Delete (red) != Query (gray).
-        assert_ne!(
-            tool_op("draw_rectangle").color(),
-            tool_op("update_element").color()
-        );
-        assert_ne!(
-            tool_op("draw_rectangle").color(),
-            tool_op("delete_element").color()
-        );
-        assert_ne!(
-            tool_op("draw_rectangle").color(),
-            tool_op("list_elements").color()
-        );
-        assert_eq!(tool_op("list_elements"), ToolOp::Query);
-    }
     #[test]
     fn compact_status_shows_latest_reasoning_even_after_text() {
         use super::super::client::AssistantStep;

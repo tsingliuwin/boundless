@@ -82,6 +82,8 @@ actions!(
         SendBackward,
         Quit,
         CheckForUpdates,
+        /// 关于：打开版本信息对话框（帮助菜单 / 应用菜单）。
+        About,
         GotoPrevPage,
         GotoNextPage,
         PresentStart,
@@ -384,6 +386,8 @@ pub struct BoardView {
     /// Whether the update confirm dialog is open (opened by clicking the
     /// title-bar download icon; restart only happens after the user confirms).
     update_dialog_open: bool,
+    /// Whether the about dialog (version info) is open.
+    about_open: bool,
     /// Per-element world-geometry cache (render/cache.rs): skips roughr
     /// generation and spline/ribbon rebuilds for unchanged elements. Pan/zoom
     /// never invalidates it; invalidation is by element fingerprint.
@@ -493,6 +497,7 @@ impl BoardView {
             chat_compact,
             update_state: crate::updater::UpdateState::default(),
             update_dialog_open: false,
+            about_open: false,
             render_cache: crate::render::cache::RenderCache::new(),
             text_cache: crate::render::cache::TextCache::new(),
             canvas_cache: crate::render::raster::CanvasCache::new(),
@@ -785,6 +790,12 @@ impl BoardView {
             cx.notify();
             return;
         }
+        // The about dialog absorbs Esc the same way.
+        if self.about_open {
+            self.about_open = false;
+            cx.notify();
+            return;
+        }
         // An open context menu absorbs Esc: close it instead of clearing the
         // selection / committing an edit.
         if self.context_menu.is_some() {
@@ -1049,44 +1060,6 @@ impl BoardView {
         } else {
             self.selection.clone()
         }
-    }
-
-    /// Add a text element with AI-generated content near the current
-    /// selection (or at the viewport center). Bounds are estimated here and
-    /// precisely measured during the next render.
-    pub fn insert_ai_text(&mut self, text: String, cx: &mut Context<Self>) {
-        let origin = if let Some(id) = self.selection.first() {
-            self.scene
-                .get(*id)
-                .map(|e| WPoint::new(e.bounds.x, e.bounds.bottom() + 24.0))
-        } else {
-            None
-        };
-        let origin = origin.unwrap_or_else(|| {
-            let center_screen = point(
-                self.canvas_bounds.origin.x + self.canvas_bounds.size.width * 0.5,
-                self.canvas_bounds.origin.y + self.canvas_bounds.size.height * 0.5,
-            );
-            let c = self
-                .camera
-                .screen_to_world(center_screen, self.canvas_origin());
-            WPoint::new(c.x - 150.0, c.y - 40.0)
-        });
-        self.history.record(&self.scene);
-        let mut el = self.new_text_element(origin, text);
-        // Rough estimate; render() refines with the real text system.
-        let lines = el.text().map(|t| t.lines().count()).unwrap_or(1).max(1);
-        let max_chars = el
-            .text()
-            .map(|t| t.lines().map(|l| l.chars().count()).max().unwrap_or(1))
-            .unwrap_or(1);
-        el.bounds.w = (max_chars as f64 * self.text_font_size).max(1.0);
-        el.bounds.h = lines as f64 * self.text_font_size * LINE_HEIGHT;
-        let id = self.scene.add(el);
-        self.pending_measure.push(id);
-        self.selection = vec![id];
-        self.mark_dirty();
-        cx.notify();
     }
 
     /// Apply a single AI drawing operation: translate the op into an element,
@@ -1536,7 +1509,7 @@ impl BoardView {
                     *wrap2 = wrap_width;
                 }
                 // Rough estimate; render() refines with the real text system,
-                // matching how insert_ai_text pre-sizes a new text element.
+                // the same pre-sizing a freshly created text element gets.
                 // With wrap_width the estimated width is capped so the
                 // pre-measure box approximates the wrapped layout.
                 let lines = el.text().map(|t| t.lines().count()).unwrap_or(1).max(1);
@@ -6918,6 +6891,10 @@ impl Render for BoardView {
             .on_action(cx.listener(|this, _: &CheckForUpdates, _window, cx| {
                 this.check_for_updates(cx, false)
             }))
+            .on_action(cx.listener(|this, _: &About, _window, cx| {
+                this.about_open = true;
+                cx.notify();
+            }))
             .on_action(cx.listener(|this, _: &GotoPrevPage, _window, cx| this.goto_prev_page(cx)))
             .on_action(cx.listener(|this, _: &GotoNextPage, _window, cx| this.goto_next_page(cx)))
             .on_action(cx.listener(|this, _: &PresentStart, window, cx| {
@@ -7013,6 +6990,7 @@ impl Render for BoardView {
             // Update confirm dialog paints above everything (menu bar
             // included); it's an explicit user-opened modal.
             .children(self.render_update_dialog(cx))
+            .children(self.render_about_dialog(cx))
     }
 }
 
@@ -8833,7 +8811,7 @@ impl BoardView {
                 card = card.child(context_menu_row(
                     "m-check-updates",
                     None,
-                    "检查更新…".into(),
+                    "检查更新".into(),
                     None,
                     true,
                     move |_, _, cx| {
@@ -8843,6 +8821,23 @@ impl BoardView {
                             cx.notify();
                         })
                         .ok();
+                    },
+                ));
+                let w_about = weak.clone();
+                card = card.child(context_menu_row(
+                    "m-about",
+                    None,
+                    "关于".into(),
+                    None,
+                    true,
+                    move |_, _, cx| {
+                        w_about
+                            .update(cx, |this, cx| {
+                                this.menubar_open = None;
+                                this.about_open = true;
+                                cx.notify();
+                            })
+                            .ok();
                     },
                 ));
             }
@@ -9448,6 +9443,91 @@ impl BoardView {
                         )
                         .child(
                             div().flex().flex_row().justify_end().gap_2().mt_1().child(buttons),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// About dialog: name, version and license — the only in-app place to
+    /// read the running version. Opened from 帮助 → 关于 (and the app menu);
+    /// Esc or a backdrop click closes it, same as the update dialog.
+    fn render_about_dialog(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.about_open {
+            return None;
+        }
+        let weak = cx.weak_entity();
+        let version = env!("CARGO_PKG_VERSION");
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .bg(gpui::black().opacity(0.28))
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.about_open = false;
+                    cx.notify();
+                }))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        // Clicks inside the card never reach the backdrop.
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .w(px(380.0))
+                        .bg(rgb(0xffffff))
+                        .border_1()
+                        .border_color(rgb(0xe3e2df))
+                        .rounded_lg()
+                        .shadow_lg()
+                        .p_4()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("无界白板"),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(0x666666))
+                                .child(format!("版本 v{version}")),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(0x666666))
+                                .child("无限手绘白板 —— AI 智能体直接在画布上作画。"),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(0x666666))
+                                .child("以 AGPL-3.0 许可证开源。"),
+                        )
+                        .child(
+                            div().flex().flex_row().justify_end().mt_1().child(
+                                div()
+                                    .id("about-ok")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(rgb(0xf1f0ee))
+                                    .hover(|s| s.bg(rgb(0xebeaea)))
+                                    .cursor_pointer()
+                                    .text_sm()
+                                    .text_color(rgb(0x1e1e1e))
+                                    .on_click(move |_, _, cx| {
+                                        let _ = weak.update(cx, |this, cx| {
+                                            this.about_open = false;
+                                            cx.notify();
+                                        });
+                                    })
+                                    .child("知道了"),
+                            ),
                         ),
                 )
                 .into_any_element(),
