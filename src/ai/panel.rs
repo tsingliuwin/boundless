@@ -910,7 +910,7 @@ impl Render for AiPanel {
                 div()
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child("AI 创作助手"),
+                    .child("AI无界"),
             )
             .child(
                 div()

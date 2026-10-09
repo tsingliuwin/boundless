@@ -1116,7 +1116,7 @@ pub fn outside_runs(
     let mut runs: Vec<(Vec<WPoint>, Vec<f64>)> = Vec::new();
     let mut cur_pts: Vec<WPoint> = Vec::new();
     let mut cur_w: Vec<f64> = Vec::new();
-    let mut close = |runs: &mut Vec<(Vec<WPoint>, Vec<f64>)>,
+    let close = |runs: &mut Vec<(Vec<WPoint>, Vec<f64>)>,
                      pts: &mut Vec<WPoint>,
                      ws: &mut Vec<f64>| {
         if pts.len() >= 2 {

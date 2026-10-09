@@ -354,7 +354,7 @@ pub fn apply(
         }
         CanvasOp::Polygon {
             points,
-            smooth,
+            smooth: _,
             style,
         } => {
             if points.len() < 3 || points.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {

@@ -490,7 +490,7 @@ impl BoardView {
             explorer_rename_input,
             explorer_hover: None,
             explorer_sessions: HashMap::new(),
-            chat_compact: true,
+            chat_compact,
             update_state: crate::updater::UpdateState::default(),
             update_dialog_open: false,
             render_cache: crate::render::cache::RenderCache::new(),
@@ -531,9 +531,11 @@ impl BoardView {
         }
         // The conversation is on by default: open it on start (in the user's
         // mode) unless they explicitly closed it last session. This also
-        // persists the open state via toggle_ai_panel.
+        // persists the open state via open_ai_panel.
         if chat_open {
-            view.toggle_ai_panel(window, cx);
+            // The camera was just restored from the board file, framed with
+            // the panel in exactly this saved mode — open without panning.
+            view.open_ai_panel(false, window, cx);
         }
         // Autosave ticker: while a board with a workspace file is dirty,
         // write it out every 1.5s (the file is always writeable — no dialog
@@ -1258,7 +1260,7 @@ impl BoardView {
                 })?;
                 let w = width.unwrap_or(320.0).clamp(20.0, 4000.0);
                 let h = w * ih / iw;
-                let vis = self.visible_world_bounds();
+                let vis = self.visible_world_bounds(cx);
                 let x = x.unwrap_or(vis.center().x - w / 2.0);
                 let y = y.unwrap_or(vis.center().y - h / 2.0);
                 self.history.record(&self.scene);
@@ -1290,7 +1292,7 @@ impl BoardView {
             } => {
                 let w = w.unwrap_or(480.0).clamp(80.0, 2000.0);
                 let h = h.unwrap_or(320.0).clamp(80.0, 2000.0);
-                let vis = self.visible_world_bounds();
+                let vis = self.visible_world_bounds(cx);
                 let x = x.unwrap_or(vis.center().x - w / 2.0);
                 let y = y.unwrap_or(vis.center().y - h / 2.0);
                 let origin = WPoint::new(x, y);
@@ -2305,24 +2307,35 @@ impl BoardView {
             // applies while the user hasn't turned it off).
             self.workspace.set_chat_prefs(false, self.chat_compact);
         } else {
-            // Opening: the right-docked panel overlays the canvas, so the
-            // visible canvas center jumps left by w/2. Pan the camera to
-            // follow it, keeping whatever was centered still centered in the
-            // (narrower) visible area - otherwise the focal content can end up
-            // hidden behind the panel. Excalidraw does the same. Zoom is left
-            // untouched (no need to fit + restore 100%). The compact bar
-            // floats at the bottom and doesn't displace the canvas center.
-            let weak = cx.weak_entity();
-            let active_board = self.active_board_key();
-            let compact = self.chat_compact;
-            let panel = cx.new(|cx| AiPanel::new(weak, active_board, compact, window, cx));
-            if !compact {
-                let w = panel.read(cx).width();
-                self.camera.pan_by_screen(px(-w / 2.0), px(0.0));
-            }
-            self.ai_panel = Some(panel);
-            self.workspace.set_chat_prefs(true, self.chat_compact);
+            self.open_ai_panel(true, window, cx);
         }
+        cx.notify();
+    }
+
+    /// Open the AI panel in the saved display mode. `compensate` pans the
+    /// camera half the docked width so whatever was centered stays centered
+    /// in the narrower visible area — right for a mid-session toggle, where
+    /// the camera is framed for the panel-less view; wrong on startup, where
+    /// the camera was just restored from the board file, already framed with
+    /// the panel in exactly this mode.
+    fn open_ai_panel(&mut self, compensate: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // Opening: the right-docked panel overlays the canvas, so the
+        // visible canvas center jumps left by w/2. Pan the camera to
+        // follow it, keeping whatever was centered still centered in the
+        // (narrower) visible area - otherwise the focal content can end up
+        // hidden behind the panel. Excalidraw does the same. Zoom is left
+        // untouched (no need to fit + restore 100%). The compact bar
+        // floats at the bottom and doesn't displace the canvas center.
+        let weak = cx.weak_entity();
+        let active_board = self.active_board_key();
+        let compact = self.chat_compact;
+        let panel = cx.new(|cx| AiPanel::new(weak, active_board, compact, window, cx));
+        if compensate && !compact {
+            let w = panel.read(cx).width();
+            self.camera.pan_by_screen(px(-w / 2.0), px(0.0));
+        }
+        self.ai_panel = Some(panel);
+        self.workspace.set_chat_prefs(true, self.chat_compact);
         cx.notify();
     }
 
@@ -2824,7 +2837,7 @@ impl BoardView {
             .store(bytes, ext)
             .map_err(|e| anyhow::anyhow!("写入图片资源失败: {e}"))?;
 
-        let vis = self.visible_world_bounds();
+        let vis = self.visible_world_bounds(cx);
         let (w, h) = fit_image(iw, ih, vis.w * 0.45, vis.h * 0.45);
         let x = vis.center().x - w / 2.0;
         let y = vis.center().y - h / 2.0;
@@ -2857,13 +2870,16 @@ impl BoardView {
 
     /// World-space rect of the visible canvas (with a small margin), shared
     /// by zoom-reset fitting and image insertion placement.
-    fn visible_world_bounds(&self) -> WBounds {
+    fn visible_world_bounds(&self, cx: &mut Context<Self>) -> WBounds {
         let origin = self.canvas_origin();
-        let vp = self.canvas_bounds.size;
-        let tl = self.camera.screen_to_world(point(origin.x, origin.y), origin);
-        let br = self
-            .camera
-            .screen_to_world(point(origin.x + vp.width, origin.y + vp.height), origin);
+        // viewport_bounds 已扣除左侧目录内缩与右侧停靠的 AI 面板：AI 的默认
+        // 落点会居中在用户真正看得见的区域，不会藏到面板后面。
+        let vp = self.viewport_bounds(cx);
+        let tl = self.camera.screen_to_world(vp.origin, origin);
+        let br = self.camera.screen_to_world(
+            point(vp.origin.x + vp.size.width, vp.origin.y + vp.size.height),
+            origin,
+        );
         WBounds::from_corners(tl, br)
     }
 
@@ -2871,7 +2887,7 @@ impl BoardView {
     /// 世界单位，上限为可见范围的 60%）。插入后自动选中，样式栏随即
     /// 给出水彩/钢笔/飞白笔刷选择。
     fn insert_canvas(&mut self, cx: &mut Context<Self>) {
-        let vis = self.visible_world_bounds();
+        let vis = self.visible_world_bounds(cx);
         let w = 480.0_f64.min(vis.w * 0.6).max(120.0);
         let h = 320.0_f64.min(vis.h * 0.6).max(80.0);
         let (x, y) = (vis.center().x - w / 2.0, vis.center().y - h / 2.0);
@@ -7606,6 +7622,24 @@ impl BoardView {
         ];
 
         let mut bar = bar_container();
+        // 白板（目录面板）开关居首：面板停靠在左侧，开关放工具栏最左端；
+        // 面板打开后工具栏整体右移，按钮恰好贴着面板右缘。
+        let weak_explorer = weak.clone();
+        let explorer_active = self.explorer_open;
+        bar = bar
+            .child(
+                bar_icon_button(
+                    "白板",
+                    explorer_active,
+                    ic::explorer(icon_color(explorer_active)),
+                )
+                .on_click(move |_, _, cx| {
+                    weak_explorer
+                        .update(cx, |this, cx| this.toggle_explorer(cx))
+                        .ok();
+                }),
+            )
+            .child(div().w(px(1.0)).h_5().bg(rgb(0xe3e2df)).mx_1());
         // Whether a modifier is held that would trigger a temporary gesture —
         // used to highlight Hand (Ctrl) / Pen (Shift) even before the button is
         // pressed, for immediate visual feedback. Ignored while editing text.
@@ -7665,9 +7699,7 @@ impl BoardView {
         let weak_save = weak.clone();
         let weak_open = weak.clone();
         let weak_ai = weak.clone();
-        let weak_explorer = weak.clone();
         let ai_active = self.ai_panel.is_some();
-        let explorer_active = self.explorer_open;
         bar = bar
             .child(div().w(px(1.0)).h_5().bg(rgb(0xe3e2df)).mx_1())
             .child(
@@ -7698,19 +7730,6 @@ impl BoardView {
                         weak_open.update(cx, |this, cx| this.open(window, cx)).ok();
                     },
                 ),
-            )
-            .child(div().w(px(1.0)).h_5().bg(rgb(0xe3e2df)).mx_1())
-            .child(
-                bar_icon_button(
-                    "白板",
-                    explorer_active,
-                    ic::explorer(icon_color(explorer_active)),
-                )
-                .on_click(move |_, _, cx| {
-                    weak_explorer
-                        .update(cx, |this, cx| this.toggle_explorer(cx))
-                        .ok();
-                }),
             )
             .child(
                 bar_icon_button("AI", ai_active, ic::ai(icon_color(ai_active))).on_click(
@@ -9547,15 +9566,4 @@ fn paper_tile(kind: PaperTexture) -> std::sync::Arc<RenderImage> {
     let image =
         image::RgbaImage::from_raw(N as u32, N as u32, buf).expect("paper tile buffer size");
     std::sync::Arc::new(RenderImage::new(vec![image::Frame::new(image)]))
-}
-
-fn pen_brush_visible(board: &BoardView) -> bool {
-    board.tool == ActiveTool::Pen
-        || board.temp_pen
-        || board.selection.iter().any(|id| {
-            board
-                .scene
-                .get(*id)
-                .is_some_and(|e| matches!(e.kind, ElementKind::Freedraw { .. }))
-        })
 }

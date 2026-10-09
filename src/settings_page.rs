@@ -281,7 +281,7 @@ impl SettingsPage {
                                     .child("AI 模型"),
                             )
                             .child(div().text_sm().text_color(rgb(0x777777)).child(
-                                "配置 OpenAI 兼容接口，AI 助手通过它调用模型、在画布上直接创作。",
+                                "配置 OpenAI 兼容接口，AI无界通过它调用模型、在画布上直接创作。",
                             )),
                     )
                     .child(field_row("Base URL", &self.base_url_input))

@@ -334,30 +334,6 @@ fn shadow_transform(
         .collect()
 }
 
-/// Translate every point of a Bézier path by (dx, dy).
-fn translate_bez(bez: &kurbo::BezPath, dx: f64, dy: f64) -> kurbo::BezPath {
-    bez.iter()
-        .map(|el| match el {
-            kurbo::PathEl::MoveTo(p) => {
-                kurbo::PathEl::MoveTo(kurbo::Point::new(p.x + dx, p.y + dy))
-            }
-            kurbo::PathEl::LineTo(p) => {
-                kurbo::PathEl::LineTo(kurbo::Point::new(p.x + dx, p.y + dy))
-            }
-            kurbo::PathEl::QuadTo(c, p) => kurbo::PathEl::QuadTo(
-                kurbo::Point::new(c.x + dx, c.y + dy),
-                kurbo::Point::new(p.x + dx, p.y + dy),
-            ),
-            kurbo::PathEl::CurveTo(c1, c2, p) => kurbo::PathEl::CurveTo(
-                kurbo::Point::new(c1.x + dx, c1.y + dy),
-                kurbo::Point::new(c2.x + dx, c2.y + dy),
-                kurbo::Point::new(p.x + dx, p.y + dy),
-            ),
-            other => other.clone(),
-        })
-        .collect()
-}
-
 /// Closed Catmull-Rom spline through `pts` as a cubic Bézier path — the
 /// smooth organic outline behind the AI's blob/curve shapes.
 fn closed_catmull_rom_bez(pts: &[WPoint]) -> kurbo::BezPath {
@@ -615,7 +591,7 @@ fn rough_shape(
                         continue;
                     }
                     let mut current: Vec<kurbo::PathEl> = Vec::new();
-                    let mut flush = |line: &mut Vec<kurbo::PathEl>, out: &mut Vec<RoughOpSet>| {
+                    let flush = |line: &mut Vec<kurbo::PathEl>, out: &mut Vec<RoughOpSet>| {
                         let ys: Vec<f64> = line
                             .iter()
                             .filter_map(|el| match el {
