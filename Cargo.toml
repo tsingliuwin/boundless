@@ -5,7 +5,7 @@ edition = "2021"
 description = "A boundless Excalidraw-style whiteboard built on GPUI, with a rig-powered AI agent that draws directly onto the canvas"
 
 [dependencies]
-gpui = "0.2.2"
+gpui = { version = "=0.3.8", package = "gpui-pre" }
 ropey = "1"
 serde = { version = "1", features = ["derive"] }
 image = "0.25"
@@ -27,14 +27,17 @@ futures = "0.3"
 futures-util = "0.3"
 dirs = "6"
 rfd = "0.15"
-# GPUI component library (Input, Button, etc.). The crates.io 0.5 release
-# depends on gpui ^0.2.2 - the same version this project uses - so no GPUI
-# source change is needed.
-gpui-component = "0.5"
-# Embedded SVG icon assets for gpui-component's IconName enum. The git tag
-# matches the crates.io release; the crate itself only depends on gpui's
-# AssetSource trait and embeds icons via rust_embed.
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", tag = "v0.5.1" }
+# GPUI Kit component library (Input, Button, etc.) — 0.7 ecosystem:
+# gpui (zed snapshot, crates.io name gpui-pre) + gpui-base + this crate.
+# Assets ship as gpui-kit-assets, pulled in directly for with_assets().
+gpui-component = "0.7.1"
+gpui-kit-assets = "0.7.1"
+# Platform backend factory (gpui_platform::application()) — the 0.7 ecosystem
+# dropped Application::new(); desktop apps build via this crate instead.
+gpui-platform = { version = "=0.3.8", package = "gpui-pre-platform", features = [
+    "font-kit",
+    "runtime_shaders",
+] }
 # rig drives the AI agent: an OpenAI-compatible client, multi-turn tool-calling
 # loop, and streaming. The `derive` feature pulls in `rig-derive` (and schemars)
 # so tool argument types can derive their JSON schema.
@@ -52,13 +55,10 @@ schemars = "1"
 # minisign-verify: verify downloaded artifacts against an embedded public key.
 # semver: compare manifest version vs env!(CARGO_PKG_VERSION).
 # zip: extract the Windows bare-exe artifact.
-# flate2 + tar: extract the macOS .app.tar.gz bundle (preserves unix perms).
-# semver/flate2 already exist transitively; listed directly for the updater.
+# (flate2 + tar are macOS-only — see the target section below.)
 minisign-verify = "0.2"
 semver = "1"
 zip = "2"
-flate2 = "1"
-tar = "0.4"
 
 # Win32 interop: GPUI updates the *cached* cursor style on a modifier change,
 # but on Windows the system cursor only refreshes on WM_SETCURSOR (mouse move).
@@ -89,6 +89,10 @@ raw-window-handle = "0.6"
 # graph. Target-gated; no-op on other platforms.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"
+# Extract the macOS .app.tar.gz update bundle (preserves unix perms);
+# target-gated so other platforms don't carry (or warn about) them.
+flate2 = "1"
+tar = "0.4"
 
 # Windows application icon embedding (see build.rs). Pinned to the version that
 # already exists in Cargo.lock so we don't introduce a new dependency.
@@ -132,9 +136,7 @@ strip = true
 # release binary.
 minisign = "0.9.1"
 
-# Vendored gpui 0.2.2 (crates.io source, pruned examples/docs) with one local
-# patch: trackpad pinch (NSEventTypeMagnify) is synthesized into a cmd+scroll
-# so the canvas can zoom at the cursor — stock 0.2.2 drops the gesture. See
-# vendor/gpui/src/platform/mac/events.rs.
-[patch.crates-io]
-gpui = { path = "vendor/gpui" }
+# Vendored gpui macOS patch retired with the gpui-pre rename: the old patch
+# (vendor/gpui, trackpad pinch -> cmd+scroll synth) targeted gpui 0.2.2 by
+# crate name and no longer applies. Re-port to the gpui-pre snapshot if
+# trackpad pinch-zoom regresses on macOS.

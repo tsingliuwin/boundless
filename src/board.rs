@@ -406,7 +406,7 @@ pub struct BoardView {
 impl BoardView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
-        window.focus(&focus_handle);
+        window.focus(&focus_handle, cx);
         // Windows Ink: subclass the window to observe WM_POINTER packets so
         // the ink pipeline gets real stylus pressure and the eraser tip.
         // Idempotent; no-op on other platforms.
@@ -2926,6 +2926,10 @@ impl BoardView {
                     }
                     return;
                 }
+                ClipboardEntry::ExternalPaths(_) => {
+                    // Dragged-in file lists aren't paste-able images; ignore
+                    // (file drops have their own handler).
+                }
                 ClipboardEntry::String(s) => {
                     let t = s.text().trim();
                     if !t.is_empty() && t.starts_with('/') {
@@ -3799,6 +3803,9 @@ impl BoardView {
                         let double_click = match event {
                             ClickEvent::Mouse(click) => click.up.click_count > 1,
                             ClickEvent::Keyboard(_) => false,
+                            // Touch taps don't carry a click count; treat as
+                            // single (toggle), never the double-click open.
+                            ClickEvent::Touch(_) => false,
                         };
                         if has_sessions && !double_click {
                             if !this.explorer_expanded.remove(&rel_open) {
@@ -4337,7 +4344,7 @@ impl BoardView {
         if self.over_explorer(event.position) {
             return;
         }
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         let world = self.to_world(event.position);
 
         // While editing: clicks inside the text move the caret; outside commits.
@@ -6711,6 +6718,7 @@ impl Render for BoardView {
                                 );
                                 let _ = window.paint_image(
                                     Bounds::new(origin, size(ts, ts)),
+                                    Bounds::new(origin, size(ts, ts)),
                                     gpui::Corners::all(px(0.0)),
                                     tile.clone(),
                                     0,
@@ -6733,6 +6741,7 @@ impl Render for BoardView {
                     // Raster canvas surfaces paint in this same layer.
                     for item in &paint.images {
                         let _ = window.paint_image(
+                            item.bounds,
                             item.bounds,
                             gpui::Corners::all(px(0.0)),
                             item.image.clone(),
@@ -7004,7 +7013,9 @@ fn paint_text_item(item: &TextPaintItem, window: &mut Window, cx: &mut App) {
             item.origin.x + item.line_offsets.get(i).copied().unwrap_or(px(0.0)),
             item.origin.y + item.line_height * i as f32,
         );
-        let _ = line.line.paint(origin, item.line_height, window, cx);
+        let _ = line
+            .line
+            .paint(origin, item.line_height, gpui::TextAlign::Left, None, window, cx);
     }
 }
 

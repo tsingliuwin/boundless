@@ -86,8 +86,8 @@ fn main() {
     install_panic_hook();
     boundless::platform::install_crash_logger();
 
-    Application::new()
-        .with_assets(gpui_component_assets::Assets)
+    gpui_platform::application()
+        .with_assets(gpui_kit_assets::Assets)
         .run(|cx: &mut App| {
             // Initialize the gpui-component theme and global state. Must be called
             // early so Input/Button/etc. have their styling ready before the first
@@ -210,10 +210,12 @@ fn main() {
                 // no standard about-panel API.)
                 Menu {
                     name: "Boundless".into(),
+                    disabled: false,
                     items: vec![MenuItem::action("退出 Boundless", Quit)],
                 },
                 Menu {
                     name: "文件".into(),
+                    disabled: false,
                     items: vec![
                         MenuItem::action("打开场景…", OpenScene),
                         MenuItem::action("保存场景", SaveScene),
@@ -223,6 +225,7 @@ fn main() {
                 },
                 Menu {
                     name: "帮助".into(),
+                    disabled: false,
                     items: vec![
                         MenuItem::action("检查更新", CheckForUpdates),
                         MenuItem::action("关于", About),

@@ -12,7 +12,7 @@ use futures::StreamExt;
 use gpui::prelude::*;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::input::{InputEvent, Textarea, TextareaState};
 use gpui_component::text::TextView;
 use gpui_component::{Icon, IconName, Sizable};
 
@@ -63,7 +63,7 @@ pub struct AiPanel {
     streaming: Option<StreamingState>,
     error: Option<String>,
     /// Multi-line chat input (auto-grow 3..8 lines) — the docked panel's.
-    input: Entity<InputState>,
+    input: Entity<TextareaState>,
     /// The compact bar's input: auto-grow 1..4 lines. At rest the bar is a
     /// one-line pill; typing more lines grows it (up to 4), and beyond that
     /// the input scrolls in place. (Pin-the-height + rely on internal scroll
@@ -72,7 +72,7 @@ pub struct AiPanel {
     /// content height, concludes everything is visible, and never scrolls —
     /// only the first line shows.) Separate from `input` because its
     /// min-rows differ; drafts are carried across on mode switches.
-    compact_input: Entity<InputState>,
+    compact_input: Entity<TextareaState>,
     /// Transient panel-level notice (e.g. session save/load failures). Shown
     /// as a slim dismissible bar under the header.
     notice: Option<String>,
@@ -160,17 +160,17 @@ impl AiPanel {
     ) -> Self {
         let settings = AiSettings::load();
 
-        // Chat input: multi-line, auto-grow 3..8 lines.
+        // Chat input: multi-line, auto-grow 3..8 lines. 0.7 moved multi-line
+        // editing onto TextareaState (InputState is single-line only).
         let input = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 .placeholder("给 AI 发送消息…")
-                .multi_line(true)
                 .auto_grow(3, 8)
         });
         // Compact bar's input: auto-grow from one line (keeps the pill slim
         // at rest) up to 4 lines; longer content scrolls inside.
         let compact_input = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 .placeholder("给 AI 发送消息…")
                 .auto_grow(1, 4)
         });
@@ -180,7 +180,7 @@ impl AiPanel {
         for input in [&input, &compact_input] {
             subscriptions.push(
                 cx.subscribe(input, |this, _entity, event: &InputEvent, cx| {
-                    if let InputEvent::PressEnter { secondary } = event {
+                    if let InputEvent::PressEnter { secondary, .. } = event {
                         if !secondary {
                             this.send_message(cx);
                         }
@@ -304,7 +304,7 @@ impl AiPanel {
     }
 
     /// The input entity for the currently visible mode.
-    fn active_input(&self) -> &Entity<InputState> {
+    fn active_input(&self) -> &Entity<TextareaState> {
         if self.compact {
             &self.compact_input
         } else {
@@ -1098,7 +1098,7 @@ impl Render for AiPanel {
             .border_1()
             .border_color(rgb(0xe3e2df))
             .rounded_lg()
-            .child(Input::new(&self.input).appearance(false))
+            .child(Textarea::new(&self.input))
             .child(toolbar);
 
         // --- Resizable left edge ---
@@ -1426,7 +1426,7 @@ impl AiPanel {
                     // gpui-component gives the input root a default 8px
                     // vertical padding (input_py); without zeroing it the
                     // text line paints 8px low inside the pill.
-                    .child(Input::new(&self.compact_input).appearance(false).py_0()),
+                    .child(Textarea::new(&self.compact_input).py_0()),
             )
             .child(
                 div()
@@ -1682,8 +1682,6 @@ impl AiPanel {
                             TextView::markdown(
                                 ElementId::named_usize("ai-stream-text", idx),
                                 text.clone(),
-                                window,
-                                cx,
                             )
                             .selectable(true),
                         )
@@ -1794,8 +1792,6 @@ impl AiPanel {
                     TextView::markdown(
                         ElementId::named_usize("ai-msg-text", msg_idx * 100000 + step_idx),
                         text.clone(),
-                        window,
-                        cx,
                     )
                     .selectable(true),
                 )
@@ -1864,8 +1860,7 @@ impl AiPanel {
                 // collide with a plain message index.
                 step = step.child(
                     div().text_sm().child(
-                        TextView::markdown(("ai-msg-content", idx), content, window, cx)
-                            .selectable(true),
+                        TextView::markdown(("ai-msg-content", idx), content).selectable(true),
                     ),
                 );
             }
@@ -1873,7 +1868,7 @@ impl AiPanel {
             return step.into_any_element();
         }
 
-        message_bubble(idx, &msg.role, content, window, cx).into_any_element()
+        message_bubble(idx, &msg.role, content).into_any_element()
     }
 
     /// Collapsed summary of a run of consecutive tool calls: one quiet row
@@ -1926,13 +1921,7 @@ impl AiPanel {
     }
 }
 
-fn message_bubble(
-    idx: usize,
-    role: &str,
-    content: String,
-    window: &mut Window,
-    cx: &mut App,
-) -> Div {
+fn message_bubble(idx: usize, role: &str, content: String) -> Div {
     let is_user = role == "user";
     let id = if is_user {
         ElementId::named_usize("ai-msg-user", idx)
@@ -1949,7 +1938,7 @@ fn message_bubble(
             .text_sm()
             .max_w(px(360.0))
             .min_w_0()
-            .child(TextView::markdown(id, content, window, cx).selectable(true))
+            .child(TextView::markdown(id, content).selectable(true))
             .bg(rgb(0xf0efec))
     } else {
         // AI messages: plain text, no card background/border — content flows
@@ -1960,7 +1949,7 @@ fn message_bubble(
             .text_sm()
             .w_full()
             .min_w_0()
-            .child(TextView::markdown(id, content, window, cx).selectable(true))
+            .child(TextView::markdown(id, content).selectable(true))
     };
     let mut col = div().flex().flex_col().gap_1();
     // User messages: bubble aligns right (items_end prevents the default
@@ -2201,7 +2190,7 @@ fn contained_scroll(
     let dy = if delta.y != px(0.0) { delta.y } else { delta.x };
     let old = handle.offset();
     let max = handle.max_offset();
-    let new_y = (old.y + dy).clamp(-max.height, px(0.0));
+    let new_y = (old.y + dy).clamp(-max.y, px(0.0));
     if new_y != old.y {
         handle.set_offset(point(old.x, new_y));
         cx.stop_propagation();
@@ -2271,8 +2260,6 @@ fn styled_body(
                 TextView::markdown(
                     ElementId::named_usize(format!("{base_id}-text"), index),
                     text,
-                    window,
-                    cx,
                 )
                 .selectable(true),
             ),

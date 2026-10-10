@@ -1,0 +1,4 @@
+# gpui-pre (Zed snapshots) uses unstable std::hint::cold_path, so the whole
+# workspace builds on nightly. CI workflows install the matching channel.
+[toolchain]
+channel = "nightly"
