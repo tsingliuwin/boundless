@@ -5366,9 +5366,9 @@ impl BoardView {
         }
     }
 
-    fn on_scroll_wheel(
+    fn on_scroll(
         &mut self,
-        event: &ScrollWheelEvent,
+        event: &ScrollEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -6974,7 +6974,7 @@ impl Render for BoardView {
                 }))
             })
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
+            .on_scroll(cx.listener(Self::on_scroll))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .when_some(menubar, |d, bar| d.child(bar))

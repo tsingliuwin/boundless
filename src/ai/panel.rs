@@ -2141,10 +2141,11 @@ enum StyledBodyKind {
 /// inner box is at its limit — or has no overflow — the event falls through
 /// and the outer area scrolls as usual.
 ///
-/// Custom `on_scroll_wheel` listeners are registered after the element's
+/// Custom `on_scroll` listeners are registered after the element's
 /// built-in scroll listener and therefore run before it in the bubble phase,
-/// so this applies the scroll itself and then stops the event. Mirrors
-/// gpui-component's `InputState::on_scroll_wheel`.
+/// so this applies the scroll itself and then stops the event. Mirrors the
+/// nested-scroll fallthrough behavior of gpui-component's input scroll
+/// handling (pre-0.9 `InputState::on_scroll_wheel`).
 ///
 /// `notify` is the panel's EntityId, captured at render time. Do NOT use
 /// `window.current_view()` here instead: it unwraps the render-stack, which
@@ -2154,7 +2155,7 @@ enum StyledBodyKind {
 fn contained_scroll(
     handle: &ScrollHandle,
     notify: EntityId,
-    event: &ScrollWheelEvent,
+    event: &ScrollEvent,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -2221,7 +2222,7 @@ fn styled_body(
         .max_h(px(STEP_BODY_MAX_H))
         .overflow_y_scroll()
         .track_scroll(&scroll)
-        .on_scroll_wheel(move |event, window, cx| {
+        .on_scroll(move |event, window, cx| {
             contained_scroll(&wheel, notify, event, window, cx)
         })
         .text_xs()
@@ -2269,7 +2270,7 @@ fn plain_body(
         .max_h(px(STEP_BODY_MAX_H))
         .overflow_y_scroll()
         .track_scroll(scroll)
-        .on_scroll_wheel(move |event, window, cx| {
+        .on_scroll(move |event, window, cx| {
             contained_scroll(&wheel, notify, event, window, cx)
         })
         .text_xs()
