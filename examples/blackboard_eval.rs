@@ -10,7 +10,6 @@
 //! Exit code: 0 = 达标, 1 = 未达标, 2 = 运行失败（配置/网络等）。
 
 use boundless::ai::agent::{AgentEvent, BoundlessAgent};
-use boundless::ai::canvas_ops::CanvasOp;
 use boundless::ai::eval;
 use boundless::ai::settings::AiSettings;
 use futures::StreamExt;

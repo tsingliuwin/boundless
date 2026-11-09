@@ -20,8 +20,8 @@ Excalidraw 风格的无限手绘白板，AI 智能体直接在画布上作画。
 ## 特性
 
 **手绘画板**
-- 全套工具：画笔（压感）、矩形、菱形、椭圆、箭头、直线、文本、橡皮、抓手，单键切换（`P R D O A L T E H`）
-- 手绘渲染：rough 风格抖动线条，排线/水彩/密实/干刷多种填充，画布表面预设（白板/黑板/宣纸…），支持真渐变填充与无边框样式
+- 全套工具：选择、画笔（压感）、矩形、菱形、椭圆、箭头、直线、文本、橡皮、抓手，单键切换（`V P R D O A L T E H`）
+- 手绘渲染：rough 风格抖动线条，排线/密排/整块/水彩/渐变五种填充，画布表面预设（白板/黑板/宣纸…），支持自上而下渐变与无边框样式
 - 中文手绘风：内嵌小赖字体，全场景手写体渲染
 - 数位笔压感（Windows WM_POINTER）、触摸板捏合缩放、平滑与墨迹收集管线
 - 撤销/重做、层级调整、多页面 + 页面栏、工作区资源管理器与自动保存
@@ -56,15 +56,15 @@ Excalidraw 风格的无限手绘白板，AI 智能体直接在画布上作画。
 
 ## 从源码构建
 
-需要 Rust stable（edition 2021）。
+需要 **Rust nightly**（版本见 [rust-toolchain.toml](rust-toolchain.toml)）：GPUI 的 `gpui-pre` 快照用了 unstable 的 `std::hint::cold_path`，stable 工具链编译不过。
 
 ```sh
 cargo run              # 开发构建
-cargo test             # 单元测试
+cargo test             # 单元 + 集成测试
 cargo build --release  # 发布构建
 ```
 
-- GPUI 以 vendored 方式内嵌（`vendor/gpui`），带一个本地补丁：macOS 触摸板捏合手势合成 cmd+scroll 实现光标处缩放（stock 0.2.2 会丢弃该事件）
+- GPUI 走 crates.io 上的 `gpui-pre` 快照（`=0.3.11`）加 `gpui-component` 0.9 组件库；早先内嵌的 `vendor/gpui` 触摸板捏合补丁已随 crate 改名退役（见 [Cargo.toml](Cargo.toml) 末尾注释），若 macOS 捏合缩放回归需重新移植
 - Windows 安装器：NSIS 脚本 `installer/installer.nsi`
 - macOS 打包：`scripts/package-macos.sh`
 - 评测 harness：`cargo run --example slides_eval`（另有 `blackboard_eval` / `mindmap_eval`）
@@ -83,27 +83,33 @@ cargo build --release  # 发布构建
 
 | 按键 | 动作 | 按键 | 动作 |
 |------|------|------|------|
-| `P` | 画笔 | `Ctrl/Cmd+Z` | 撤销（`+Shift` 重做） |
+| `P` / `V` | 画笔 / 选择 | `Ctrl/Cmd+Z` | 撤销（`+Shift` 重做） |
 | `R` / `D` / `O` | 矩形/菱形/椭圆 | `Ctrl/Cmd+S` / `O` | 保存/打开 |
 | `A` / `L` | 箭头/直线 | `Ctrl/Cmd+I` / `V` | 插入/粘贴图片 |
 | `T` / `E` / `H` | 文本/橡皮/抓手 | `Ctrl/Cmd+B` | AI 面板 |
 | `Ctrl/Cmd+=` `-` `0` | 缩放/复位 | `Ctrl/Cmd+E` | 资源管理器 |
-| `Ctrl/Cmd+[` `]` | 层级（`+Shift` 置顶/沉底） | `PageUp/Down` | 翻页 |
+| `Ctrl/Cmd+[` `]` | 层级（`+Shift` 置顶/沉底） | `PageUp/Down` | 翻页（`F5` 开始放映） |
 | `Delete` / `Esc` | 删除/取消 | `Ctrl/Cmd+,` | 设置 |
 
 ## 项目结构
 
 ```
 src/
-├── board.rs      画板视图与交互
-├── ink/          墨迹管线：压感采集、平滑、轮廓
-├── render/       rough 手绘渲染与缓存
-├── scene/        元素模型、多页面、模板、思维导图（.boundless JSON 格式）
-├── ai/           rig 智能体：工具调用、技能路由、会话存储、面板
+├── board.rs      画板视图与交互（BoardView：画布、选择、文本编辑、外框 UI）
+├── ink/          墨迹管线：压感采集、平滑、可变宽轮廓
+├── render/       rough 手绘渲染、位图画布光栅、指纹缓存
+├── scene/        元素模型、多页面、模板库、思维导图（.boundless JSON 格式）
+├── ai/           rig 智能体：工具调用、技能路由、会话存储、评测、面板
+├── camera.rs     世界↔屏幕坐标与缩放
+├── history.rs    快照式撤销/重做
 ├── workspace.rs  工作区与资源管理器
+├── assets.rs     画布图片资源存储
+├── theme.rs      明/暗主题
 └── updater.rs    自托管自动更新
 skills/           六大内置技能（SKILL.md）
-vendor/gpui/      vendored GPUI + 触摸板捏合补丁
+installer/        Windows NSIS 安装脚本
+scripts/e2e/      macOS UI E2E（Python + PIL 像素断言）
+docs/             测试方案与执行日志
 ```
 
 数据与诊断位于 `~/.boundless/`（可用 `BOUNDLESS_HOME` 重定向）：会话与工作区、`agent-logs/*.jsonl`（智能体运行日志）、`panic.log`。

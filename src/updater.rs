@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 // ---------------------------------------------------------------------------
-// Config (TODO: fill these in)
+// Config (filled in; see UPDATER_CONFIG.md for what each value must match)
 // ---------------------------------------------------------------------------
 
 /// URL of the `latest.json` manifest (self-hosted on a CDN/docs site).

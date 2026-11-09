@@ -1,10 +1,14 @@
-//! Minimal repro: does gpui 0.2.2's `PathBuilder::fill()` + `paint_path`
+//! Minimal repro: does gpui-pre's `PathBuilder::fill()` + `paint_path`
 //! render a semi-transparent filled path on Windows? Same mechanics as
 //! `paint_world_geom`'s FillPath branch.
+//!
+//! Run with `cargo run --example fill_repro`. The board deliberately avoids
+//! FillPath for every fill style because this probe (and the macOS E2E round)
+//! showed the filled path never reaches the screen — see `render/rough.rs`.
 
 use gpui::{
-    div, fill, hsla, point, prelude::*, px, rgb, size, App, Application, Bounds, IntoElement,
-    PathBuilder, Pixels, Point, Size, Window, WindowBounds, WindowOptions,
+    div, point, prelude::*, px, size, App, Bounds, IntoElement, PathBuilder, Pixels, Point, Size,
+    Window, WindowBounds, WindowOptions,
 };
 
 struct FillRepro;
@@ -22,8 +26,6 @@ impl gpui::Render for FillRepro {
                     let oy = f32::from(bounds.origin.y);
                     let w = f32::from(bounds.size.width);
                     let h = f32::from(bounds.size.height);
-                    let cx0 = ox + w * 0.5;
-                    let cy0 = oy + h * 0.35;
                     let rx = w * 0.28;
                     let ry = h * 0.22;
 
@@ -75,7 +77,9 @@ impl gpui::Render for FillRepro {
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    // The 0.7+ gpui ecosystem dropped `Application::new()`; desktop apps boot
+    // through the platform crate's factory (same entry point as src/main.rs).
+    gpui_platform::application().run(|cx: &mut App| {
         let bounds = Bounds::centered(
             None,
             Size {

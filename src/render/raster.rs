@@ -1667,7 +1667,7 @@ mod tests {
         let a = img.as_bytes(0).unwrap();
         let b = full.as_raw().as_slice();
         assert_eq!(a.len(), b.len());
-        let worst = a.iter().zip(b).map(|(x, y)| (x.abs_diff(*y))).max().unwrap();
+        let worst = a.iter().zip(b).map(|(x, y)| x.abs_diff(*y)).max().unwrap();
         if worst > 2 {
             let pw = 200usize;
             for (i, (x, y)) in a.iter().zip(b).enumerate() {

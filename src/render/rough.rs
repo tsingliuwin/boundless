@@ -222,7 +222,7 @@ fn options_for(style: &ElementStyle, seed: u64, is_freedraw: bool) -> Options {
     }
     if let Some(bg) = style.background {
         options.fill = Some(srgba(bg, style.opacity));
-        // gpui 0.2.2 在 Windows 上 PathBuilder::fill() 的产物不可见（最小
+        // gpui-pre 的 PathBuilder::fill() 在 Windows 上产物不可见（最小
         // 复现工程 fill_repro 证实：同窗口 quad 正常、fill 路径消失）。而
         // macOS 真机上 FillPath + 渐变同样不显示（描边正常、填充面消失，
         // 2026-09-06 用户实测；「着色器支持」只是读码推断，从未上屏验证
@@ -1002,8 +1002,6 @@ mod tests {
 
     #[test]
     fn dry_brush_density_parameter_drives_run_count() {
-        let camera = Camera::default();
-        let origin = gpui::point(px(0.0), px(0.0));
         let points: Vec<WPoint> = (0..60)
             .map(|i| WPoint::new(i as f64 * 5.0, (i as f64 * 0.3).sin() * 8.0))
             .collect();
@@ -1058,7 +1056,7 @@ mod tests {
 
     #[test]
     fn gradient_fill_colors_hachure_lines_top_light_bottom_dark() {
-        // U-RD-002（回归）：FillPath+渐变在真机（gpui 0.2.2 Metal）上不渲染
+        // U-RD-002（回归）：FillPath+渐变在真机（gpui-pre / Metal）上不渲染
         // （描边正常、填充面消失，2026-09-06 用户实测）。渐变必须走
         // FillSketch 排线管线并逐线上色 —— 本用例取用户画板里的真实元素
         // （黄底椭圆、飞白笔刷、真实 seed/尺寸），断言：
@@ -1571,7 +1569,7 @@ mod solid_fill_tests {
         let geom = world_geometry(&el);
         match &geom {
             WorldGeom::Rough(sets) => {
-                // gpui 0.2.2 Windows 上 FillPath（PathBuilder::fill）不可见，
+                // Windows 上 FillPath（PathBuilder::fill）不可见，
                 // 因此 Solid 统一走 FillSketch（密排线→视觉实心），见 options_for。
                 // 近实心 = 基础密排 + 交叉第二遍，至少两道 FillSketch。
                 let fill_sets: Vec<_> = sets

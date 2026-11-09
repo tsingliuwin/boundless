@@ -15,24 +15,41 @@
 
 ## 2. 现状盘点
 
-### 2.1 已有测试分布（共 216 个，全部为 `src/**` 内联单元测试）
+### 2.1 已有测试分布（271 个 `src/**` 内联单元测试 + 5 个 `tests/integration.rs` 集成用例）
 
 | 模块 | 数量 | 覆盖要点 |
 |---|---|---|
-| `ai/eval.rs` | 29 | 黑板报/水墨/思维导图三套 rubric 评分、replay 校验 |
-| `scene/element.rs` | 20 | 命中测试、serde 往返、rescale、顶点编辑、曲线命中 |
-| `render/rough.rs` | 14 | 各形状出路径、种子确定、渐变 FillPath、飞白密度参数、图片无矢量几何 |
-| `ai/canvas_ops.rs` | 15 | op serde 往返、颜色解析（hex/数字/null）、文本规范化 |
-| `ink/*`（4 文件） | 34 | 采样抽稀、笔压速度模型、ribbon 轮廓、圆点 |
-| `scene/mindmap.rs` | 13 | 布局不重叠、连线不交叉、确定性、大图缩放 |
-| `ai/panel.rs` | 12 | 工具步骤气泡/芯片预览文案 |
-| `render/cache.rs` | 9 | 指纹稳定性/各字段变更敏感、几何缓存命中 |
+| `ai/eval.rs` | 29 | 黑板报/水墨/思维导图/幻灯片四套 rubric 评分、replay 语义 |
+| `scene/element.rs` | 25 | 命中测试（形状/曲线/位图）、serde 往返、rescale、顶点编辑、飞白宽度并行 |
+| `render/rough.rs` | 17 | 各形状出路径、种子确定性、逐线渐变上色、飞白密度、曲线线型、图片无矢量几何 |
+| `ai/tools.rs` | 16 | 工具参数校验（尺寸/点数/思维导图树/气泡）、pose 与气泡 op 构造 |
+| `ai/canvas_ops.rs` | 15 | op serde 往返、颜色解析（hex/数字/null）、文本反转义 |
+| `render/raster.rs` | 14 | 像素笔刷不透明度/裁剪、水彩与飞白对比、增量光栅与全量一致、缓存指纹 |
+| `scene/mindmap.rs` | 13 | 布局不重叠、连线不交叉、双侧均衡、确定性、大图缩放 |
+| `scene/templates.rs` | 13 | 模板存取、盖章变换（平移/缩放/镜像/倾斜）、孤儿标签降级、重叠警告 |
+| `ink/collector.rs` | 13 | 抽稀随缩放、速度压感、硬件压感覆盖、笔尾收细、宽度比并行 |
+| `ai/panel.rs` | 13 | 工具步骤气泡/芯片文案、思考状态、结果追加 |
+| `render/cache.rs` | 12 | 指纹对每个样式字段敏感、几何/文本缓存命中 |
+| `ink/outline.rs` | 10 | ribbon 轮廓闭合、宽度保持、退化输入、圆点直径 |
+| `ai/store.rs` | 8 | 会话 JSONL 追加/加载、按板分组、`BOUNDLESS_HOME` 覆盖 |
 | `scene/mod.rs` | 7 | 场景文件往返、旧版兼容、topmost 命中、z 序四操作 |
-| `ai/*`（tools/store/client/skills/log/agent/settings） | 31 | 参数校验、会话存储、步骤重建、技能 frontmatter |
-| `scene/pages.rs` | 5 | 比例解析、横向排布、page_at |
-| `text.rs` | 5 | UTF-16 映射（CJK/emoji）、编辑会话、IME |
-| `camera.rs` / `history.rs` / `workspace.rs` / `platform.rs` / `updater.rs` | 3+2+4+6+3 | 缩放锚点、undo 往返、工作区扫描、笔分类、更新器 |
-| `board.rs` | **1** | ⚠️ 巨型模块（UI/交互/操作应用核心）几乎裸奔 |
+| `assets.rs` | 6 | 资产唯一命名、自动建目录、解码缓存、BGRA 换序、损坏返回 None |
+| `platform.rs` | 6 | 笔指针分类、压力归一/钳制、橡皮尖、过期样本 |
+| `ink/smooth.rs` | 6 | EMA 平滑核函数、抖动抑制、收敛性 |
+| `ink/pressure.rs` | 6 | 速度压感单调性、宽度比区间、硬件压力端点 |
+| `text.rs` | 5 | UTF-16 映射（CJK/emoji）、编辑会话、IME 组词 |
+| `scene/pages.rs` | 5 | 比例解析、横向无重叠排布、page_at、按尺寸反推比例 |
+| `ai/skills.rs` | 5 | frontmatter 解析、内置技能全部可解析、路由规则进系统提示 |
+| `workspace.rs` | 4 | 扫描排序与跳过数据目录、新建板/文件夹、路径归一 |
+| `ai/client.rs` | 4 | 工具步骤字段向后兼容、JSONL 往返 |
+| `camera.rs` | 3 | 世界↔屏幕往返、缩放锚点固定、缩放钳制 |
+| `updater.rs` | 3 | 清单解析、版本比较、签名校验往返 |
+| `render/mod.rs` | 3 | 句柄缩放锚点、曲线中点几何 |
+| `board.rs` | **3** | ⚠️ 9333 行的巨型模块（UI/交互/操作应用核心）只有 `fit_image` / `apply_fill_style` / `now_line` 三个纯函数被覆盖 |
+| `history.rs` | 2 | undo/redo 往返、新变更清空 redo 栈 |
+| `ai/log.rs` | 2 | 事件序列化、run 生命周期写入顺序 |
+| `ai/agent.rs` | 2 | 消息类型转换、运行时上下文只注入一次 |
+| `ai/settings.rs` | 1 | 配置文件加载 |
 
 ### 2.2 已有基础设施
 
@@ -43,10 +60,10 @@
 
 ### 2.3 主要缺口
 
-1. `board.rs`（约 8000 行：指针交互、op 应用、工具栏、页面、演示、自动保存）仅 1 个测试。
-2. 无 `tests/` 集成测试目录：跨模块行为（serde 兼容矩阵、资源存储往返、历史×场景组合）没有载体。
-3. 渲染只有"出不出路径"断言，缺几何属性断言（包围盒、渐变色标、指纹矩阵参数化）。
-4. UI E2E 完全依赖手工；已验证的 macOS 自动化技巧未沉淀为脚本。
+1. `board.rs`（9333 行：指针交互、op 应用、工具栏、页面、演示、自动保存）仅 3 个测试，且只覆盖抽出的纯函数。
+2. `tests/integration.rs` 已有 5 个用例，但跨模块矩阵仍不全（§4.2 中 I-SC-002 / I-WK-002 / I-AI-001 等仍待建）。
+3. 渲染断言已补指纹参数化矩阵与渐变色标，仍缺包围盒/顶点密度等几何属性断言（§4.3）。
+4. UI E2E 已沉淀为 `scripts/e2e/`，但只实现了 e2e-001/002/007（§4.4 其余用例待建）。
 5. CI 无 macOS 作业、无 clippy/fmt/覆盖率门禁。
 
 ## 3. 分层架构
@@ -59,7 +76,7 @@ L2  集成 (tests/)      serde 兼容矩阵、资源存储、历史×场景、�
 L1  单元 (src/**)      纯函数：几何、布局、解析、状态机（现状主力，继续补缺）
 ```
 
-失败成本越高、跑得越慢的层放越少用例；每层可独立运行：`cargo test`（L1-L3）、`cargo test --test integration`（L2）、`python3 scripts/e2e/run.py smoke`（L4）。
+失败成本越高、跑得越慢的层放越少用例；每层可独立运行：`cargo test`（L1-L3）、`cargo test --test integration`（L2）、`python3 scripts/e2e/scenarios.py`（L4）。
 
 ---
 
@@ -175,7 +192,7 @@ L1  单元 (src/**)      纯函数：几何、布局、解析、状态机（现�
 | E2E-011 | AI 面板冒烟 | Ctrl-B 打开面板（不调用模型） | 面板区出现；输入框聚焦时单键工具快捷键不触发（`!Input` 上下文） | P1 | 🆕 |
 | E2E-012 | 退出写盘 | 画未存内容 → 点红点退出 | 退出后板文件更新（autosave flush） | P1 | 🆕 |
 
-运行方式：`python3 scripts/e2e/run.py e2e-001 …`（默认全部 P0）；断点失败自动留存 `/tmp/e2e-artifacts/<id>/`（全图+裁剪+diff）。
+运行方式：`python3 scripts/e2e/scenarios.py [e2e-001 …]`（不带参数则跑已实现的全部场景，当前为 001/002/007）；`scenarios.py calibrate` 打印自动定位到的工具栏按钮坐标。失败时截图自动留存 `/tmp/e2e-artifacts/<id>/`（全图+裁剪+diff）。
 
 ### 4.5 L5 AI Agent 评测
 
@@ -203,7 +220,7 @@ L1  单元 (src/**)      纯函数：几何、布局、解析、状态机（现�
 1. **保留** Windows `cargo test` 作业（现状）。
 2. **新增** macOS 作业：`macos-latest`，`cargo fmt --check && cargo clippy -D warnings && cargo test`（L1-L3；macOS 是主开发平台，必须与 Windows 同绿）。
 3. PR 触发全部；main 触发全部 + 覆盖率数值上报；nightly（cron）跑 L2 全量 + L3 预算 + `AI-EV-002` 录制回放。
-4. L4 E2E 不进 CI（需要解锁的 GUI 会话），作为**发版前本地门禁**：`scripts/e2e/run.py` 全绿才允许打 tag（可写进 `package-macos.sh` 前置提示）。
+4. L4 E2E 不进 CI（需要解锁的 GUI 会话），作为**发版前本地门禁**：`scripts/e2e/scenarios.py` 全绿才允许打 tag（可写进 `package-macos.sh` 前置提示）。
 
 ## 7. 落地路线图
 
@@ -211,13 +228,13 @@ L1  单元 (src/**)      纯函数：几何、布局、解析、状态机（现�
 |---|---|---|---|
 | R1（立即） | U-RD-002/009/011、U-BR-001/002/003、U-AI-002/003/005、I-WK-001、E2E-001/002/007 | 本轮三特性（渐变/图片/飞白）的回归网 | 1~2 天 | ✅（2026-09-06 全部完成） |
 | R2（本迭代） | L2 `tests/` 骨架 + fixtures 兼容矩阵、CI macOS 作业、clippy 清零、覆盖率基线 | `tests/integration.rs`、ci.yml v2 | 2~3 天 | 部分完成（tests/ ✅） |
-| R3（下迭代） | E2E 全套 + `BOUNDLESS_HOME` 隔离支持、历史/自动保存抽纯函数进 L1 | `scripts/e2e/run.py` 全套 | 3~5 天 | **BOUNDLESS_HOME 已落地（2026-09-06）**；E2E 剩余用例继续 |
+| R3（下迭代） | E2E 全套 + `BOUNDLESS_HOME` 隔离支持、历史/自动保存抽纯函数进 L1 | `scripts/e2e/scenarios.py` 全套 | 3~5 天 | **BOUNDLESS_HOME 已落地（2026-09-06）**；E2E 剩余用例继续 |
 | R4（持续） | AI 录制回放金样、性能预算、真实模型夜间评测 | nightly 工作流 | 持续 |
 
 ## 8. 已知不可自动化项（明确不做）
 
 - 真实 Apple Pencil/触控笔压手感（硬件在环）——以 `ink/` 单元测试模拟信号替代。
-- Windows 上的 `PathBuilder::fill()` 渲染产物（gpui 0.2.2 已知缺陷，排线是兜底方案）——以 L3 几何断言 + macOS E2E 覆盖语义。
+- `PathBuilder::fill()` 的渲染产物（Windows 最小复现工程与 macOS 真机截图均证实不可见，全 App 一律用排线兜底）——以 L3 几何断言 + macOS E2E 覆盖语义。
 - 视觉美感（渐变色标是否"好看"）——rubric 只管结构，美感人工评审。
 - 锁屏/多显示器切换等系统级行为。
 

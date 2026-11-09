@@ -349,7 +349,7 @@ use windows::Win32::Foundation::{HWND, POINT, RECT};
 // ---------------------------------------------------------------------------
 // Stylus pressure (Windows Ink / WM_POINTER)
 //
-// GPUI 0.2.2 has no pressure in its event model and its Windows backend only
+// GPUI's event model has no pressure, and its Windows backend only
 // handles legacy WM_MOUSE* messages — when a stylus draws, the digitizer's
 // WM_POINTER packets are simply ignored and everything arrives as synthetic
 // mouse input with the pressure thrown away.

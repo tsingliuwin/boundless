@@ -2354,7 +2354,6 @@ mod slides_tests {
     #[test]
     fn gaudy_magenta_fills_fail() {
         let ops = sample_deck(2, "16:9");
-        let canvas = replay(&ops);
         // A content card filled with the failure-mode magenta.
         let mut ops = ops;
         ops.push((
