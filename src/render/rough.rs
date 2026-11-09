@@ -686,9 +686,7 @@ pub fn world_geometry(el: &Element) -> WorldGeom {
                 let bez = closed_catmull_rom_bez(&points);
                 rough_shape(style, el.seed, *b, |gen| gen.bez_path(bez.clone()))
             } else {
-                rough_shape(style, el.seed, *b, |gen: &KurboGenerator| {
-                    gen.polygon(&pts)
-                })
+                rough_shape(style, el.seed, *b, |gen: &KurboGenerator| gen.polygon(&pts))
             }
         }
         // Variable-width ink stroke (from the crate::ink pipeline): fill the
@@ -697,9 +695,7 @@ pub fn world_geometry(el: &Element) -> WorldGeom {
         // uniform strokes (empty widths) on the original rough path.
         // 钢笔（brush = None）ink 笔迹走变宽 ribbon 轮廓；铅笔/飞白故意
         // 落到下方通用笔迹分支，让 brush 变体（细颗粒 / 断续干笔）生效。
-        ElementKind::Freedraw { .. }
-            if !el.ink_widths().is_empty() && style.brush.is_none() =>
-        {
+        ElementKind::Freedraw { .. } if !el.ink_widths().is_empty() && style.brush.is_none() => {
             let points = el.absolute_points();
             if points.len() < 2 {
                 return dot_geometry(el, &points);
@@ -766,8 +762,7 @@ pub fn world_geometry(el: &Element) -> WorldGeom {
                     passes.push(samples.iter().map(offset_fn).collect());
                 }
                 // 笔刷变体：铅笔 = 细颗粒多道半透明线；飞白 = 断续干笔。
-                let sampled: Vec<SampledPass> =
-                    brush_sampled_passes(style, el.seed, passes);
+                let sampled: Vec<SampledPass> = brush_sampled_passes(style, el.seed, passes);
                 WorldGeom::Sampled(sampled)
             } else {
                 let gen = KurboGenerator::new(options_for(style, el.seed, false));
@@ -868,7 +863,10 @@ pub fn paint_world_geom(
                         let mut builder = PathBuilder::stroke(width_px);
                         append_bez_path(&mut builder, &set.ops, camera, canvas_origin);
                         if let Ok(path) = builder.build() {
-                            out.push(ReadyPath { path, color: color.into() });
+                            out.push(ReadyPath {
+                                path,
+                                color: color.into(),
+                            });
                         }
                     }
                     OpSetType::Path => {
@@ -893,7 +891,10 @@ pub fn paint_world_geom(
                         }
                         append_bez_path(&mut builder, &set.ops, camera, canvas_origin);
                         if let Ok(path) = builder.build() {
-                            out.push(ReadyPath { path, color: color.into() });
+                            out.push(ReadyPath {
+                                path,
+                                color: color.into(),
+                            });
                         }
                     }
                 }
@@ -923,7 +924,10 @@ pub fn paint_world_geom(
                     builder.line_to(camera.world_to_screen(*p, canvas_origin));
                 }
                 if let Ok(path) = builder.build() {
-                    out.push(ReadyPath { path, color: color.into() });
+                    out.push(ReadyPath {
+                        path,
+                        color: color.into(),
+                    });
                 }
             }
         }
@@ -1190,7 +1194,10 @@ mod tests {
         let top = format!("{:?}", color_u32(lighten(0xa5d8ff, 0.35), 1.0));
         let bottom = format!("{:?}", color_u32(darken(0xa5d8ff, 0.35), 1.0));
         assert!(dbg.contains(&top), "top stop {top} missing in {dbg}");
-        assert!(dbg.contains(&bottom), "bottom stop {bottom} missing in {dbg}");
+        assert!(
+            dbg.contains(&bottom),
+            "bottom stop {bottom} missing in {dbg}"
+        );
     }
 
     #[test]
@@ -1225,11 +1232,8 @@ mod tests {
             style.clone(),
         );
         assert!(matches!(world_geometry(&dot), WorldGeom::Outline(_)));
-        let empty = Element::from_absolute_points(
-            |points| ElementKind::Line { points },
-            Vec::new(),
-            style,
-        );
+        let empty =
+            Element::from_absolute_points(|points| ElementKind::Line { points }, Vec::new(), style);
         assert!(matches!(world_geometry(&empty), WorldGeom::Empty));
     }
 

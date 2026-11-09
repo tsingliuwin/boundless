@@ -11,9 +11,7 @@
 use gpui::prelude::*;
 use gpui::*;
 use gpui_component::input::{Input, InputState};
-use gpui_component::setting::{
-    SettingGroup, SettingItem, SettingPage as KitSettingPage, Settings,
-};
+use gpui_component::setting::{SettingGroup, SettingItem, SettingPage as KitSettingPage, Settings};
 use gpui_component::{Icon, IconName};
 
 use crate::ai::settings::AiSettings;
@@ -187,9 +185,7 @@ impl Render for SettingsPage {
                         .text_color(theme.popover)
                         .hover(|s| s.bg(theme.primary_hover))
                         .on_click(move |_, _, cx: &mut App| {
-                            weak_save
-                                .update(cx, |this, cx| this.save(cx))
-                                .ok();
+                            weak_save.update(cx, |this, cx| this.save(cx)).ok();
                         })
                         .child("保存"),
                 )
@@ -361,51 +357,53 @@ impl Render for SettingsPage {
         let theme_page = KitSettingPage::new("外观")
             .icon(IconName::Sun)
             .description("应用界面配色：浅色纸白 / 深色墨黑 / 跟随系统。")
-            .group(SettingGroup::new().item(
-                SettingItem::render(move |_, _, _cx| {
-                    let current = crate::theme::current_pref();
-                    div()
-                        .flex()
-                        .flex_row()
-                        .gap_2()
-                        .children(
-                            [
-                                crate::theme::ThemePref::Light,
-                                crate::theme::ThemePref::Dark,
-                                crate::theme::ThemePref::System,
-                            ]
-                            .iter()
-                            .enumerate()
-                            .map(|(i, pref)| {
-                                let active = *pref == current;
-                                div()
-                                    .id(("theme-mode", i))
-                                    .h_7()
-                                    .px_3()
-                                    .rounded_md()
-                                    .flex()
-                                    .items_center()
-                                    .text_sm()
-                                    .cursor_pointer()
-                                    .when(active, |d| {
-                                        d.bg(theme.primary).text_color(theme.popover)
-                                    })
-                                    .when(!active, |d| {
-                                        d.border_1()
-                                            .border_color(theme.border)
-                                            .text_color(theme.foreground)
-                                            .hover(|s| s.bg(theme.muted))
-                                    })
-                                    .on_click(move |_, _, cx: &mut App| {
-                                        crate::theme::set_pref(*pref, cx);
-                                    })
-                                    .child(pref.label())
-                            }),
-                        )
-                        .into_any_element()
-                })
-                .keywords(["主题", "外观", "深色", "dark", "theme"]),
-            ));
+            .group(
+                SettingGroup::new().item(
+                    SettingItem::render(move |_, _, _cx| {
+                        let current = crate::theme::current_pref();
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .children(
+                                [
+                                    crate::theme::ThemePref::Light,
+                                    crate::theme::ThemePref::Dark,
+                                    crate::theme::ThemePref::System,
+                                ]
+                                .iter()
+                                .enumerate()
+                                .map(|(i, pref)| {
+                                    let active = *pref == current;
+                                    div()
+                                        .id(("theme-mode", i))
+                                        .h_7()
+                                        .px_3()
+                                        .rounded_md()
+                                        .flex()
+                                        .items_center()
+                                        .text_sm()
+                                        .cursor_pointer()
+                                        .when(active, |d| {
+                                            d.bg(theme.primary).text_color(theme.popover)
+                                        })
+                                        .when(!active, |d| {
+                                            d.border_1()
+                                                .border_color(theme.border)
+                                                .text_color(theme.foreground)
+                                                .hover(|s| s.bg(theme.muted))
+                                        })
+                                        .on_click(move |_, _, cx: &mut App| {
+                                            crate::theme::set_pref(*pref, cx);
+                                        })
+                                        .child(pref.label())
+                                }),
+                            )
+                            .into_any_element()
+                    })
+                    .keywords(["主题", "外观", "深色", "dark", "theme"]),
+                ),
+            );
 
         let settings = Settings::new("app-settings").pages([theme_page, ai_page, ws_page]);
 
@@ -417,12 +415,7 @@ impl Render for SettingsPage {
             .flex_col()
             .bg(theme.popover)
             .child(header)
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .child(settings),
-            )
+            .child(div().flex_1().min_h_0().child(settings))
     }
 }
 
@@ -433,6 +426,11 @@ fn field_row(label: &'static str, field: &Entity<InputState>, cx: &App) -> Div {
         .flex()
         .flex_col()
         .gap_1()
-        .child(div().text_xs().text_color(theme.muted_foreground).child(label))
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(label),
+        )
         .child(Input::new(field))
 }

@@ -741,7 +741,11 @@ fn validate_pose(args: &PoseElementArgs) -> Result<(), ToolError> {
     if args.points.len() < 2 {
         return Err(ToolError::invalid_args("points 至少需要两个坐标点"));
     }
-    if args.points.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
+    if args
+        .points
+        .iter()
+        .any(|p| !p.x.is_finite() || !p.y.is_finite())
+    {
         return Err(ToolError::invalid_args("坐标点必须是有限数值"));
     }
     Ok(())
@@ -1828,7 +1832,10 @@ impl Tool for SaveTemplateTool {
             // 边界校验：名字、类别、id 列表（对快照快速失败，主线程再权威复核）。
             let clean = match crate::scene::templates::sanitize_name(&args.name) {
                 Ok(n) => n,
-                Err(e) => return fail_tool(&events, id, name, args_json, ToolError::invalid_args(e)).await,
+                Err(e) => {
+                    return fail_tool(&events, id, name, args_json, ToolError::invalid_args(e))
+                        .await
+                }
             };
             let kind = match crate::scene::templates::TemplateKind::parse(&args.kind) {
                 Some(k) => k,
@@ -2002,7 +2009,14 @@ impl Tool for StampTemplateTool {
             let id = next_tool_id(name);
             let args_json = serde_json::to_value(&args).unwrap_or(Value::Null);
             if !args.x.is_finite() || !args.y.is_finite() {
-                return fail_tool(&events, id, name, args_json, ToolError::invalid_args("坐标必须是有限数值")).await;
+                return fail_tool(
+                    &events,
+                    id,
+                    name,
+                    args_json,
+                    ToolError::invalid_args("坐标必须是有限数值"),
+                )
+                .await;
             }
             if let Some(s) = args.scale {
                 if !s.is_finite() || !(0.05..=8.0).contains(&s) {
@@ -2041,11 +2055,10 @@ impl Tool for StampTemplateTool {
                 });
                 Err(ToolError::not_found(msg))
             };
-            let template =
-                match crate::scene::templates::load(&templates_dir, args.name.trim()) {
-                    Ok(t) => t,
-                    Err(e) => return emit_err(&events, id, e),
-                };
+            let template = match crate::scene::templates::load(&templates_dir, args.name.trim()) {
+                Ok(t) => t,
+                Err(e) => return emit_err(&events, id, e),
+            };
             let stamped = match crate::scene::templates::stamp(
                 &template,
                 args.x,
@@ -2082,7 +2095,9 @@ impl Tool for StampTemplateTool {
                 result: message.clone(),
                 is_error,
             });
-            outcome.map(|m| format!("已放置模板「{}」×{n} 个元素。{m}", template.name)).map_err(ToolError::from_op)
+            outcome
+                .map(|m| format!("已放置模板「{}」×{n} 个元素。{m}", template.name))
+                .map_err(ToolError::from_op)
         }
     }
 }
@@ -2288,12 +2303,7 @@ impl Tool for SpeechBubbleTool {
                             elements.push(crate::scene::Element::new_with_id(
                                 new_element_id(),
                                 crate::scene::ElementKind::Ellipse,
-                                crate::scene::WBounds::new(
-                                    dcx - d / 2.0,
-                                    dcy - d / 2.0,
-                                    d,
-                                    d,
-                                ),
+                                crate::scene::WBounds::new(dcx - d / 2.0, dcy - d / 2.0, d, d),
                                 style.clone(),
                             ));
                         }
@@ -2303,10 +2313,7 @@ impl Tool for SpeechBubbleTool {
                         .map(|i| {
                             let t = i as f64 / n as f64 * std::f64::consts::TAU;
                             let r = if i % 2 == 0 { 1.0 } else { 0.86 };
-                            crate::scene::WPoint::new(
-                                cx + rx * r * t.cos(),
-                                cy + ry * r * t.sin(),
-                            )
+                            crate::scene::WPoint::new(cx + rx * r * t.cos(), cy + ry * r * t.sin())
                         })
                         .collect();
                     elements.push(crate::scene::Element::from_absolute_points_with_id(
@@ -3035,13 +3042,17 @@ mod tests {
         assert_eq!(ellipse.style.background, Some(0xff_ff_ff));
         assert_eq!(ellipse.style.fill_style, crate::scene::FillStyle::Solid);
         match &elements[2].kind {
-            crate::scene::ElementKind::Text {
-                container_id, ..
-            } => assert_eq!(*container_id, Some(ellipse.id)),
+            crate::scene::ElementKind::Text { container_id, .. } => {
+                assert_eq!(*container_id, Some(ellipse.id))
+            }
             other => panic!("期望绑定文字，实际 {other:?}"),
         }
         // 尾巴尖端在气泡外接框之下（down_left 方向：尖端 y > 气泡底边）。
-        let tip_y = tail.absolute_points().iter().map(|p| p.y).fold(f64::MIN, f64::max);
+        let tip_y = tail
+            .absolute_points()
+            .iter()
+            .map(|p| p.y)
+            .fold(f64::MIN, f64::max);
         assert!(tip_y > 80.0 + 110.0, "尾巴应伸到气泡外 tip_y={tip_y}");
 
         match std::future::Future::poll(fut.as_mut(), &mut cx) {

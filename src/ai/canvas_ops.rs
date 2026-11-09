@@ -647,9 +647,7 @@ impl CanvasStyle {
         }
         if let Some(v) = self.dry_width {
             if !(0.2..=2.0).contains(&v) {
-                return Err(format!(
-                    "dry_width {v} 超出范围 0.2~2.0（× stroke_width）"
-                ));
+                return Err(format!("dry_width {v} 超出范围 0.2~2.0（× stroke_width）"));
             }
         }
         Ok(())

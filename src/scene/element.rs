@@ -1067,7 +1067,8 @@ pub fn outside_runs(
         return Vec::new();
     }
     let inside = |p: WPoint| b.contains(p);
-    let lerp = |p: WPoint, q: WPoint, t: f64| WPoint::new(p.x + (q.x - p.x) * t, p.y + (q.y - p.y) * t);
+    let lerp =
+        |p: WPoint, q: WPoint, t: f64| WPoint::new(p.x + (q.x - p.x) * t, p.y + (q.y - p.y) * t);
     let width_at = |i: usize, t: f64| -> f64 {
         if widths.len() != points.len() {
             return 1.0;
@@ -1116,16 +1117,15 @@ pub fn outside_runs(
     let mut runs: Vec<(Vec<WPoint>, Vec<f64>)> = Vec::new();
     let mut cur_pts: Vec<WPoint> = Vec::new();
     let mut cur_w: Vec<f64> = Vec::new();
-    let close = |runs: &mut Vec<(Vec<WPoint>, Vec<f64>)>,
-                     pts: &mut Vec<WPoint>,
-                     ws: &mut Vec<f64>| {
-        if pts.len() >= 2 {
-            runs.push((std::mem::take(pts), std::mem::take(ws)));
-        } else {
-            pts.clear();
-            ws.clear();
-        }
-    };
+    let close =
+        |runs: &mut Vec<(Vec<WPoint>, Vec<f64>)>, pts: &mut Vec<WPoint>, ws: &mut Vec<f64>| {
+            if pts.len() >= 2 {
+                runs.push((std::mem::take(pts), std::mem::take(ws)));
+            } else {
+                pts.clear();
+                ws.clear();
+            }
+        };
     if !inside(points[0]) {
         cur_pts.push(points[0]);
         cur_w.push(width_at(0, 0.0));
@@ -1229,10 +1229,7 @@ mod tests {
         );
         assert!(!rect.set_absolute_points(vec![WPoint::new(0.0, 0.0), WPoint::new(1.0, 1.0)]));
         assert!(!arm.set_absolute_points(vec![WPoint::new(0.0, 0.0)]));
-        assert!(!arm.set_absolute_points(vec![
-            WPoint::new(0.0, 0.0),
-            WPoint::new(f64::NAN, 1.0)
-        ]));
+        assert!(!arm.set_absolute_points(vec![WPoint::new(0.0, 0.0), WPoint::new(f64::NAN, 1.0)]));
     }
 
     #[test]
@@ -1655,8 +1652,14 @@ mod tests {
         ];
         let runs = outside_runs(&pts, &[], &b);
         assert_eq!(runs.len(), 2, "entry run + exit run");
-        assert_eq!(runs[0].0, vec![WPoint::new(50.0, 150.0), WPoint::new(100.0, 150.0)]);
-        assert_eq!(runs[1].0, vec![WPoint::new(300.0, 150.0), WPoint::new(350.0, 150.0)]);
+        assert_eq!(
+            runs[0].0,
+            vec![WPoint::new(50.0, 150.0), WPoint::new(100.0, 150.0)]
+        );
+        assert_eq!(
+            runs[1].0,
+            vec![WPoint::new(300.0, 150.0), WPoint::new(350.0, 150.0)]
+        );
 
         // Fully inside or fully outside strokes degenerate correctly.
         assert!(outside_runs(
@@ -1665,11 +1668,7 @@ mod tests {
             &b
         )
         .is_empty());
-        let out = outside_runs(
-            &[WPoint::new(0.0, 0.0), WPoint::new(50.0, 0.0)],
-            &[],
-            &b,
-        );
+        let out = outside_runs(&[WPoint::new(0.0, 0.0), WPoint::new(50.0, 0.0)], &[], &b);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0.len(), 2);
 
@@ -1685,7 +1684,9 @@ mod tests {
 
     fn canvas_element() -> Element {
         let mut el = Element::new(
-            ElementKind::Canvas { strokes: Vec::new() },
+            ElementKind::Canvas {
+                strokes: Vec::new(),
+            },
             WBounds::new(10.0, 20.0, 200.0, 120.0),
             rect_style(),
         );

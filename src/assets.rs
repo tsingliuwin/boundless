@@ -57,7 +57,9 @@ impl AssetStore {
             pixel.swap(0, 2);
         }
         let render = Arc::new(RenderImage::new(vec![image::Frame::new(img)]));
-        self.cache.borrow_mut().insert(name.to_string(), render.clone());
+        self.cache
+            .borrow_mut()
+            .insert(name.to_string(), render.clone());
         Some(render)
     }
 }
@@ -146,6 +148,9 @@ mod tests {
     fn extension_is_normalized() {
         let store = temp_store();
         let name = store.store(&tiny_png(), ".PNG").expect("store");
-        assert!(name.ends_with(".PNG"), "dot trimmed only, case kept: {name}");
+        assert!(
+            name.ends_with(".PNG"),
+            "dot trimmed only, case kept: {name}"
+        );
     }
 }

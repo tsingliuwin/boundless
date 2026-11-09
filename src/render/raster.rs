@@ -445,7 +445,18 @@ fn draw_stroke(
             // stroke's own overlapping discs scratch each other away (the
             // 74-round regression where glints vanished).
             dry_stipple(
-                buf, pw, ph, &pts, &half, r, g, b, s.opacity, &mut rng, &base_alpha, pw,
+                buf,
+                pw,
+                ph,
+                &pts,
+                &half,
+                r,
+                g,
+                b,
+                s.opacity,
+                &mut rng,
+                &base_alpha,
+                pw,
             );
         }
     }
@@ -519,8 +530,14 @@ fn smooth_centerline(pts: &[(f32, f32)], half: &[f32]) -> (Vec<(f32, f32)>, Vec<
         for j in 1..=k {
             let t = j as f32 / k as f32;
             let u = 1.0 - t;
-            let x = u * u * u * p1.0 + 3.0 * u * u * t * c1.0 + 3.0 * u * t * t * c2.0 + t * t * t * p2.0;
-            let y = u * u * u * p1.1 + 3.0 * u * u * t * c1.1 + 3.0 * u * t * t * c2.1 + t * t * t * p2.1;
+            let x = u * u * u * p1.0
+                + 3.0 * u * u * t * c1.0
+                + 3.0 * u * t * t * c2.0
+                + t * t * t * p2.0;
+            let y = u * u * u * p1.1
+                + 3.0 * u * u * t * c1.1
+                + 3.0 * u * t * t * c2.1
+                + t * t * t * p2.1;
             out_pts.push((x, y));
             out_half.push(h1 + (h2 - h1) * t);
         }
@@ -532,12 +549,7 @@ fn smooth_centerline(pts: &[(f32, f32)], half: &[f32]) -> (Vec<(f32, f32)>, Vec<
 /// normal by smoothed (two box passes) seeded noise scaled to the local
 /// half-width and `strength`. The result is an organic edge line instead of
 /// a rigidly shifted copy of the path.
-fn wander_path(
-    pts: &[(f32, f32)],
-    half: &[f32],
-    strength: f32,
-    rng: &mut Rng,
-) -> Vec<(f32, f32)> {
+fn wander_path(pts: &[(f32, f32)], half: &[f32], strength: f32, rng: &mut Rng) -> Vec<(f32, f32)> {
     let n = pts.len();
     if n < 2 {
         return pts.to_vec();
@@ -578,7 +590,11 @@ fn wander_path(
             let (a, b) = (pts[i.saturating_sub(1)], pts[(i + 1).min(n - 1)]);
             let (dx, dy) = (b.0 - a.0, b.1 - a.1);
             let len = dx.hypot(dy);
-            let (nx, ny) = if len > 1e-3 { (-dy / len, dx / len) } else { (0.0, 1.0) };
+            let (nx, ny) = if len > 1e-3 {
+                (-dy / len, dx / len)
+            } else {
+                (0.0, 1.0)
+            };
             // Amplitude grows super-linearly with half-width: a 60px-tall
             // sky band needs decimetre-scale undulation to stop reading as
             // a ruler-straight slat, while a 4px line stays controlled.
@@ -958,8 +974,7 @@ impl CanvasCache {
         let mut entries = self.entries.borrow_mut();
         let ent = entries.get_mut(&el.id)?;
         let n = el.canvas_strokes().len();
-        let first_wet = (ent.baked..n)
-            .find(|&i| Self::settle_of(ent, i, now) < 1.0);
+        let first_wet = (ent.baked..n).find(|&i| Self::settle_of(ent, i, now) < 1.0);
         if live.is_none() && first_wet.is_none() {
             return None;
         }
@@ -1170,9 +1185,7 @@ mod tests {
         // Dry brush deposits less total pigment than a solid ink band (the
         // 飞白 look IS the missing coverage). Compare total alpha mass —
         // robust against individual overlapping stipple dots going dark.
-        let mass = |img: &image::RgbaImage| -> u64 {
-            img.pixels().map(|p| p[3] as u64).sum()
-        };
+        let mass = |img: &image::RgbaImage| -> u64 { img.pixels().map(|p| p[3] as u64).sum() };
         assert!(
             mass(&dry) < mass(&ink) / 2,
             "dry brush leaves well under half the ink's pigment"
@@ -1231,8 +1244,8 @@ mod tests {
         let mut rng = Rng::new(7);
         let w = wander_path(&pts, &half, 1.0, &mut rng);
         let dy: Vec<f32> = w.iter().zip(pts.iter()).map(|(a, b)| a.1 - b.1).collect();
-        let spread = dy.iter().copied().fold(0.0f32, f32::max)
-            - dy.iter().copied().fold(0.0f32, f32::min);
+        let spread =
+            dy.iter().copied().fold(0.0f32, f32::max) - dy.iter().copied().fold(0.0f32, f32::min);
         assert!(
             spread > 2.0,
             "wander varies along the path (spread {spread}px)"
@@ -1396,9 +1409,7 @@ mod tests {
                 total += ms;
                 worst = worst.max(ms);
             }
-            eprintln!(
-                "incremental: 20 wide commits total {total:.1} ms, worst {worst:.1} ms"
-            );
+            eprintln!("incremental: 20 wide commits total {total:.1} ms, worst {worst:.1} ms");
             let live = CanvasStroke {
                 points: vec![WPoint::new(5.0, 200.0), WPoint::new(607.0, 210.0)],
                 widths: vec![],
@@ -1592,17 +1603,14 @@ mod tests {
     #[test]
     fn wet_profile_progresses_and_settles() {
         let now = std::time::Instant::now();
-        let ago = |ms: u64| Some(now.checked_sub(std::time::Duration::from_millis(ms)).unwrap());
+        let ago = |ms: u64| {
+            Some(
+                now.checked_sub(std::time::Duration::from_millis(ms))
+                    .unwrap(),
+            )
+        };
         // Fresh commit → 0; past WET_MS → 1; mid-way strictly between.
-        let p = wet_profile(
-            &[
-                Some(now),
-                ago(WET_MS + 100),
-                ago(WET_MS / 2),
-                None,
-            ],
-            now,
-        );
+        let p = wet_profile(&[Some(now), ago(WET_MS + 100), ago(WET_MS / 2), None], now);
         assert_eq!(p[0], 0.0);
         assert_eq!(p[1], 1.0);
         assert!(p[2] > 0.0 && p[2] < 1.0, "mid-way in (0,1), got {}", p[2]);
@@ -1636,7 +1644,10 @@ mod tests {
             "settled wash spreads further"
         );
         // settle == 1 is exactly the settled raster (seamless hand-off).
-        assert_eq!(rasterize_with(&el, &[1.0]).as_raw(), rasterize(&el).as_raw());
+        assert_eq!(
+            rasterize_with(&el, &[1.0]).as_raw(),
+            rasterize(&el).as_raw()
+        );
         // Ink strokes ignore the wet parameter.
         let ink = canvas_with(horizontal_stroke(CanvasBrush::Ink));
         assert_eq!(

@@ -10,10 +10,7 @@ use boundless::ai::canvas_ops::{CanvasOp, CanvasStyle, OpFillStyle, OpPoint};
 use boundless::ai::eval::replay;
 use boundless::camera::Camera;
 use boundless::history::History;
-use boundless::scene::{
-    Element, ElementKind, ElementStyle, FillStyle, Scene, SceneFile, WBounds,
-};
-
+use boundless::scene::{Element, ElementKind, ElementStyle, FillStyle, Scene, SceneFile, WBounds};
 
 // ---------------------------------------------------------------------------
 // I-SC-001 场景文件兼容矩阵
@@ -66,7 +63,10 @@ fn legacy_scene_without_newer_fields_loads() {
     let json2 = serde_json::to_string(&file).unwrap();
     let file2 = SceneFile::parse(&json2).unwrap();
     assert_eq!(file.elements.len(), file2.elements.len());
-    assert_eq!(file.elements[0].style.fill_style, file2.elements[0].style.fill_style);
+    assert_eq!(
+        file.elements[0].style.fill_style,
+        file2.elements[0].style.fill_style
+    );
 }
 
 /// 图片元素：场景文件往返无损（asset 名 + 显示框），且旧版字段组合共存。
@@ -132,7 +132,10 @@ fn history_over_mixed_mutations_restores_every_step() {
     snapshots.push(scene.elements.clone());
 
     history.record(&scene);
-    scene.get_mut(scene.elements[0].id).unwrap().translate(15.0, 25.0);
+    scene
+        .get_mut(scene.elements[0].id)
+        .unwrap()
+        .translate(15.0, 25.0);
     snapshots.push(scene.elements.clone());
 
     history.record(&scene);
@@ -214,7 +217,10 @@ fn replay_places_ops_where_their_args_say() {
 
     // 矩形：参数原样落位。
     let rect = &canvas.elements[0];
-    assert_eq!((rect.x, rect.y, rect.w, rect.h), (100.0, 200.0, 300.0, 200.0));
+    assert_eq!(
+        (rect.x, rect.y, rect.w, rect.h),
+        (100.0, 200.0, 300.0, 200.0)
+    );
 
     // 图片：回放无法解码像素，但布局框必须预留（真实尺寸不可读 → 4:3 估计）。
     let img = &canvas.elements[1];

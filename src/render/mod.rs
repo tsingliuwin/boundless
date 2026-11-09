@@ -156,12 +156,7 @@ pub fn shape_text(
                 strikethrough: None,
             }],
         };
-        let shaped = text_system.shape_line(
-            line_text.to_string().into(),
-            font_size,
-            &runs,
-            None,
-        );
+        let shaped = text_system.shape_line(line_text.to_string().into(), font_size, &runs, None);
         if s.is_empty() {
             shaped.with_len(0)
         } else {
@@ -225,7 +220,12 @@ fn is_cjk_char(c: char) -> bool {
 /// Split a line into `TextRun`s by script: CJK chars take `cjk_font`
 /// (Xiaolai), everything else keeps `base_font`. Runs alternate on script
 /// boundaries so a mixed sentence renders hand-drawn in both scripts.
-fn build_script_runs(line_text: &str, base_font: &Font, cjk_font: &Font, color: Hsla) -> Vec<TextRun> {
+fn build_script_runs(
+    line_text: &str,
+    base_font: &Font,
+    cjk_font: &Font,
+    color: Hsla,
+) -> Vec<TextRun> {
     let mut runs: Vec<TextRun> = Vec::new();
     let mut last_cjk: Option<bool> = None;
     for c in line_text.chars() {
@@ -239,7 +239,11 @@ fn build_script_runs(line_text: &str, base_font: &Font, cjk_font: &Font, color: 
         }
         runs.push(TextRun {
             len,
-            font: if is_cjk { cjk_font.clone() } else { base_font.clone() },
+            font: if is_cjk {
+                cjk_font.clone()
+            } else {
+                base_font.clone()
+            },
             color,
             background_color: None,
             underline: None,

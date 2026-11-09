@@ -10,10 +10,10 @@
 
 use boundless::board::{
     ArrowTool, BoardView, BringForward, BringToFront, CancelOp, DeleteSelection, DiamondTool,
-    EllipseTool, EraserTool, GotoNextPage, GotoPrevPage, HandTool, InsertImage, LineTool, OpenScene,
-    OpenSettings, PasteImage, PenTool, PresentExit, PresentStart, Quit, RectTool, Redo, SaveScene,
-    SelectTool, SendBackward, SendToBack, TextTool, ToggleAi, ToggleExplorer, Undo, ZoomIn, ZoomOut,
-    ZoomReset,
+    EllipseTool, EraserTool, GotoNextPage, GotoPrevPage, HandTool, InsertImage, LineTool,
+    OpenScene, OpenSettings, PasteImage, PenTool, PresentExit, PresentStart, Quit, RectTool, Redo,
+    SaveScene, SelectTool, SendBackward, SendToBack, TextTool, ToggleAi, ToggleExplorer, Undo,
+    ZoomIn, ZoomOut, ZoomReset,
 };
 use gpui::*;
 use gpui_component::Root;
@@ -108,12 +108,12 @@ fn main() {
             // matching hand-drawn look via FontFallbacks instead of print-style
             // KaiTi. Xiaolai's en-US family name record is "Xiaolai".
             let embedded_fonts: Vec<std::borrow::Cow<'static, [u8]>> = vec![
-                std::borrow::Cow::Borrowed(include_bytes!(
-                    "../assets/fonts/Excalifont.ttf"
-                ).as_slice()),
-                std::borrow::Cow::Borrowed(include_bytes!(
-                    "../assets/fonts/Xiaolai-Regular.ttf"
-                ).as_slice()),
+                std::borrow::Cow::Borrowed(
+                    include_bytes!("../assets/fonts/Excalifont.ttf").as_slice(),
+                ),
+                std::borrow::Cow::Borrowed(
+                    include_bytes!("../assets/fonts/Xiaolai-Regular.ttf").as_slice(),
+                ),
             ];
             if let Err(e) = cx.text_system().add_fonts(embedded_fonts) {
                 eprintln!("failed to load embedded fonts: {e}");
@@ -223,8 +223,12 @@ fn main() {
             // which reads them from gpui-component's global state rather than
             // through `cx.set_menus`. Registered here, before any window opens, so
             // the bar is populated on its first frame.
-            gpui_component::GlobalState::global_mut(cx)
-                .set_app_menus(boundless::board::app_menus().into_iter().map(Menu::owned).collect());
+            gpui_component::GlobalState::global_mut(cx).set_app_menus(
+                boundless::board::app_menus()
+                    .into_iter()
+                    .map(Menu::owned)
+                    .collect(),
+            );
 
             // Remove leftover `.old` files/dirs from a previous in-place update
             // (applied on the last run before restart). Best-effort, before any

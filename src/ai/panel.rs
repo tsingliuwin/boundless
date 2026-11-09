@@ -707,7 +707,11 @@ impl AiPanel {
                 cx.notify();
                 true
             }
-            AgentEvent::ExtractElements { ids, delete_source, reply } => {
+            AgentEvent::ExtractElements {
+                ids,
+                delete_source,
+                reply,
+            } => {
                 // 模板工具要元素本体：主线程解析前缀、深拷贝（含绑定标签），
                 // delete_source 时顺带删除原图；之后同样刷新共享快照。
                 let outcome = board
@@ -920,9 +924,9 @@ impl Render for AiPanel {
                     .gap_1()
                     .child(
                         // Collapse back to the compact bottom bar.
-                        header_action("收起", cx).on_click(cx.listener(
-                            |this, _, window, cx| this.set_compact(true, window, cx),
-                        )),
+                        header_action("收起", cx).on_click(
+                            cx.listener(|this, _, window, cx| this.set_compact(true, window, cx)),
+                        ),
                     )
                     .child(
                         header_action("新建", cx)
@@ -1226,7 +1230,9 @@ impl AiPanel {
             if active {
                 seg = seg.bg(theme.primary).text_color(theme.popover);
             } else {
-                seg = seg.hover(|s| s.bg(theme.muted)).text_color(theme.foreground);
+                seg = seg
+                    .hover(|s| s.bg(theme.muted))
+                    .text_color(theme.foreground);
             }
             control = control.child(seg.on_click(cx.listener(move |this, _, _, cx| {
                 this.set_reasoning(level, cx);
@@ -1304,7 +1310,9 @@ impl AiPanel {
                 if active {
                     row = row.bg(theme.accent).text_color(theme.primary);
                 } else {
-                    row = row.hover(|s| s.bg(theme.muted)).text_color(theme.foreground);
+                    row = row
+                        .hover(|s| s.bg(theme.muted))
+                        .text_color(theme.foreground);
                 }
                 // Select on mouse-down (not click): the popup unmounts on
                 // selection, which would swallow the click's up event.
@@ -1448,7 +1456,10 @@ impl AiPanel {
         } else if let Some(notice) = &self.notice {
             (notice.clone(), theme.danger)
         } else if let Some(stream) = &self.streaming {
-            (streaming_status_text(&stream.steps, &stream.buffer), theme.foreground)
+            (
+                streaming_status_text(&stream.steps, &stream.buffer),
+                theme.foreground,
+            )
         } else {
             // Idle: keep the last reply visible (tail) until the next send.
             let last = self.messages.last()?;
@@ -1508,7 +1519,8 @@ fn streaming_status_text(steps: &[super::client::AssistantStep], buffer: &str) -
 }
 
 /// Last `n` characters of `s`, newlines flattened so it reads as one line.
-fn tail_chars(s: &str, n: usize) -> String {    let one_line: String = s
+fn tail_chars(s: &str, n: usize) -> String {
+    let one_line: String = s
         .trim()
         .chars()
         .map(|c| if c == '\n' { ' ' } else { c })
@@ -1549,7 +1561,9 @@ impl AiPanel {
                                 StyledBodyKind::Reasoning,
                                 text.clone(),
                                 &self.live_reasoning_scroll,
-                                cx.entity_id(), cx)
+                                cx.entity_id(),
+                                cx,
+                            )
                             .into_any_element(),
                         )
                     } else {
@@ -1586,7 +1600,9 @@ impl AiPanel {
                         }
                         cx.notify();
                     }),
-                    body, cx)
+                    body,
+                    cx,
+                )
                 .into_any_element()
             }
             super::client::AssistantStep::Tool {
@@ -1640,7 +1656,9 @@ impl AiPanel {
                             window,
                             cx,
                         )
-                    }), cx)
+                    }),
+                    cx,
+                )
                 .into_any_element()
             }
             // Text steps: inline rendered, not collapsible. `default_open` carries
@@ -1710,7 +1728,9 @@ impl AiPanel {
                             window,
                             cx,
                         )
-                    }), cx)
+                    }),
+                    cx,
+                )
                 .into_any_element()
             }
             super::client::AssistantStep::Tool {
@@ -1760,7 +1780,9 @@ impl AiPanel {
                             window,
                             cx,
                         )
-                    }), cx)
+                    }),
+                    cx,
+                )
                 .into_any_element()
             }
             // Text steps: inline rendered, selectable, not collapsible.
@@ -1836,11 +1858,10 @@ impl AiPanel {
                 // Text steps above — TextView keys its parsed-content state by
                 // ElementId, and msg_idx*100000+step_idx can numerically
                 // collide with a plain message index.
-                step = step.child(
-                    div().text_sm().child(
+                step =
+                    step.child(div().text_sm().child(
                         TextView::markdown(("ai-msg-content", idx), content).selectable(true),
-                    ),
-                );
+                    ));
             }
 
             return step.into_any_element();
@@ -1894,7 +1915,9 @@ impl AiPanel {
                 }
                 cx.notify();
             }),
-            body, cx)
+            body,
+            cx,
+        )
         .into_any_element()
     }
 }
@@ -2201,7 +2224,7 @@ fn styled_body(
     window: &mut Window,
     cx: &mut App,
 ) -> impl IntoElement {
-        let theme = crate::theme::chrome(cx);
+    let theme = crate::theme::chrome(cx);
     let color = match kind {
         StyledBodyKind::Reasoning => theme.muted_foreground,
         StyledBodyKind::Tool => theme.foreground,
@@ -2222,9 +2245,7 @@ fn styled_body(
         .max_h(px(STEP_BODY_MAX_H))
         .overflow_y_scroll()
         .track_scroll(&scroll)
-        .on_scroll(move |event, window, cx| {
-            contained_scroll(&wheel, notify, event, window, cx)
-        })
+        .on_scroll(move |event, window, cx| contained_scroll(&wheel, notify, event, window, cx))
         .text_xs()
         .text_color(color)
         .border_l_1()
@@ -2270,9 +2291,7 @@ fn plain_body(
         .max_h(px(STEP_BODY_MAX_H))
         .overflow_y_scroll()
         .track_scroll(scroll)
-        .on_scroll(move |event, window, cx| {
-            contained_scroll(&wheel, notify, event, window, cx)
-        })
+        .on_scroll(move |event, window, cx| contained_scroll(&wheel, notify, event, window, cx))
         .text_xs()
         .text_color(color)
         .border_l_1()
@@ -2745,11 +2764,12 @@ mod tests {
         // 文本步 → 文本尾
         assert_eq!(
             streaming_status_text(
-                &[AssistantStep::Text { text: "done".into() }],
+                &[AssistantStep::Text {
+                    text: "done".into()
+                }],
                 "done"
             ),
             "done"
         );
     }
-
 }

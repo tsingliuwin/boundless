@@ -167,9 +167,7 @@ pub enum AgentEvent {
     ExtractElements {
         ids: Vec<String>,
         delete_source: bool,
-        reply: futures::channel::oneshot::Sender<
-            Result<Vec<crate::scene::Element>, CanvasOpError>,
-        >,
+        reply: futures::channel::oneshot::Sender<Result<Vec<crate::scene::Element>, CanvasOpError>>,
     },
     /// 模板工具：把一批预变换好的元素（盖章产物 / 气泡组合）整体插入画布，
     /// 一次入历史。reply 返回插入的短 id 列表（与 elements 顺序一致）。

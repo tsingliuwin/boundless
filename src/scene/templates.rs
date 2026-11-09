@@ -139,10 +139,7 @@ pub fn list(dir: &Path) -> Vec<TemplateSummary> {
             continue;
         };
         let Ok(t) = serde_json::from_str::<ComicTemplate>(&raw) else {
-            eprintln!(
-                "[templates] 跳过损坏的模板文件：{}",
-                path.display()
-            );
+            eprintln!("[templates] 跳过损坏的模板文件：{}", path.display());
             continue;
         };
         let bbox = union_bounds(&t.elements);
@@ -691,9 +688,7 @@ mod tests {
         t.elements.remove(0); // 去掉头部容器，标签成为孤儿
         let stamped = stamp(&t, 0.0, 0.0, 1.0, false, 0.0).unwrap();
         match &stamped[1].kind {
-            ElementKind::Text {
-                container_id, ..
-            } => assert_eq!(*container_id, None),
+            ElementKind::Text { container_id, .. } => assert_eq!(*container_id, None),
             other => panic!("期望文本，实际 {other:?}"),
         }
     }
@@ -734,9 +729,8 @@ mod tests {
                 // AABB 高 = 80·(cos20°+sin20°) ≈ 102；bounds 本身就是由
                 // 点集算出的，所以与原边长比才有意义）。
                 let ys: Vec<f64> = head.absolute_points().iter().map(|p| p.y).collect();
-                let span =
-                    ys.iter().cloned().fold(f64::MIN, f64::max)
-                        - ys.iter().cloned().fold(f64::INFINITY, f64::min);
+                let span = ys.iter().cloned().fold(f64::MIN, f64::max)
+                    - ys.iter().cloned().fold(f64::INFINITY, f64::min);
                 assert!(span > 80.0, "y 跨度 {span} 应大于原边长 80");
             }
             other => panic!("期望旋转后的多边形，实际 {other:?}"),
@@ -831,8 +825,12 @@ mod tests {
         let stamped = stamp(&t, 100.0, 100.0, 1.0, true, 0.0).unwrap();
         let abs = stamped[0].absolute_points();
         // 包围盒 x∈[100,160]，镜像中心 130：点 (160,120) → (100,120)。
-        assert!(abs.iter().any(|p| (p.x - 100.0).abs() < 1e-9 && (p.y - 120.0).abs() < 1e-9));
+        assert!(abs
+            .iter()
+            .any(|p| (p.x - 100.0).abs() < 1e-9 && (p.y - 120.0).abs() < 1e-9));
         // 点 (100,100) → (160,100)。
-        assert!(abs.iter().any(|p| (p.x - 160.0).abs() < 1e-9 && (p.y - 100.0).abs() < 1e-9));
+        assert!(abs
+            .iter()
+            .any(|p| (p.x - 160.0).abs() < 1e-9 && (p.y - 100.0).abs() < 1e-9));
     }
 }

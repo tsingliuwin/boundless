@@ -259,7 +259,11 @@ pub fn apply(
                     el.w = max_x - min_x;
                     el.h = max_y - min_y;
                     c.ops_applied += 1;
-                    msg = format!("已调整 id={} 的形状（{} 个点）。肢体动作已更新", el.id, pts.len());
+                    msg = format!(
+                        "已调整 id={} 的形状（{} 个点）。肢体动作已更新",
+                        el.id,
+                        pts.len()
+                    );
                 }
                 None => {
                     c.ops_failed += 1;
@@ -386,12 +390,7 @@ pub fn apply(
             c.ops_applied += 1;
             msg = format!("已添加多边形 id={id8}");
         }
-        CanvasOp::AddImage {
-            path,
-            x,
-            y,
-            width,
-        } => {
+        CanvasOp::AddImage { path, x, y, width } => {
             // The virtual canvas can't decode pixels; it reserves the layout
             // box so later ops (and overlap checks) see the image. Height
             // guesses 4:3 unless the file's real dimensions are readable.

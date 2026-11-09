@@ -479,17 +479,44 @@ mod tests {
         use crate::scene::{Brush, FillStyle, LineType, Shadow, StrokeStyle};
         let cases: Vec<(&str, Box<dyn FnOnce(&mut crate::scene::ElementStyle)>)> = vec![
             ("stroke", Box::new(|s: &mut _| s.stroke = 0xff0000)),
-            ("background set", Box::new(|s: &mut _| s.background = Some(0xa5d8ff))),
+            (
+                "background set",
+                Box::new(|s: &mut _| s.background = Some(0xa5d8ff)),
+            ),
             ("stroke_width", Box::new(|s: &mut _| s.stroke_width = 5.0)),
             ("roughness", Box::new(|s: &mut _| s.roughness = 2.5)),
-            ("stroke_style", Box::new(|s: &mut _| s.stroke_style = StrokeStyle::Dashed)),
-            ("line_type", Box::new(|s: &mut _| s.line_type = LineType::Curved)),
-            ("fill_style", Box::new(|s: &mut _| s.fill_style = FillStyle::Gradient)),
-            ("brush", Box::new(|s: &mut _| s.brush = Some(Brush::DryBrush))),
-            ("hachure_gap", Box::new(|s: &mut _| s.hachure_gap = Some(3.0))),
-            ("fill_weight", Box::new(|s: &mut _| s.fill_weight = Some(2.0))),
-            ("hachure_angle", Box::new(|s: &mut _| s.hachure_angle = Some(90.0))),
-            ("dry_density", Box::new(|s: &mut _| s.dry_density = Some(0.3))),
+            (
+                "stroke_style",
+                Box::new(|s: &mut _| s.stroke_style = StrokeStyle::Dashed),
+            ),
+            (
+                "line_type",
+                Box::new(|s: &mut _| s.line_type = LineType::Curved),
+            ),
+            (
+                "fill_style",
+                Box::new(|s: &mut _| s.fill_style = FillStyle::Gradient),
+            ),
+            (
+                "brush",
+                Box::new(|s: &mut _| s.brush = Some(Brush::DryBrush)),
+            ),
+            (
+                "hachure_gap",
+                Box::new(|s: &mut _| s.hachure_gap = Some(3.0)),
+            ),
+            (
+                "fill_weight",
+                Box::new(|s: &mut _| s.fill_weight = Some(2.0)),
+            ),
+            (
+                "hachure_angle",
+                Box::new(|s: &mut _| s.hachure_angle = Some(90.0)),
+            ),
+            (
+                "dry_density",
+                Box::new(|s: &mut _| s.dry_density = Some(0.3)),
+            ),
             ("dry_width", Box::new(|s: &mut _| s.dry_width = Some(1.5))),
             ("opacity", Box::new(|s: &mut _| s.opacity = 0.5)),
             (
@@ -498,7 +525,10 @@ mod tests {
             ),
         ];
         for (name, f) in cases {
-            assert!(changed_by(f), "fingerprint must change when `{name}` changes");
+            assert!(
+                changed_by(f),
+                "fingerprint must change when `{name}` changes"
+            );
         }
     }
 
@@ -592,19 +622,25 @@ mod tests {
             fingerprint(&mk(crate::scene::CanvasBrush::Ink, 0xff0000, 4.0)),
             "color"
         );
-        assert_ne!(base, fingerprint(&mk(crate::scene::CanvasBrush::Ink, 0x000000, 5.0)), "width");
+        assert_ne!(
+            base,
+            fingerprint(&mk(crate::scene::CanvasBrush::Ink, 0x000000, 5.0)),
+            "width"
+        );
 
         // Appending a stroke (the live-drawing path) invalidates.
         let mut el = mk(crate::scene::CanvasBrush::Ink, 0x000000, 4.0);
         let before = fingerprint(&el);
-        el.canvas_strokes_mut().unwrap().push(crate::scene::CanvasStroke {
-            points: vec![WPoint::new(1.0, 1.0), WPoint::new(2.0, 2.0)],
-            widths: Vec::new(),
-            color: 0x000000,
-            width: 4.0,
-            brush: crate::scene::CanvasBrush::Ink,
-            opacity: 1.0,
-        });
+        el.canvas_strokes_mut()
+            .unwrap()
+            .push(crate::scene::CanvasStroke {
+                points: vec![WPoint::new(1.0, 1.0), WPoint::new(2.0, 2.0)],
+                widths: Vec::new(),
+                color: 0x000000,
+                width: 4.0,
+                brush: crate::scene::CanvasBrush::Ink,
+                opacity: 1.0,
+            });
         assert_ne!(before, fingerprint(&el), "appended stroke");
     }
 

@@ -26,10 +26,10 @@ use crate::text::{utf16_to_utf8, utf8_to_utf16, TextEditSession};
 use crate::tools::{ActiveTool, DragState, PointTarget};
 use crate::workspace::{self, Workspace};
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::dialog::DialogButtonProps;
-use gpui_component::notification::Notification;
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::AppMenuBar;
+use gpui_component::notification::Notification;
 use gpui_component::progress::Progress;
 use gpui_component::ActiveTheme;
 use gpui_component::{Icon, IconName, Sizable, WindowExt};
@@ -235,7 +235,12 @@ fn e2e_debug(msg: &str) {
             .open(p)
         {
             use std::io::Write as _;
-            let _ = writeln!(f, "[{}] {}", chrono::Local::now().format("%H:%M:%S%.3f"), msg);
+            let _ = writeln!(
+                f,
+                "[{}] {}",
+                chrono::Local::now().format("%H:%M:%S%.3f"),
+                msg
+            );
         }
     }
 }
@@ -1245,28 +1250,26 @@ impl BoardView {
                 }
                 Ok(format!("已添加多边形 id={}", &added.to_string()[..8]))
             }
-            CanvasOp::AddImage {
-                path,
-                x,
-                y,
-                width,
-            } => {
+            CanvasOp::AddImage { path, x, y, width } => {
                 let p = std::path::PathBuf::from(&path);
                 let bytes = std::fs::read(&p).map_err(|e| {
                     CanvasOpError::invalid_args(format!("读取图片失败 {}: {e}", p.display()))
                 })?;
                 let decoded = image::load_from_memory(&bytes)
                     .map_err(|e| CanvasOpError::invalid_args(format!("图片解码失败: {e}")))?;
-                let (iw, ih) =
-                    (decoded.width().max(1) as f64, decoded.height().max(1) as f64);
+                let (iw, ih) = (
+                    decoded.width().max(1) as f64,
+                    decoded.height().max(1) as f64,
+                );
                 let ext = p
                     .extension()
                     .and_then(|e| e.to_str())
                     .unwrap_or("png")
                     .to_string();
-                let asset = self.assets.store(&bytes, &ext).map_err(|e| {
-                    CanvasOpError::internal(format!("写入图片资源失败: {e}"))
-                })?;
+                let asset = self
+                    .assets
+                    .store(&bytes, &ext)
+                    .map_err(|e| CanvasOpError::internal(format!("写入图片资源失败: {e}")))?;
                 let w = width.unwrap_or(320.0).clamp(20.0, 4000.0);
                 let h = w * ih / iw;
                 let vis = self.visible_world_bounds(cx);
@@ -1349,8 +1352,7 @@ impl BoardView {
                     }
                     crate::scene::taper_widths_tail(&mut s.widths);
                 }
-                let wet_brushes: Vec<CanvasBrush> =
-                    el_strokes.iter().map(|s| s.brush).collect();
+                let wet_brushes: Vec<CanvasBrush> = el_strokes.iter().map(|s| s.brush).collect();
                 let el = Element::new_with_id(
                     pre_assigned_id.unwrap_or_else(uuid::Uuid::new_v4),
                     ElementKind::Canvas {
@@ -1886,11 +1888,8 @@ impl BoardView {
                 let Some(uuid) = self.scene.find_by_id_prefix(&id) else {
                     return Err(CanvasOpError::not_found(format!("找不到元素 id={id}")));
                 };
-                if points.len() < 2 || points.iter().any(|p| !p.x.is_finite() || !p.y.is_finite())
-                {
-                    return Err(CanvasOpError::invalid_args(
-                        "points 需要 ≥ 2 个有限坐标点",
-                    ));
+                if points.len() < 2 || points.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
+                    return Err(CanvasOpError::invalid_args("points 需要 ≥ 2 个有限坐标点"));
                 }
                 let pts: Vec<WPoint> = points.into_iter().map(Into::into).collect();
                 let Some(el) = self.scene.elements.iter_mut().find(|e| e.id == uuid) else {
@@ -2119,11 +2118,7 @@ impl BoardView {
         }
         // 页面跟随：与 apply_canvas_op 的 follow 语义一致。
         if let Some(b) = bbox {
-            let page = crate::scene::pages::page_at(
-                &self.scene.pages,
-                b.center().x,
-                b.center().y,
-            );
+            let page = crate::scene::pages::page_at(&self.scene.pages, b.center().x, b.center().y);
             if let Some(p) = page {
                 if self.ai_focus_page != Some(p) {
                     self.ai_focus_page = Some(p);
@@ -2254,9 +2249,7 @@ impl BoardView {
         // 漫画等多格创作里保持人物与场景一致（同角色只 stamp 不重画）。
         let summaries = crate::scene::templates::list(&self.templates_dir());
         if !summaries.is_empty() {
-            body.push_str(
-                "素材模板库（用 stamp_template 复用，保证人物/场景跨格一致）：\n",
-            );
+            body.push_str("素材模板库（用 stamp_template 复用，保证人物/场景跨格一致）：\n");
             for t in &summaries {
                 body.push_str(&format!("- {}\n", t.one_line()));
             }
@@ -2563,7 +2556,8 @@ impl BoardView {
                     DownloadMsg::Done(res) => {
                         upd_trace(format!(
                             "download finished: {}",
-                            res.as_ref().map(|a| a.display().to_string())
+                            res.as_ref()
+                                .map(|a| a.display().to_string())
                                 .unwrap_or_else(|e| format!("FAILED: {e}"))
                         ));
                         this.update(cx, |this, cx| {
@@ -2664,7 +2658,12 @@ impl BoardView {
                 let span = win_w - explorer_left;
                 crate::ai::panel::compact_bar_width(span) / 2.0 + 12.0
             };
-            let center = win_w / 2.0 + if self.explorer_open { Self::EXPLORER_W / 2.0 } else { 0.0 };
+            let center = win_w / 2.0
+                + if self.explorer_open {
+                    Self::EXPLORER_W / 2.0
+                } else {
+                    0.0
+                };
             let left = (center - half).max(0.0);
             let right = (center + half).min(win_w);
             return f32::from(position.x) >= left && f32::from(position.x) <= right;
@@ -2839,7 +2838,10 @@ impl BoardView {
     ) -> anyhow::Result<ElementId> {
         let decoded =
             image::load_from_memory(bytes).map_err(|e| anyhow::anyhow!("图片解码失败: {e}"))?;
-        let (iw, ih) = (decoded.width().max(1) as f64, decoded.height().max(1) as f64);
+        let (iw, ih) = (
+            decoded.width().max(1) as f64,
+            decoded.height().max(1) as f64,
+        );
         let asset = self
             .assets
             .store(bytes, ext)
@@ -2865,7 +2867,11 @@ impl BoardView {
     }
 
     /// Insert from a file on disk (文件对话框与 agent add_image 共用)。
-    fn insert_image_file(&mut self, path: &Path, cx: &mut Context<Self>) -> anyhow::Result<ElementId> {
+    fn insert_image_file(
+        &mut self,
+        path: &Path,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<ElementId> {
         let bytes = std::fs::read(path)
             .map_err(|e| anyhow::anyhow!("读取图片失败 {}: {e}", path.display()))?;
         let ext = path
@@ -2905,7 +2911,9 @@ impl BoardView {
             ..ElementStyle::default()
         };
         let el = Element::new(
-            ElementKind::Canvas { strokes: Vec::new() },
+            ElementKind::Canvas {
+                strokes: Vec::new(),
+            },
             WBounds::new(x, y, w, h),
             style,
         );
@@ -2922,10 +2930,8 @@ impl BoardView {
         // Same rule as `open`: the picker runs in a detached task so the
         // modal loop never pumps tasks while an entity borrow is held.
         cx.spawn(async move |this, cx| {
-            let dialog = rfd::FileDialog::new().add_filter(
-                "图片",
-                &["png", "jpg", "jpeg", "gif", "webp", "bmp"],
-            );
+            let dialog = rfd::FileDialog::new()
+                .add_filter("图片", &["png", "jpg", "jpeg", "gif", "webp", "bmp"]);
             if let Some(path) = dialog.pick_file() {
                 this.update(cx, |this, cx| {
                     if let Err(e) = this.insert_image_file(&path, cx) {
@@ -3522,11 +3528,11 @@ impl BoardView {
                     .flex_row()
                     .gap_1()
                     .child(
-                        explorer_mini_button("explorer-new-board", "＋白板", cx).on_click(cx.listener(
-                            |this, _, window, cx| {
+                        explorer_mini_button("explorer-new-board", "＋白板", cx).on_click(
+                            cx.listener(|this, _, window, cx| {
                                 this.create_board_in(None, window, cx);
-                            },
-                        )),
+                            }),
+                        ),
                     )
                     .child(
                         explorer_mini_button("explorer-new-folder", "＋文件夹", cx).on_click(
@@ -3829,7 +3835,9 @@ impl BoardView {
                     if is_active {
                         row = row.bg(theme.accent).text_color(theme.primary);
                     } else {
-                        row = row.text_color(theme.foreground).hover(|s| s.bg(theme.muted));
+                        row = row
+                            .text_color(theme.foreground)
+                            .hover(|s| s.bg(theme.muted));
                     }
                     row = row.on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         // Like folders, a single click toggles the level;
@@ -4078,10 +4086,7 @@ impl BoardView {
                     // resize-follow state at the glide's endpoint.
                     let vp = self.viewport_bounds(cx);
                     to.zoom_to_fit(self.scene.pages[i].bounds(), vp.size);
-                    self.page_fit = Some((
-                        to,
-                        (vp.size.width.to_f64(), vp.size.height.to_f64()),
-                    ));
+                    self.page_fit = Some((to, (vp.size.width.to_f64(), vp.size.height.to_f64())));
                 }
                 self.animate_camera_to(to, 300, cx);
             }
@@ -5406,12 +5411,7 @@ impl BoardView {
         }
     }
 
-    fn on_scroll(
-        &mut self,
-        event: &ScrollEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_scroll(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
         // Presentation mode locks the camera: one page fills the view
         // exactly, and a wheel zoom would let the neighbors leak in.
         if self.presenting.is_some() {
@@ -6094,7 +6094,11 @@ impl BoardView {
                     text, font_size, ..
                 } => {
                     // 文字无描边概念：stroke_none 时回落深色，避免隐形文字。
-                    let stroke = if el.style.stroke_none { 0x1e1e1e } else { el.style.stroke };
+                    let stroke = if el.style.stroke_none {
+                        0x1e1e1e
+                    } else {
+                        el.style.stroke
+                    };
                     let color = color_u32(stroke, el.style.opacity);
                     let bg = el.style.background.map(|c| color_u32(c, el.style.opacity));
                     let shaped = self.text_cache.shaped(
@@ -6381,7 +6385,11 @@ impl BoardView {
         let el = self.scene.get(ed.element_id)?;
         let text = ed.session.text();
         let color = color_u32(
-            if el.style.stroke_none { 0x1e1e1e } else { el.style.stroke },
+            if el.style.stroke_none {
+                0x1e1e1e
+            } else {
+                el.style.stroke
+            },
             el.style.opacity,
         );
         let shaped = self.text_cache.shaped(
@@ -6954,22 +6962,29 @@ impl Render for BoardView {
                                     .flex_col()
                                     .gap_2()
                                     .py_1()
-                                    .child(div().text_sm().child(format!(
-                                        "版本 v{}",
-                                        env!("CARGO_PKG_VERSION")
-                                    )))
                                     .child(
-                                        div().text_sm().text_color(theme.muted_foreground)
+                                        div()
+                                            .text_sm()
+                                            .child(format!("版本 v{}", env!("CARGO_PKG_VERSION"))),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(theme.muted_foreground)
                                             .child("无限手绘白板 —— AI 智能体直接在画布上作画。"),
                                     )
                                     .child(
-                                        div().text_sm().text_color(theme.muted_foreground)
+                                        div()
+                                            .text_sm()
+                                            .text_color(theme.muted_foreground)
                                             .child("以 AGPL-3.0 许可证开源。"),
                                     ),
                             )
                         })
                         .button_props(
-                            DialogButtonProps::default().ok_text("知道了").on_ok(|_, _, _| true),
+                            DialogButtonProps::default()
+                                .ok_text("知道了")
+                                .on_ok(|_, _, _| true),
                         )
                 });
             }))
@@ -7079,9 +7094,14 @@ fn paint_text_item(item: &TextPaintItem, window: &mut Window, cx: &mut App) {
             item.origin.x + item.line_offsets.get(i).copied().unwrap_or(px(0.0)),
             item.origin.y + item.line_height * i as f32,
         );
-        let _ = line
-            .line
-            .paint(origin, item.line_height, gpui::TextAlign::Left, None, window, cx);
+        let _ = line.line.paint(
+            origin,
+            item.line_height,
+            gpui::TextAlign::Left,
+            None,
+            window,
+            cx,
+        );
     }
 }
 
@@ -7102,7 +7122,6 @@ const ROUGHNESSES: [f32; 3] = [0.0, 1.0, 2.0];
 /// Font size presets: (font size in world units, glyph icon size in px).
 /// The button icon is an "A" drawn at increasing sizes, Excalidraw-style.
 const TEXT_SIZES: [(f64, f32); 4] = [(16.0, 10.0), (24.0, 13.0), (36.0, 16.0), (56.0, 19.0)];
-
 
 fn bar_container(cx: &App) -> Div {
     let theme = cx.theme();
@@ -7427,7 +7446,7 @@ impl BoardView {
     /// the window is already maximized. Close quits (single-window app:
     /// closing the window quits the process, matching the "退出" menu item).
     fn window_controls(&self, window: &Window, cx: &mut Context<Self>) -> Div {
-    let theme = crate::theme::chrome(cx);
+        let theme = crate::theme::chrome(cx);
         let max_icon = if window.is_maximized() {
             IconName::WindowRestore
         } else {
@@ -7496,7 +7515,12 @@ impl BoardView {
                     .justify_center()
                     .gap_1()
                     .text_color(theme.muted_foreground)
-                    .child(div().w(px(ic::S)).h(px(ic::S)).child(ic::download(icon_color(false, cx))))
+                    .child(
+                        div()
+                            .w(px(ic::S))
+                            .h(px(ic::S))
+                            .child(ic::download(icon_color(false, cx))),
+                    )
                     // gpui-kit's Progress draws the real bar; its `value` is
                     // 0..=100 (it clamps), while our fraction is 0..1.
                     .child(
@@ -7541,13 +7565,17 @@ impl BoardView {
                 IconName::WindowMinimize,
                 theme.muted,
                 theme.foreground,
-                |_, window, _| window.minimize_window(), cx))
+                |_, window, _| window.minimize_window(),
+                cx,
+            ))
             .child(window_control_button(
                 "win-max",
                 max_icon,
                 theme.muted,
                 theme.foreground,
-                |_, window, _| crate::platform::toggle_maximize(window), cx))
+                |_, window, _| crate::platform::toggle_maximize(window),
+                cx,
+            ))
             // Soft red hover (light tint bg + red icon) instead of a harsh
             // solid red square - still reads as the "close" button but is
             // gentler, and matches the gray hovers of the other two in
@@ -7558,7 +7586,9 @@ impl BoardView {
                 IconName::WindowClose,
                 rgb(0xffebe9),
                 rgb(0xcf222e),
-                |_, _, cx| cx.quit(), cx))
+                |_, _, cx| cx.quit(),
+                cx,
+            ))
     }
 
     fn apply_style_to_selection(
@@ -7741,7 +7771,9 @@ impl BoardView {
                 bar_icon_button(
                     "白板",
                     explorer_active,
-                    ic::explorer(icon_color(explorer_active, cx)), cx)
+                    ic::explorer(icon_color(explorer_active, cx)),
+                    cx,
+                )
                 .on_click(move |_, _, cx| {
                     weak_explorer
                         .update(cx, |this, cx| this.toggle_explorer(cx))
@@ -7772,7 +7804,9 @@ impl BoardView {
                 bar_icon_button(
                     gpui::ElementId::Name(label.into()),
                     active,
-                    icon_fn(icon_color(active, cx)), cx)
+                    icon_fn(icon_color(active, cx)),
+                    cx,
+                )
                 .on_click(move |_, window, cx| {
                     weak.update(cx, |this, cx| this.set_tool(tool, window, cx))
                         .ok();
@@ -8006,10 +8040,13 @@ impl BoardView {
             };
             row = row.child(swatch.on_click(move |_, _, cx| {
                 weak.update(cx, |this, cx| {
-                    this.apply_style_to_selection(|s| {
-                        s.stroke = color;
-                        s.stroke_none = false;
-                    }, cx)
+                    this.apply_style_to_selection(
+                        |s| {
+                            s.stroke = color;
+                            s.stroke_none = false;
+                        },
+                        cx,
+                    )
                 })
                 .ok();
             }));
@@ -8056,150 +8093,147 @@ impl BoardView {
         }
 
         // 填充样式：排线（hachure 手绘线）/ 密排（近乎实心）/ 实心
-            // （色块）。选中或预设均可切换，作用于 shape 的 background 填充。
-            // 高亮跟随**所选形状**的实际填充（整组一致时），没有选择时才
-            // 回退到"最近使用"的预设样式。
-            // 填充样式只对有可填充内部的形状生效。开放折线（线/箭头/笔迹）
-            // 渲染不出任何填充，与背景色行同条件隐藏，避免「点了没反应」。
-            if show_background {
-                let mut fs_row = div().flex().flex_row().gap_1();
-                let active_fill = self.selection_fill_style().unwrap_or(self.style.fill_style);
-                for (ix, (label, fs)) in [
-                    ("纹", crate::scene::FillStyle::Hachure),
-                    ("密", crate::scene::FillStyle::Dense),
-                    ("实", crate::scene::FillStyle::Solid),
-                    ("彩", crate::scene::FillStyle::Watercolor),
-                    ("渐", crate::scene::FillStyle::Gradient),
-                ]
-                .into_iter()
-                .enumerate()
-                {
-                    let weak = weak.clone();
-                    let active = active_fill == fs;
-                    fs_row = fs_row.child(
-                        div()
-                            .id(gpui::ElementId::named_usize("fill-style", ix))
-                            .size_5()
-                            .rounded_sm()
-                            .border_1()
-                            .cursor_pointer()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_xs()
-                            .child(label)
-                            .when(active, |d| d.border_color(rgb(SELECTION_COLOR)).border_2())
-                            .when(!active, |d| d.border_color(theme.border))
-                            .on_click(move |_, _, cx| {
-                                weak.update(cx, |this, cx| {
-                                    this.apply_style_to_selection(
-                                        |s| apply_fill_style(s, fs),
-                                        cx,
-                                    )
-                                })
-                                .ok();
-                            }),
-                    );
-                }
-                bar = bar.child(fs_row);
+        // （色块）。选中或预设均可切换，作用于 shape 的 background 填充。
+        // 高亮跟随**所选形状**的实际填充（整组一致时），没有选择时才
+        // 回退到"最近使用"的预设样式。
+        // 填充样式只对有可填充内部的形状生效。开放折线（线/箭头/笔迹）
+        // 渲染不出任何填充，与背景色行同条件隐藏，避免「点了没反应」。
+        if show_background {
+            let mut fs_row = div().flex().flex_row().gap_1();
+            let active_fill = self.selection_fill_style().unwrap_or(self.style.fill_style);
+            for (ix, (label, fs)) in [
+                ("纹", crate::scene::FillStyle::Hachure),
+                ("密", crate::scene::FillStyle::Dense),
+                ("实", crate::scene::FillStyle::Solid),
+                ("彩", crate::scene::FillStyle::Watercolor),
+                ("渐", crate::scene::FillStyle::Gradient),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let weak = weak.clone();
+                let active = active_fill == fs;
+                fs_row = fs_row.child(
+                    div()
+                        .id(gpui::ElementId::named_usize("fill-style", ix))
+                        .size_5()
+                        .rounded_sm()
+                        .border_1()
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_xs()
+                        .child(label)
+                        .when(active, |d| d.border_color(rgb(SELECTION_COLOR)).border_2())
+                        .when(!active, |d| d.border_color(theme.border))
+                        .on_click(move |_, _, cx| {
+                            weak.update(cx, |this, cx| {
+                                this.apply_style_to_selection(|s| apply_fill_style(s, fs), cx)
+                            })
+                            .ok();
+                        }),
+                );
             }
+            bar = bar.child(fs_row);
+        }
 
-            // 笔刷（钢笔/铅笔/飞白）只作用于手绘笔迹（Freedraw）：钢笔 =
-            // 实心墨迹、铅笔 = 颗粒细线、飞白 = 断续干笔。对文字和形状
-            // 无效，所以只在画笔工具激活（作为后续笔迹预设）或选中了
-            // 笔迹时显示，避免选中文字时点了没反应的困惑。
-            let stroke_sel = !self.selection.is_empty()
-                && self.selection.iter().any(|id| {
-                    self.scene
-                        .get(*id)
-                        .is_some_and(|e| matches!(e.kind, ElementKind::Freedraw { .. }))
-                });
-            if matches!(self.tool, ActiveTool::Pen) || stroke_sel {
-                let mut br_row = div().flex().flex_row().gap_1();
-                for (ix, (label, br)) in [
-                    ("钢笔", None),
-                    ("铅笔", Some(crate::scene::Brush::Pencil)),
-                    ("飞白", Some(crate::scene::Brush::DryBrush)),
-                ]
-                .into_iter()
-                .enumerate()
-                {
-                    let weak = weak.clone();
-                    let active = self.style.brush == br;
-                    br_row = br_row.child(
-                        div()
-                            .id(gpui::ElementId::named_usize("brush", ix))
-                            .px_1p5()
-                            .h_5()
-                            .rounded_sm()
-                            .border_1()
-                            .cursor_pointer()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_xs()
-                            .child(label)
-                            .when(active, |d| d.border_color(rgb(SELECTION_COLOR)).border_2())
-                            .when(!active, |d| d.border_color(theme.border))
-                            .on_click(move |_, _, cx| {
-                                weak.update(cx, |this, cx| {
-                                    this.apply_style_to_selection(|s| s.brush = br, cx)
-                                })
-                                .ok();
-                            }),
-                    );
-                }
-                bar = bar.child(br_row);
+        // 笔刷（钢笔/铅笔/飞白）只作用于手绘笔迹（Freedraw）：钢笔 =
+        // 实心墨迹、铅笔 = 颗粒细线、飞白 = 断续干笔。对文字和形状
+        // 无效，所以只在画笔工具激活（作为后续笔迹预设）或选中了
+        // 笔迹时显示，避免选中文字时点了没反应的困惑。
+        let stroke_sel = !self.selection.is_empty()
+            && self.selection.iter().any(|id| {
+                self.scene
+                    .get(*id)
+                    .is_some_and(|e| matches!(e.kind, ElementKind::Freedraw { .. }))
+            });
+        if matches!(self.tool, ActiveTool::Pen) || stroke_sel {
+            let mut br_row = div().flex().flex_row().gap_1();
+            for (ix, (label, br)) in [
+                ("钢笔", None),
+                ("铅笔", Some(crate::scene::Brush::Pencil)),
+                ("飞白", Some(crate::scene::Brush::DryBrush)),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let weak = weak.clone();
+                let active = self.style.brush == br;
+                br_row = br_row.child(
+                    div()
+                        .id(gpui::ElementId::named_usize("brush", ix))
+                        .px_1p5()
+                        .h_5()
+                        .rounded_sm()
+                        .border_1()
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_xs()
+                        .child(label)
+                        .when(active, |d| d.border_color(rgb(SELECTION_COLOR)).border_2())
+                        .when(!active, |d| d.border_color(theme.border))
+                        .on_click(move |_, _, cx| {
+                            weak.update(cx, |this, cx| {
+                                this.apply_style_to_selection(|s| s.brush = br, cx)
+                            })
+                            .ok();
+                        }),
+                );
             }
+            bar = bar.child(br_row);
+        }
 
-            // 位图画布笔刷（水彩/钢笔/飞白）：像素级笔刷，只作用于画进
-            // 位图画布的笔迹（下一个笔画进画布时生效）。水彩 = 半透明
-            // 分层晕染 + 边缘沉色，飞白 = 干笔断续颗粒。选中画布时显示
-            // （插入画布后自动选中，立刻可挑笔刷）。
-            let canvas_sel = !self.selection.is_empty()
-                && self.selection.iter().any(|id| {
-                    self.scene
-                        .get(*id)
-                        .is_some_and(|e| matches!(e.kind, ElementKind::Canvas { .. }))
-                });
-            if canvas_sel {
-                let mut cbr_row = div().flex().flex_row().gap_1();
-                for (ix, (label, br)) in [
-                    ("水彩", crate::scene::CanvasBrush::Watercolor),
-                    ("钢笔", crate::scene::CanvasBrush::Ink),
-                    ("飞白", crate::scene::CanvasBrush::DryBrush),
-                ]
-                .into_iter()
-                .enumerate()
-                {
-                    let weak = weak.clone();
-                    let active = self.canvas_brush == br;
-                    cbr_row = cbr_row.child(
-                        div()
-                            .id(gpui::ElementId::named_usize("canvas-brush", ix))
-                            .px_1p5()
-                            .h_5()
-                            .rounded_sm()
-                            .border_1()
-                            .cursor_pointer()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_xs()
-                            .child(label)
-                            .when(active, |d| d.border_color(rgb(SELECTION_COLOR)).border_2())
-                            .when(!active, |d| d.border_color(theme.border))
-                            .on_click(move |_, _, cx| {
-                                weak.update(cx, |this, cx| {
-                                    this.canvas_brush = br;
-                                    cx.notify();
-                                })
-                                .ok();
-                            }),
-                    );
-                }
-                bar = bar.child(cbr_row);
+        // 位图画布笔刷（水彩/钢笔/飞白）：像素级笔刷，只作用于画进
+        // 位图画布的笔迹（下一个笔画进画布时生效）。水彩 = 半透明
+        // 分层晕染 + 边缘沉色，飞白 = 干笔断续颗粒。选中画布时显示
+        // （插入画布后自动选中，立刻可挑笔刷）。
+        let canvas_sel = !self.selection.is_empty()
+            && self.selection.iter().any(|id| {
+                self.scene
+                    .get(*id)
+                    .is_some_and(|e| matches!(e.kind, ElementKind::Canvas { .. }))
+            });
+        if canvas_sel {
+            let mut cbr_row = div().flex().flex_row().gap_1();
+            for (ix, (label, br)) in [
+                ("水彩", crate::scene::CanvasBrush::Watercolor),
+                ("钢笔", crate::scene::CanvasBrush::Ink),
+                ("飞白", crate::scene::CanvasBrush::DryBrush),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let weak = weak.clone();
+                let active = self.canvas_brush == br;
+                cbr_row = cbr_row.child(
+                    div()
+                        .id(gpui::ElementId::named_usize("canvas-brush", ix))
+                        .px_1p5()
+                        .h_5()
+                        .rounded_sm()
+                        .border_1()
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_xs()
+                        .child(label)
+                        .when(active, |d| d.border_color(rgb(SELECTION_COLOR)).border_2())
+                        .when(!active, |d| d.border_color(theme.border))
+                        .on_click(move |_, _, cx| {
+                            weak.update(cx, |this, cx| {
+                                this.canvas_brush = br;
+                                cx.notify();
+                            })
+                            .ok();
+                        }),
+                );
             }
+            bar = bar.child(cbr_row);
+        }
 
         // Text options: font size presets + font family + alignment, shown
         // as glyph icons. With no selection (Text tool active) the buttons
@@ -8242,7 +8276,9 @@ impl BoardView {
                         active,
                         *glyph_px,
                         "A",
-                        None, cx)
+                        None,
+                        cx,
+                    )
                     .on_click(move |_, _, cx| {
                         weak.update(cx, |this, cx| this.apply_style_to_text(|fs| *fs = size, cx))
                             .ok();
@@ -8277,7 +8313,9 @@ impl BoardView {
                         active,
                         15.0,
                         "Aa",
-                        Some(family), cx)
+                        Some(family),
+                        cx,
+                    )
                     .on_click(move |_, _, cx| {
                         weak.update(cx, |this, cx| this.set_text_font(family, cx))
                             .ok();
@@ -8309,7 +8347,9 @@ impl BoardView {
                     bar_icon_button(
                         gpui::ElementId::named_usize("al", ix),
                         active,
-                        ic::align_icon(icon_color(active, cx), a), cx)
+                        ic::align_icon(icon_color(active, cx), a),
+                        cx,
+                    )
                     .on_click(move |_, _, cx| {
                         weak.update(cx, |this, cx| this.set_text_align(a, cx)).ok();
                     }),
@@ -8329,7 +8369,9 @@ impl BoardView {
                     bar_icon_button(
                         gpui::ElementId::named_usize("sw", width as usize),
                         active,
-                        ic::stroke_width_icon(icon_color(active, cx), px_w), cx)
+                        ic::stroke_width_icon(icon_color(active, cx), px_w),
+                        cx,
+                    )
                     .on_click(move |_, _, cx| {
                         weak.update(cx, |this, cx| {
                             this.apply_shape_style(|s| s.stroke_width = width, cx)
@@ -8351,7 +8393,9 @@ impl BoardView {
                     bar_icon_button(
                         gpui::ElementId::named_usize("pt", 0),
                         active,
-                        ic::taper_icon(icon_color(active, cx)), cx)
+                        ic::taper_icon(icon_color(active, cx)),
+                        cx,
+                    )
                     .on_click(move |_, _, cx| {
                         weak.update(cx, |this, cx| {
                             this.pen_taper = !this.pen_taper;
@@ -8371,7 +8415,9 @@ impl BoardView {
                     bar_icon_button(
                         gpui::ElementId::named_usize("rg", roughness.to_bits() as usize),
                         active,
-                        ic::roughness_icon(icon_color(active, cx), roughness), cx)
+                        ic::roughness_icon(icon_color(active, cx), roughness),
+                        cx,
+                    )
                     .on_click(move |_, _, cx| {
                         weak.update(cx, |this, cx| {
                             this.apply_shape_style(|s| s.roughness = roughness, cx)
@@ -8414,7 +8460,9 @@ impl BoardView {
                     bar_icon_button(
                         gpui::ElementId::named_usize("lt", ix),
                         active,
-                        ic::line_type_icon(icon_color(active, cx), lt), cx)
+                        ic::line_type_icon(icon_color(active, cx), lt),
+                        cx,
+                    )
                     .on_click(move |_, _, cx| {
                         weak.update(cx, |this, cx| {
                             this.apply_shape_style(|s| s.line_type = lt, cx)
@@ -8522,7 +8570,11 @@ impl BoardView {
                     .child(div().child(size_text)),
             );
         if let Some(t) = text_content {
-            card = card.child(div().text_color(theme.foreground).child(format!("文字: {t}")));
+            card = card.child(
+                div()
+                    .text_color(theme.foreground)
+                    .child(format!("文字: {t}")),
+            );
         }
         // Position: right-aligned, but avoid the AI panel.
         if panel_open {
@@ -8595,7 +8647,9 @@ impl BoardView {
                 true,
                 move |_, _, cx| {
                     let _ = weak.update(cx, |b, cx| b.delete_vertex(idx, cx));
-                }, cx));
+                },
+                cx,
+            ));
             card = card.child(menu_separator(cx));
         }
 
@@ -8637,7 +8691,9 @@ impl BoardView {
                 enabled,
                 move |_, _, cx| {
                     let _ = weak.update(cx, |b, cx| b.reorder_layers(op, cx));
-                }, cx));
+                },
+                cx,
+            ));
         }
 
         card = card.child(menu_separator(cx));
@@ -8655,7 +8711,9 @@ impl BoardView {
                     b.delete_selection(cx);
                     b.context_menu = None;
                 });
-            }, cx));
+            },
+            cx,
+        ));
 
         Some(card.into_any_element())
     }
@@ -8749,24 +8807,18 @@ impl BoardView {
                         // Texture picker: a popover like the AI bar's 低/中/高 —
                         // the button toggles the panel, options pick directly;
                         // no cycling through states.
-                        let mut tex_button = div()
-                            .id("texture-picker")
-                            .relative()
-                            .child(
-                                // No active tint on the button itself — every
-                                // texture state reads the same (白板 included).
-                                bar_button(tex_label, false, cx).on_click(
-                                    move |_, _, cx| {
-                                        weak_tex
-                                            .update(cx, |this, cx| {
-                                                this.texture_picker_open =
-                                                    !this.texture_picker_open;
-                                                cx.notify();
-                                            })
-                                            .ok();
-                                    },
-                                ),
-                            );
+                        let mut tex_button = div().id("texture-picker").relative().child(
+                            // No active tint on the button itself — every
+                            // texture state reads the same (白板 included).
+                            bar_button(tex_label, false, cx).on_click(move |_, _, cx| {
+                                weak_tex
+                                    .update(cx, |this, cx| {
+                                        this.texture_picker_open = !this.texture_picker_open;
+                                        cx.notify();
+                                    })
+                                    .ok();
+                            }),
+                        );
                         if self.texture_picker_open {
                             let mut card = div()
                                 .absolute()
@@ -8880,16 +8932,21 @@ impl BoardView {
                             }),
                     )
                     .child(
-                        bar_icon_button("toggle-grid", grid_on, ic::grid(icon_color(grid_on, cx)), cx)
-                            .on_click(move |_, _, cx| {
-                                weak_grid
-                                    .update(cx, |this, cx| {
-                                        this.show_grid = !this.show_grid;
-                                        this.mark_dirty();
-                                        cx.notify();
-                                    })
-                                    .ok();
-                            }),
+                        bar_icon_button(
+                            "toggle-grid",
+                            grid_on,
+                            ic::grid(icon_color(grid_on, cx)),
+                            cx,
+                        )
+                        .on_click(move |_, _, cx| {
+                            weak_grid
+                                .update(cx, |this, cx| {
+                                    this.show_grid = !this.show_grid;
+                                    this.mark_dirty();
+                                    cx.notify();
+                                })
+                                .ok();
+                        }),
                     )
                     // Canvas surface swatches: white board / green chalkboard
                     // / black chalkboard. Same colors the AI's
@@ -8966,7 +9023,9 @@ impl BoardView {
                         false,
                         Icon::new(IconName::Plus)
                             .size(px(crate::icons::S))
-                            .text_color(icon_color(false, cx)), cx)
+                            .text_color(icon_color(false, cx)),
+                        cx,
+                    )
                     .on_click(move |_, _, cx| {
                         weak_add_empty
                             .update(cx, |this, cx| this.add_page_manual(cx))
@@ -8981,7 +9040,9 @@ impl BoardView {
                         false,
                         Icon::new(IconName::ChevronLeft)
                             .size(px(crate::icons::S))
-                            .text_color(icon_color(false, cx)), cx)
+                            .text_color(icon_color(false, cx)),
+                        cx,
+                    )
                     .on_click(move |_, _, cx| {
                         weak_prev
                             .update(cx, |this, cx| this.goto_prev_page(cx))
@@ -9002,7 +9063,9 @@ impl BoardView {
                         false,
                         Icon::new(IconName::ChevronRight)
                             .size(px(crate::icons::S))
-                            .text_color(icon_color(false, cx)), cx)
+                            .text_color(icon_color(false, cx)),
+                        cx,
+                    )
                     .on_click(move |_, _, cx| {
                         weak_next
                             .update(cx, |this, cx| this.goto_next_page(cx))
@@ -9020,7 +9083,9 @@ impl BoardView {
                         false,
                         Icon::new(IconName::Plus)
                             .size(px(crate::icons::S))
-                            .text_color(icon_color(false, cx)), cx)
+                            .text_color(icon_color(false, cx)),
+                        cx,
+                    )
                     .on_click(move |_, _, cx| {
                         weak_add
                             .update(cx, |this, cx| this.add_page_manual(cx))
@@ -9028,13 +9093,12 @@ impl BoardView {
                     }),
                 )
                 .child(
-                    bar_icon_button("page-del", false, ic::trash(icon_color(false, cx)), cx).on_click(
-                        move |_, _, cx| {
+                    bar_icon_button("page-del", false, ic::trash(icon_color(false, cx)), cx)
+                        .on_click(move |_, _, cx| {
                             weak_del
                                 .update(cx, |this, cx| this.delete_current_page(cx))
                                 .ok();
-                        },
-                    ),
+                        }),
                 )
             })
     }
@@ -9066,7 +9130,9 @@ impl BoardView {
                                 false,
                                 Icon::new(IconName::ChevronLeft)
                                     .size(ic_s)
-                                    .text_color(icon_color(false, cx)), cx)
+                                    .text_color(icon_color(false, cx)),
+                                cx,
+                            )
                             .on_click(move |_, _, cx| {
                                 weak_prev
                                     .update(cx, |this, cx| this.goto_prev_page(cx))
@@ -9086,7 +9152,9 @@ impl BoardView {
                                 false,
                                 Icon::new(IconName::ChevronRight)
                                     .size(ic_s)
-                                    .text_color(icon_color(false, cx)), cx)
+                                    .text_color(icon_color(false, cx)),
+                                cx,
+                            )
                             .on_click(move |_, _, cx| {
                                 weak_next
                                     .update(cx, |this, cx| this.goto_next_page(cx))
@@ -9107,7 +9175,9 @@ impl BoardView {
                                 false,
                                 Icon::new(IconName::Close)
                                     .size(ic_s)
-                                    .text_color(icon_color(false, cx)), cx)
+                                    .text_color(icon_color(false, cx)),
+                                cx,
+                            )
                             .on_click(move |_, window, cx| {
                                 weak_exit
                                     .update(cx, |this, cx| this.exit_presenting(window, cx))
@@ -9158,8 +9228,7 @@ impl BoardView {
             .text_color(theme.muted_foreground)
             .child(text)
     }
-
-    }
+}
 
 /// The update-confirm dialog (0.7 `open_dialog`): snapshot of `update_state`
 /// at open time. Ready → 稍后 / 重启应用 (restart installs); Error → 知道了
@@ -9170,7 +9239,7 @@ fn open_update_dialog(
     state: &crate::updater::UpdateState,
     weak: &WeakEntity<BoardView>,
 ) {
-        let theme = crate::theme::chrome(cx);
+    let theme = crate::theme::chrome(cx);
     use crate::updater::UpdateState;
     let (title, body, restartable) = match state {
         UpdateState::Ready { version, notes, .. } => {
@@ -9225,16 +9294,16 @@ fn open_update_dialog(
                     .on_cancel(|_, _, _| true),
             )
         } else {
-            dialog.button_props(
-                DialogButtonProps::default().ok_text("知道了").on_ok(move |_, _, cx| {
+            dialog.button_props(DialogButtonProps::default().ok_text("知道了").on_ok(
+                move |_, _, cx| {
                     // Error is transient — acknowledge it back to Idle so
                     // the red title-bar icon goes away.
                     weak_cancel
                         .update(cx, |this, cx| this.dismiss_update(cx))
                         .ok();
                     true
-                }),
-            )
+                },
+            ))
         }
     });
 }
@@ -9337,7 +9406,11 @@ fn paper_tile(kind: PaperTexture) -> std::sync::Arc<RenderImage> {
             // 黑板：墨绿底上的白色粉笔粉尘（8–33% alpha，经典黑板质感）
             PaperTexture::Chalkboard => {
                 let lum = 0xf2;
-                let a = if v % 6 == 0 { ((v >> 8) % 64 + 20) as u8 } else { 0 };
+                let a = if v % 6 == 0 {
+                    ((v >> 8) % 64 + 20) as u8
+                } else {
+                    0
+                };
                 (lum, lum, lum, a)
             }
         };
