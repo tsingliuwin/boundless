@@ -25,9 +25,12 @@ use crate::settings_page::SettingsPage;
 use crate::text::{utf16_to_utf8, utf8_to_utf16, TextEditSession};
 use crate::tools::{ActiveTool, DragState, PointTarget};
 use crate::workspace::{self, Workspace};
+use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::dialog::DialogButtonProps;
 use gpui_component::notification::Notification;
+use gpui_component::menu::AppMenuBar;
+use gpui_component::progress::Progress;
 use gpui_component::ActiveTheme;
 use gpui_component::{Icon, IconName, Sizable, WindowExt};
 
@@ -59,6 +62,8 @@ pub(crate) fn apply_fill_style(s: &mut ElementStyle, fs: crate::scene::FillStyle
 actions!(
     boundless,
     [
+        /// 新建白板：丢弃当前画布，换一张全新的空白画布。
+        NewBoard,
         Undo,
         Redo,
         SaveScene,
@@ -101,6 +106,46 @@ actions!(
         InsertCanvas,
     ]
 );
+
+/// The application's content menus (File / Edit / View / Help).
+///
+/// Returned fresh on every call because `Menu` is not `Clone`. Consumers live on
+/// both sides of the platform split: macOS takes it through `cx.set_menus`, while
+/// Windows/Linux register the same list as `OwnedMenu`s in
+/// `gpui_component::GlobalState` for the in-app `AppMenuBar` to render.
+///
+/// Key hints are not spelled into the labels: the popup resolves each action's
+/// keystroke from the keymap, so binding changes stay visible without edits here.
+/// The leading application menu (macOS-only, renamed to the app name) is added by
+/// the caller — it makes no sense as a menu inside the in-app bar.
+pub fn app_menus() -> Vec<Menu> {
+    vec![
+        Menu::new("文件").items(vec![
+            MenuItem::action("新建白板", NewBoard),
+            MenuItem::action("打开场景…", OpenScene),
+            MenuItem::action("保存场景", SaveScene),
+            MenuItem::separator(),
+            MenuItem::action("插入图片…", InsertImage),
+            MenuItem::action("插入位图画布", InsertCanvas),
+            MenuItem::separator(),
+            MenuItem::action("退出 Boundless", Quit),
+        ]),
+        Menu::new("编辑").items(vec![
+            MenuItem::action("撤销", Undo),
+            MenuItem::action("重做", Redo),
+        ]),
+        Menu::new("视图").items(vec![
+            MenuItem::action("放大", ZoomIn),
+            MenuItem::action("缩小", ZoomOut),
+            MenuItem::separator(),
+            MenuItem::action("重置缩放", ZoomReset),
+        ]),
+        Menu::new("帮助").items(vec![
+            MenuItem::action("检查更新", CheckForUpdates),
+            MenuItem::action("关于", About),
+        ]),
+    ]
+}
 
 pub const SELECTION_COLOR: u32 = 0x4c9ffe;
 const BG_COLOR: u32 = 0xffffff;
@@ -345,11 +390,12 @@ pub struct BoardView {
     /// untouched, a window resize re-fits the current page automatically;
     /// any manual pan/zoom drops the follow.
     page_fit: Option<(Camera, (f64, f64))>,
-    /// Index of the currently open top-level menu in the Windows in-app menu
-    /// bar (None = all collapsed). Unused on macOS, which uses the native
-    /// `set_menus` bar; the field compiles everywhere because the menu-bar
-    /// rendering is pure GPUI.
-    menubar_open: Option<usize>,
+    /// The in-app menu bar (Windows/Linux). gpui-kit's `AppMenuBar` renders the
+    /// menus registered in `gpui_component::GlobalState` (see
+    /// [`app_menus`] + main.rs) and handles its own dropdown open/close,
+    /// hover-to-switch, Esc, and key-hint badges, so no open-index state lives
+    /// here. Never rendered on macOS, which has the native `set_menus` bar.
+    app_menu_bar: Entity<AppMenuBar>,
     /// Independent settings page (shown as a full-area overlay below the
     /// menu bar while `settings_open`). Owned eagerly so its input state
     /// survives open/close cycles; fields re-sync from disk on every open.
@@ -375,10 +421,6 @@ pub struct BoardView {
     /// Workspace-relative path of the explorer row under the pointer; the
     /// ＋/✎ action buttons show only on the hovered row.
     explorer_hover: Option<String>,
-    /// Live hover tooltip for chrome buttons: (label, key hint, mouse
-    /// position, window width). Rendered by render_tooltip as a floating
-    /// dark chip below the cursor; cleared on un-hover.
-    tooltip: Option<(SharedString, Option<String>, Point<Pixels>, f32)>,
     /// Sessions grouped by workspace-relative board path, refreshed together
     /// with the tree. The explorer renders them as an expandable level under
     /// each board.
@@ -484,7 +526,7 @@ impl BoardView {
             last_seen_viewport: None,
             present_resize_at: None,
             page_fit: None,
-            menubar_open: None,
+            app_menu_bar: AppMenuBar::new(cx),
             settings_page,
             settings_open: false,
             workspace,
@@ -495,7 +537,6 @@ impl BoardView {
             renaming: None,
             explorer_rename_input,
             explorer_hover: None,
-            tooltip: None,
             explorer_sessions: HashMap::new(),
             chat_compact,
             update_state: crate::updater::UpdateState::default(),
@@ -2324,7 +2365,6 @@ impl BoardView {
     /// panel's model label). Closes any transient popups first so they can't
     /// float above the page, and re-syncs the fields from disk.
     pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.menubar_open = None;
         self.context_menu = None;
         self.settings_open = true;
         self.settings_page
@@ -4316,11 +4356,11 @@ impl BoardView {
         if self.settings_open {
             return;
         }
-        // Windows: the in-app menu bar spans the top MENU_BAR_HEIGHT px. Clicks
-        // there belong to the menu bar (labels / drag spacer / caption buttons),
+        // Windows: the in-app title bar spans the top MENU_BAR_HEIGHT px.
+        // Clicks there belong to it (menu bar / drag area / caption buttons),
         // not the canvas, so don't start a canvas action. The caption buttons
-        // stop propagation themselves, but the drag spacer can't - HTCAPTION
-        // needs the NC mouse-down to reach DefWindowProcW to move the window -
+        // stop propagation themselves, but the drag surface cannot - HTCAPTION
+        // needs the NC mouse-down to reach DefWindowProcW so the window moves -
         // so guard here instead.
         if cfg!(target_os = "windows") && event.position.y < px(MENU_BAR_HEIGHT) {
             return;
@@ -6813,17 +6853,12 @@ impl Render for BoardView {
         }
         let canvas_el = canvas_el.cursor(cursor);
 
-        // Windows-only in-app menu bar (None on macOS, which uses the native
-        // set_menus bar). Computed before the chain so the builder doesn't
-        // hold a borrow of `self`/`cx` alongside the chain's own use.
-        // Hidden while presenting.
+        // Windows-only in-app title bar (None on macOS, which uses the native
+        // set_menus bar). Computed before the chain so the builder doesn't hold
+        // a borrow of `self`/`cx` alongside the chain's own use. Hidden while
+        // presenting, where the page should own the whole window.
         let menubar = if cfg!(target_os = "windows") && !presenting {
-            Some(self.render_menu_bar(window, cx))
-        } else {
-            None
-        };
-        let menubar_dropdown = if cfg!(target_os = "windows") && !presenting {
-            self.render_menu_dropdown(cx)
+            Some(self.render_title_bar(window, cx))
         } else {
             None
         };
@@ -6961,6 +6996,9 @@ impl Render for BoardView {
             .on_action(cx.listener(|this, _: &InsertCanvas, _window, cx| {
                 this.insert_canvas(cx);
             }))
+            .on_action(cx.listener(|this, _: &NewBoard, window, cx| {
+                this.new_board(window, cx);
+            }))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_left_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_down))
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_down))
@@ -7028,9 +7066,6 @@ impl Render for BoardView {
                             .when(self.settings_open, |d| d.child(self.settings_page.clone()))
                     }),
             )
-            // Dropdown overlay rendered last so it paints above the canvas.
-            .when_some(menubar_dropdown, |d, dd| d.child(dd))
-            .child(self.render_tooltip())
     }
 }
 
@@ -7152,9 +7187,9 @@ fn glyph_button(
 
 /// A square icon button for the toolbar. `id` must be unique. `icon_child` is
 /// rendered inside a 20×20 box so vector icons fill the button.
-/// Toolbar hover-tooltip helper: records the board's live tooltip state
-/// (label + key hint at the cursor) on hover and clears it on leave;
-/// `render_tooltip` paints the floating chip.
+/// Toolbar hover-tooltip helper: defers to the kit `Tooltip` attached by
+/// `Button::tooltip`, so placement, show delay and viewport clamping are the
+/// component library's job instead of the board's.
 trait ToolbarTooltip: Sized {
     fn with_toolbar_tooltip(
         self,
@@ -7164,61 +7199,52 @@ trait ToolbarTooltip: Sized {
     ) -> Self;
 }
 
-impl ToolbarTooltip for Stateful<Div> {
+impl ToolbarTooltip for Button {
     fn with_toolbar_tooltip(
         self,
-        weak: &WeakEntity<BoardView>,
+        _weak: &WeakEntity<BoardView>,
         label: &str,
         key: Option<&str>,
     ) -> Self {
-        let weak = weak.clone();
-        let label = label.to_string();
-        let key = key.map(str::to_string);
-        self.on_hover(move |hovered, window, cx| {
-            let hovered = *hovered;
-            weak.update(cx, |this, cx| {
-                this.tooltip = if hovered {
-                    Some((
-                        label.clone().into(),
-                        key.clone(),
-                        window.mouse_position(),
-                        f32::from(window.viewport_size().width),
-                    ))
-                } else {
-                    None
-                };
-                cx.notify();
-            })
-            .ok();
-        })
+        // The kit's text tooltip has no key-badge slot, so the shortcut is
+        // appended to the label text.
+        let text = match key {
+            Some(key) => format!("{label}  {key}"),
+            None => label.to_string(),
+        };
+        self.tooltip(SharedString::from(text))
     }
 }
 
+/// A square icon button for the toolbars, built from the kit `Button` so the
+/// hover tooltip, focus ring and pressed/hover states come from the library.
 fn bar_icon_button(
     id: impl Into<gpui::ElementId>,
     active: bool,
     icon_child: impl IntoElement,
     cx: &App,
-) -> Stateful<Div> {
+) -> Button {
     let theme = cx.theme();
-    let mut b = div()
-        .id(id)
-        .flex()
-        .items_center()
-        .justify_center()
-        .size_6()
-        .rounded_md()
-        .cursor_pointer()
-        .child(div().size(px(crate::icons::S)).child(icon_child));
+    let button = Button::new(id)
+        .compact()
+        .child(div().size(px(crate::icons::S)).child(icon_child))
+        .ghost();
     if active {
-        b = b.bg(theme.accent);
+        // A quiet accent tint rather than the kit's saturated `.primary()` fill:
+        // the toolbar can show several "on" buttons at once (explorer toggle plus
+        // the current tool), and a row of bold primary blocks reads as noisy. This
+        // also keeps the glyph on the light `accent` surface it was designed for,
+        // so the icon colour stays `accent_foreground` (see `icon_color`).
+        button.bg(theme.accent)
     } else {
-        b = b.hover(|s| s.bg(theme.muted));
+        button
     }
-    b
 }
 
 /// Icon color: accent when active, foreground otherwise.
+///
+/// Active toolbar buttons paint the light `accent` tint (see
+/// `bar_icon_button`), which is what `accent_foreground` is designed to sit on.
 fn icon_color(active: bool, cx: &App) -> Hsla {
     let theme = cx.theme();
     if active {
@@ -7246,22 +7272,19 @@ fn menu_separator(cx: &App) -> Div {
     div().h(px(1.0)).w_full().bg(theme.border)
 }
 
-// --- Windows in-app menu bar ---------------------------------------------
+// --- Windows in-app title bar --------------------------------------------
 // GPUI's Windows backend renders nothing for `set_menus` (it only stores the
 // definitions), so without a native bar the app has no File/Edit/View entries
-// on Windows. These constants + helpers draw a compact in-app bar instead.
-// macOS keeps using the native screen-top menu, so this code is gated at the
-// call site by `cfg!(target_os = "windows")`; the helpers themselves are pure
-// GPUI and compile on every platform.
+// on Windows. gpui-kit's `AppMenuBar` fills that gap: it renders the menus we
+// hand to gpui-component's `GlobalState` and brings its own dropdowns,
+// hover-to-switch and key-hint badges. We only supply the surrounding strip
+// (window drag + caption buttons), because the window opens with
+// `appears_transparent: true` and therefore has no OS-drawn title bar. macOS
+// keeps the native screen-top menu, so this is gated at the call site by
+// `cfg!(target_os = "windows")`.
 
 /// Bar height (px). Compact but an easy click target.
 const MENU_BAR_HEIGHT: f32 = 30.0;
-/// Fixed width of each top-level menu label (px). Constant so the dropdown
-/// can align under its label without measuring layout at runtime.
-const MENU_LABEL_W: f32 = 56.0;
-/// Left padding of the bar (px). Equals `px_2()`, so label `i` starts at
-/// `MENU_PAD + i * MENU_LABEL_W` - the dropdown's `left` offset.
-const MENU_PAD: f32 = 8.0;
 /// Width of each window caption button (minimize / maximize / close). Windows
 /// caption buttons are typically ~46px; matches the visual weight of the
 /// 30px-tall bar.
@@ -7465,7 +7488,7 @@ impl BoardView {
             }
             UpdateState::Downloading { fraction } => Some(
                 div()
-                    .w(px(64.0))
+                    .w(px(112.0))
                     .h_full()
                     .flex()
                     .flex_row()
@@ -7474,10 +7497,17 @@ impl BoardView {
                     .gap_1()
                     .text_color(theme.muted_foreground)
                     .child(div().w(px(ic::S)).h(px(ic::S)).child(ic::download(icon_color(false, cx))))
+                    // gpui-kit's Progress draws the real bar; its `value` is
+                    // 0..=100 (it clamps), while our fraction is 0..1.
+                    .child(
+                        Progress::new("upd-progress")
+                            .value((*fraction * 100.0) as f32)
+                            .w(px(56.0)),
+                    )
                     .child(
                         div()
                             .text_xs()
-                            .child(format!("{}%", (fraction * 100.0) as u32)),
+                            .child(format!("{}%", (*fraction * 100.0) as u32)),
                     )
                     .into_any_element(),
             ),
@@ -8630,340 +8660,53 @@ impl BoardView {
         Some(card.into_any_element())
     }
 
-    /// The Windows top menu bar (文件 / 编辑 / 视图) plus a draggable spacer and
-    /// window caption buttons (minimize / maximize / close). Placed as the first
-    /// child of the board's outer column so it occupies layout space at the top;
-    /// macOS uses the native `set_menus` bar instead and never calls this.
-    fn render_menu_bar(&self, window: &Window, cx: &mut Context<Self>) -> Div {
+    /// The Windows title strip: the in-app menu bar on the left, caption
+    /// buttons on the right.
+    ///
+    /// The strip itself is the window-drag surface. Because the window is
+    /// opened with `appears_transparent: true`, the OS draws no caption area,
+    /// so dragging is synthesized from non-client `HTCAPTION` clicks.
+    /// `AppMenuBar`'s menu buttons call `prevent_default` + `stop_propagation`
+    /// on mouse-down, so clicking a menu never starts a drag while the space
+    /// around the menus still does.
+    fn render_title_bar(&self, window: &Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = crate::theme::chrome(cx);
-        let labels: [&str; 4] = ["文件", "编辑", "视图", "帮助"];
-        let mut bar = div()
+        div()
+            .id("app-title-bar")
             .flex()
             .flex_row()
             .items_center()
-            .pl_2()
             .h(px(MENU_BAR_HEIGHT))
             .flex_shrink_0()
             .border_b_1()
             .border_color(theme.border)
             .bg(theme.popover)
             // The bar inherits the canvas tool cursor (crosshair/ibeam/...)
-            // from the board's outer div otherwise; force the normal arrow so
-            // the title bar always looks like a title bar. Menu labels below
-            // override this with `cursor_pointer` for their own click hint.
-            .cursor(CursorStyle::Arrow);
-        for (i, label) in labels.into_iter().enumerate() {
-            let active = self.menubar_open == Some(i);
-            bar = bar.child(
-                div()
-                    .id(gpui::ElementId::named_usize("menu-label", i))
-                    .w(px(MENU_LABEL_W))
-                    .h(px(MENU_BAR_HEIGHT))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_sm()
-                    .text_color(theme.foreground)
-                    .cursor_pointer()
-                    .when(active, |d| d.bg(theme.muted))
-                    .hover(|s| s.bg(theme.muted))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.menubar_open = if this.menubar_open == Some(i) {
-                            None
-                        } else {
-                            Some(i)
-                        };
-                        cx.notify();
-                    }))
-                    .child(label),
-            );
-        }
-        // Draggable spacer: the empty middle of the bar moves the window. We
-        // don't use window_control_area(Drag) here - that route depends on a
-        // current mouse_hit_test, which is often stale at click time so the hit
-        // falls back to HTCLIENT and nothing drags. Instead, on mouse-down we
-        // synthesize an HTCAPTION non-client click (see platform::start_window_
-        // drag), which reliably starts Windows' caption drag. stop_propagation
-        // keeps the board's on_left_down from also firing.
-        bar = bar.child(
-            div()
-                .id("title-drag")
-                .flex_1()
-                .h_full()
-                .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                    crate::platform::begin_window_drag(window);
+            // from the board's outer div otherwise; force the normal arrow.
+            .cursor(CursorStyle::Arrow)
+            // Caption drag, synthesized as an `HTCAPTION` non-client click:
+            // `window_control_area(Drag)` depends on a current `mouse_hit_test`
+            // that is often stale at click time, so the hit would fall back to
+            // `HTCLIENT` and nothing would drag. Stopping propagation keeps the
+            // board's `on_left_down` from also firing.
+            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                crate::platform::begin_window_drag(window);
+                cx.stop_propagation();
+            })
+            .on_mouse_move(|event: &MouseMoveEvent, window, cx| {
+                if event.pressed_button == Some(MouseButton::Left) {
+                    crate::platform::move_window_drag(window);
                     cx.stop_propagation();
-                })
-                .on_mouse_move(|event: &MouseMoveEvent, window, cx| {
-                    if event.pressed_button == Some(MouseButton::Left) {
-                        crate::platform::move_window_drag(window);
-                        cx.stop_propagation();
-                    }
-                })
-                .on_mouse_up(MouseButton::Left, |_, window, cx| {
-                    crate::platform::end_window_drag(window);
-                    cx.stop_propagation();
-                }),
-        );
-        // Caption buttons on the right; the OS handles their clicks. The gear
-        // button (left of minimize) opens the settings page.
-        bar = bar.child(self.window_controls(window, cx));
-        bar
-    }
-
-    /// The dropdown for the currently open menu (None when collapsed). Rendered
-    /// as the *last* child of the board's outer column so it paints above the
-    /// canvas. Reuses the context-menu card pattern (white card, click-away
-    /// dismiss via `on_mouse_down_out`, `context_menu_row` rows).
-    fn render_menu_dropdown(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let theme = crate::theme::chrome(cx);
-        let i = self.menubar_open?;
-        let weak = cx.weak_entity();
-        let left = px(MENU_PAD + i as f32 * MENU_LABEL_W);
-
-        let mut card = div()
-            .id("menu-dropdown")
-            .absolute()
-            .top(px(MENU_BAR_HEIGHT))
-            .left(left)
-            .w(px(180.0))
-            .bg(theme.popover)
-            .border_1()
-            .border_color(theme.border)
-            .rounded_md()
-            .shadow_lg()
-            .p_1()
-            .flex()
-            .flex_col()
-            .gap_0p5()
-            // Clicks on the card don't bubble to the canvas.
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            // Any mouse-down outside the card closes the menu.
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.menubar_open = None;
-                cx.notify();
-            }));
-
-        // Each row runs its action on the board via the captured weak handle,
-        // then collapses the menu. `cx` in the row closure is `&mut App`, so
-        // `cx.quit()` (no entity needed) is called directly for 退出.
-        match i {
-            0 => {
-                // 文件
-                let w = weak.clone();
-                card = card.child(context_menu_row(
-                    "m-new-board",
-                    Some(IconName::File),
-                    "新建白板".into(),
-                    None,
-                    true,
-                    move |_, window, cx| {
-                        w.update(cx, |this, cx| {
-                            this.new_board(window, cx);
-                            this.menubar_open = None;
-                            cx.notify();
-                        })
-                        .ok();
-                    }, cx));
-                let w = weak.clone();
-                card = card.child(context_menu_row(
-                    "m-open",
-                    Some(IconName::FolderOpen),
-                    "打开场景…".into(),
-                    Some("Ctrl+O".into()),
-                    true,
-                    move |_, window, cx| {
-                        w.update(cx, |this, cx| {
-                            this.open(window, cx);
-                            this.menubar_open = None;
-                            cx.notify();
-                        })
-                        .ok();
-                    }, cx));
-                let w = weak.clone();
-                card = card.child(context_menu_row(
-                    "m-save",
-                    Some(IconName::File),
-                    "保存场景".into(),
-                    Some("Ctrl+S".into()),
-                    true,
-                    move |_, _, cx| {
-                        w.update(cx, |this, cx| {
-                            this.save(cx);
-                            this.menubar_open = None;
-                            cx.notify();
-                        })
-                        .ok();
-                    }, cx));
-                card = card.child(menu_separator(cx));
-                let w = weak.clone();
-                card = card.child(context_menu_row(
-                    "m-quit",
-                    None,
-                    "退出 Boundless".into(),
-                    Some("Ctrl+Q".into()),
-                    true,
-                    move |_, _, cx| {
-                        w.update(cx, |this, cx| {
-                            this.menubar_open = None;
-                            cx.notify();
-                        })
-                        .ok();
-                        cx.quit();
-                    }, cx));
-            }
-            1 => {
-                // 编辑
-                let w = weak.clone();
-                card = card.child(context_menu_row(
-                    "m-undo",
-                    Some(IconName::Undo),
-                    "撤销".into(),
-                    Some("Ctrl+Z".into()),
-                    true,
-                    move |_, window, cx| {
-                        w.update(cx, |this, cx| {
-                            this.undo(window, cx);
-                            this.menubar_open = None;
-                            cx.notify();
-                        })
-                        .ok();
-                    }, cx));
-                let w = weak.clone();
-                card = card.child(context_menu_row(
-                    "m-redo",
-                    Some(IconName::Redo),
-                    "重做".into(),
-                    Some("Ctrl+Shift+Z".into()),
-                    true,
-                    move |_, window, cx| {
-                        w.update(cx, |this, cx| {
-                            this.redo(window, cx);
-                            this.menubar_open = None;
-                            cx.notify();
-                        })
-                        .ok();
-                    }, cx));
-            }
-            2 => {
-                // 视图
-                let w = weak.clone();
-                card = card.child(context_menu_row(
-                    "m-zin",
-                    Some(IconName::Plus),
-                    "放大".into(),
-                    Some("Ctrl+=".into()),
-                    true,
-                    move |_, _, cx| {
-                        w.update(cx, |this, cx| {
-                            this.zoom_by(1.25, cx);
-                            this.menubar_open = None;
-                            cx.notify();
-                        })
-                        .ok();
-                    }, cx));
-                let w = weak.clone();
-                card = card.child(context_menu_row(
-                    "m-zout",
-                    Some(IconName::Minus),
-                    "缩小".into(),
-                    Some("Ctrl+-".into()),
-                    true,
-                    move |_, _, cx| {
-                        w.update(cx, |this, cx| {
-                            this.zoom_by(0.8, cx);
-                            this.menubar_open = None;
-                            cx.notify();
-                        })
-                        .ok();
-                    }, cx));
-                card = card.child(menu_separator(cx));
-                let w = weak.clone();
-                card = card.child(context_menu_row(
-                    "m-zreset",
-                    None,
-                    "重置缩放".into(),
-                    Some("Ctrl+0".into()),
-                    true,
-                    move |_, _, cx| {
-                        w.update(cx, |this, cx| {
-                            this.zoom_reset(cx);
-                            this.menubar_open = None;
-                            cx.notify();
-                        })
-                        .ok();
-                    }, cx));
-            }
-            3 => {
-                // 帮助
-                let w = weak.clone();
-                card = card.child(context_menu_row(
-                    "m-check-updates",
-                    None,
-                    "检查更新".into(),
-                    None,
-                    true,
-                    move |_, _, cx| {
-                        w.update(cx, |this, cx| {
-                            this.menubar_open = None;
-                            this.check_for_updates(cx, false);
-                            cx.notify();
-                        })
-                        .ok();
-                    }, cx));
-                let w_about = weak.clone();
-                card = card.child(context_menu_row(
-                    "m-about",
-                    None,
-                    "关于".into(),
-                    None,
-                    true,
-                    move |_, window, cx| {
-                        w_about
-                            .update(cx, |this, cx| {
-                                this.menubar_open = None;
-                                cx.notify();
-                            })
-                            .ok();
-                        window.open_dialog(cx, move |dialog, _, _| {
-                            let theme = theme;
-                            dialog
-                                .title("关于无界白板")
-                                .content(move |content, _, _| {
-                                    let theme = theme;
-                                    content.child(
-                                        div()
-                                            .flex()
-                                            .flex_col()
-                                            .gap_2()
-                                            .py_1()
-                                            .child(div().text_sm().child(format!(
-                                                "版本 v{}",
-                                                env!("CARGO_PKG_VERSION")
-                                            )))
-                                            .child(
-                                                div().text_sm().text_color(theme.muted_foreground).child(
-                                                    "无限手绘白板 —— AI 智能体直接在画布上作画。",
-                                                ),
-                                            )
-                                            .child(
-                                                div().text_sm().text_color(theme.muted_foreground)
-                                                    .child("以 AGPL-3.0 许可证开源。"),
-                                            ),
-                                    )
-                                })
-                                .button_props(
-                                    DialogButtonProps::default()
-                                        .ok_text("知道了")
-                                        .on_ok(|_, _, _| true),
-                                )
-                        });
-                    }, cx));
-            }
-            _ => return None,
-        }
-
-        Some(card.into_any_element())
+                }
+            })
+            .on_mouse_up(MouseButton::Left, |_, window, cx| {
+                crate::platform::end_window_drag(window);
+                cx.stop_propagation();
+            })
+            // `AppMenuBar` renders `size_full()`, so it needs a flex slot; the
+            // caption buttons stay pinned to the right.
+            .child(div().flex_1().h_full().child(self.app_menu_bar.clone()))
+            .child(self.window_controls(window, cx))
     }
 
     fn render_zoom_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -9416,47 +9159,7 @@ impl BoardView {
             .child(text)
     }
 
-    /// The live hover tooltip: a dark chip below the cursor — label first,
-    /// then a translucent key badge — width-estimated and clamped to the
-    /// window's right edge.
-    fn render_tooltip(&self) -> AnyElement {
-        let Some((label, key, mouse, win_w)) = &self.tooltip else {
-            return div().hidden().into_any_element();
-        };
-        let mut est = label.chars().count() as f32 * 13.0 + 20.0;
-        if let Some(k) = key {
-            est += k.chars().count() as f32 * 8.0 + 16.0;
-        }
-        let x = (f32::from(mouse.x) - est / 2.0).clamp(4.0, (win_w - est - 4.0).max(4.0));
-        div()
-            .absolute()
-            .left(px(x))
-            .top(mouse.y + px(14.0))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_1p5()
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .bg(rgb(0x2b2a28).opacity(0.94))
-            .shadow_md()
-            .text_xs()
-            .text_color(rgb(0xf5f4f2))
-            .child(label.clone())
-            .when_some(key.clone(), |d, k| {
-                d.child(
-                    div()
-                        .px_1()
-                        .rounded_sm()
-                        .bg(rgba(0xffffff26))
-                        .text_color(rgb(0xd9d7d3))
-                        .child(k),
-                )
-            })
-            .into_any_element()
     }
-}
 
 /// The update-confirm dialog (0.7 `open_dialog`): snapshot of `update_state`
 /// at open time. Ready → 稍后 / 重启应用 (restart installs); Error → 知道了

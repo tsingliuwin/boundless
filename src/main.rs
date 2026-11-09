@@ -9,11 +9,11 @@
 #![windows_subsystem = "windows"]
 
 use boundless::board::{
-    About, ArrowTool, BoardView, BringForward, BringToFront, CancelOp, CheckForUpdates,
-    DeleteSelection, DiamondTool, EllipseTool, EraserTool, GotoNextPage, GotoPrevPage, HandTool,
-    InsertCanvas, InsertImage, LineTool, OpenScene, OpenSettings, PasteImage, PenTool, PresentExit,
-    PresentStart, Quit, RectTool, Redo, SaveScene, SelectTool, SendBackward, SendToBack, TextTool,
-    ToggleAi, ToggleExplorer, Undo, ZoomIn, ZoomOut, ZoomReset,
+    ArrowTool, BoardView, BringForward, BringToFront, CancelOp, DeleteSelection, DiamondTool,
+    EllipseTool, EraserTool, GotoNextPage, GotoPrevPage, HandTool, InsertImage, LineTool, OpenScene,
+    OpenSettings, PasteImage, PenTool, PresentExit, PresentStart, Quit, RectTool, Redo, SaveScene,
+    SelectTool, SendBackward, SendToBack, TextTool, ToggleAi, ToggleExplorer, Undo, ZoomIn, ZoomOut,
+    ZoomReset,
 };
 use gpui::*;
 use gpui_component::Root;
@@ -207,35 +207,24 @@ fn main() {
             // platform layer sets no presentation options, so we rely on having
             // menu items for the system's auto-show to kick in).
             cx.on_action(|_: &Quit, cx| cx.quit());
-            cx.set_menus(vec![
-                // First menu is the application menu; macOS renames it to the app
-                // name and bolds it. GPUI does not auto-inject About/Quit, so we
-                // provide the entries we want here. (No "About" item: GPUI exposes
-                // no standard about-panel API.)
-                Menu {
+            // The first menu is the application menu; macOS renames it to the app
+            // name and bolds it, and GPUI auto-injects nothing, so Quit is listed
+            // explicitly. The content menus are shared with the in-app bar.
+            cx.set_menus(
+                std::iter::once(Menu {
                     name: "Boundless".into(),
                     disabled: false,
                     items: vec![MenuItem::action("退出 Boundless", Quit)],
-                },
-                Menu {
-                    name: "文件".into(),
-                    disabled: false,
-                    items: vec![
-                        MenuItem::action("打开场景…", OpenScene),
-                        MenuItem::action("保存场景", SaveScene),
-                        MenuItem::action("插入图片…", InsertImage),
-                        MenuItem::action("插入位图画布", InsertCanvas),
-                    ],
-                },
-                Menu {
-                    name: "帮助".into(),
-                    disabled: false,
-                    items: vec![
-                        MenuItem::action("检查更新", CheckForUpdates),
-                        MenuItem::action("关于", About),
-                    ],
-                },
-            ]);
+                })
+                .chain(boundless::board::app_menus())
+                .collect::<Vec<_>>(),
+            );
+            // The same menus feed the in-app `AppMenuBar` used on Windows/Linux,
+            // which reads them from gpui-component's global state rather than
+            // through `cx.set_menus`. Registered here, before any window opens, so
+            // the bar is populated on its first frame.
+            gpui_component::GlobalState::global_mut(cx)
+                .set_app_menus(boundless::board::app_menus().into_iter().map(Menu::owned).collect());
 
             // Remove leftover `.old` files/dirs from a previous in-place update
             // (applied on the last run before restart). Best-effort, before any
