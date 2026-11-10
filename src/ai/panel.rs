@@ -1157,6 +1157,10 @@ impl Render for AiPanel {
                             // matches the shift applied on open/close.
                             this.board
                                 .update(cx, |board, cx| {
+                                    // Refresh the board's width cache while we
+                                    // hold the panel lease (a board-side read of
+                                    // this panel right now would panic).
+                                    board.note_ai_panel_width(w);
                                     board.camera.pan_by_screen(px(-delta / 2.0), px(0.0));
                                     cx.notify();
                                 })

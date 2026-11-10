@@ -26,7 +26,6 @@ use crate::text::{utf16_to_utf8, utf8_to_utf16, TextEditSession};
 use crate::tools::{ActiveTool, DragState, PointTarget};
 use crate::workspace::{self, Workspace};
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::dialog::DialogButtonProps;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::AppMenuBar;
 use gpui_component::notification::Notification;
@@ -434,6 +433,13 @@ pub struct BoardView {
     /// bottom bar (the default; watch the agent on the canvas), false =
     /// docked chat panel. Mirrored from/to the live panel on mode switches.
     chat_compact: bool,
+    /// AI 面板实时宽度的缓存（紧凑条 = 0.0，面板关闭 = DEFAULT_WIDTH）。
+    /// 不直接 read 面板实体：画布 op 会在 AiPanel.update 的嵌套里走到
+    /// viewport_bounds（流式任务 → handle_event → board.update →
+    /// apply_canvas_op），届时再 read 面板就是重入租约 panic。宽度只在
+    /// 打开 / 拖拽缩放 / 紧凑切换 / 关闭四处变化，全部同步到这里——与
+    /// set_chat_compact 接收 width 参数是同一思路。
+    ai_panel_width_px: f32,
     /// Auto-update flow state (check / download / ready-to-restart). Driven by
     /// the `CheckForUpdates` action + a delayed startup poll; see `src/updater.rs`.
     update_state: crate::updater::UpdateState,
@@ -544,6 +550,7 @@ impl BoardView {
             explorer_hover: None,
             explorer_sessions: HashMap::new(),
             chat_compact,
+            ai_panel_width_px: crate::ai::panel::DEFAULT_WIDTH,
             update_state: crate::updater::UpdateState::default(),
             render_cache: crate::render::cache::RenderCache::new(),
             text_cache: crate::render::cache::TextCache::new(),
@@ -2308,6 +2315,7 @@ impl BoardView {
             // Respect an explicit close across restarts (default-open only
             // applies while the user hasn't turned it off).
             self.workspace.set_chat_prefs(false, self.chat_compact);
+            self.ai_panel_width_px = crate::ai::panel::DEFAULT_WIDTH;
         } else {
             self.open_ai_panel(true, window, cx);
         }
@@ -2332,6 +2340,8 @@ impl BoardView {
         let active_board = self.active_board_key();
         let compact = self.chat_compact;
         let panel = cx.new(|cx| AiPanel::new(weak, active_board, compact, window, cx));
+        // Sync the width cache while the fresh entity is lease-free.
+        self.ai_panel_width_px = if compact { 0.0 } else { panel.read(cx).width() };
         if compensate && !compact {
             let w = panel.read(cx).width();
             self.camera.pan_by_screen(px(-w / 2.0), px(0.0));
@@ -2344,12 +2354,16 @@ impl BoardView {
     /// Current AI panel width (its live, user-resizable value), or the default
     /// if the panel is closed. Used to offset the toolbar / zoom bar so they
     /// never sit under the panel. The compact bar floats and reserves nothing.
-    fn ai_panel_width(&self, cx: &mut Context<Self>) -> f32 {
-        match &self.ai_panel {
-            Some(p) if p.read(cx).is_compact() => 0.0,
-            Some(p) => p.read(cx).width(),
-            None => crate::ai::panel::DEFAULT_WIDTH,
-        }
+    /// Served from the cache (see `ai_panel_width_px`) — a live entity read
+    /// here would double-lease panic when canvas ops land mid-panel-update.
+    fn ai_panel_width(&self) -> f32 {
+        self.ai_panel_width_px
+    }
+
+    /// Refresh the cached panel width (called from the panel's resize-drag
+    /// handler, which already holds the panel's update lease).
+    pub fn note_ai_panel_width(&mut self, w: f32) {
+        self.ai_panel_width_px = w;
     }
 
     // Settings page
@@ -2385,6 +2399,7 @@ impl BoardView {
     /// and must not reserve docked-panel space in the chrome.
     pub fn set_chat_compact(&mut self, compact: bool, panel_width: f32, cx: &mut Context<Self>) {
         self.chat_compact = compact;
+        self.ai_panel_width_px = if compact { 0.0 } else { panel_width };
         // Switching between the floating compact bar and the docked panel
         // changes what covers the canvas by the panel's width; pan the camera
         // half of that so the centered content stays centered — the same
@@ -2668,7 +2683,7 @@ impl BoardView {
             let right = (center + half).min(win_w);
             return f32::from(position.x) >= left && f32::from(position.x) <= right;
         }
-        let panel_w = self.ai_panel_width(cx);
+        let panel_w = self.ai_panel_width();
         let win_right = f32::from(window.viewport_size().width);
         let panel_left = win_right - panel_w;
         f32::from(position.x) >= panel_left
@@ -2756,10 +2771,10 @@ impl BoardView {
     /// rendered, so the full canvas counts — subtracting the hidden panel's
     /// width centered every page fit in a one-panel-too-narrow region and the
     /// slide sat half a panel off-center.
-    fn viewport_bounds(&self, cx: &mut Context<Self>) -> Bounds<Pixels> {
+    fn viewport_bounds(&self, _cx: &mut Context<Self>) -> Bounds<Pixels> {
         let mut b = self.canvas_bounds;
         if self.ai_panel.is_some() && self.presenting.is_none() {
-            let panel_w = self.ai_panel_width(cx);
+            let panel_w = self.ai_panel_width();
             b.size.width = (b.size.width - px(panel_w)).max(px(1.0));
         }
         b
@@ -2884,11 +2899,11 @@ impl BoardView {
 
     /// World-space rect of the visible canvas (with a small margin), shared
     /// by zoom-reset fitting and image insertion placement.
-    fn visible_world_bounds(&self, cx: &mut Context<Self>) -> WBounds {
+    fn visible_world_bounds(&self, _cx: &mut Context<Self>) -> WBounds {
         let origin = self.canvas_origin();
         // viewport_bounds 已扣除左侧目录内缩与右侧停靠的 AI 面板：AI 的默认
         // 落点会居中在用户真正看得见的区域，不会藏到面板后面。
-        let vp = self.viewport_bounds(cx);
+        let vp = self.viewport_bounds(_cx);
         let tl = self.camera.screen_to_world(vp.origin, origin);
         let br = self.camera.screen_to_world(
             point(vp.origin.x + vp.size.width, vp.origin.y + vp.size.height),
@@ -6950,42 +6965,36 @@ impl Render for BoardView {
             }))
             .on_action(cx.listener(|_, _: &About, window, cx| {
                 let theme = crate::theme::chrome(cx);
-                window.open_dialog(cx, move |dialog, _, _| {
+                window.open_alert_dialog(cx, move |alert, _, _| {
                     let theme = theme;
-                    dialog
+                    alert
                         .title("关于无界白板")
-                        .content(move |content, _, _| {
-                            let theme = theme;
-                            content.child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_2()
-                                    .py_1()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .child(format!("版本 v{}", env!("CARGO_PKG_VERSION"))),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(theme.muted_foreground)
-                                            .child("无限手绘白板 —— AI 智能体直接在画布上作画。"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(theme.muted_foreground)
-                                            .child("以 AGPL-3.0 许可证开源。"),
-                                    ),
-                            )
-                        })
-                        .button_props(
-                            DialogButtonProps::default()
-                                .ok_text("知道了")
-                                .on_ok(|_, _, _| true),
+                        .description(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .py_1()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .child(format!("版本 v{}", env!("CARGO_PKG_VERSION"))),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(theme.muted_foreground)
+                                        .child("无限手绘白板 —— AI 智能体直接在画布上作画。"),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(theme.muted_foreground)
+                                        .child("以 AGPL-3.0 许可证开源。"),
+                                ),
                         )
+                        .ok_text("知道了")
+                        .on_ok(|_, _, _| true)
                 });
             }))
             .on_action(cx.listener(|this, _: &GotoPrevPage, _window, cx| this.goto_prev_page(cx)))
@@ -7891,7 +7900,7 @@ impl BoardView {
         // centering region so the toolbar stays visually centered in the
         // remaining drawable space instead of drifting toward the panel. The
         // left explorer panel shifts the canvas the same way on the left.
-        let panel_width = self.ai_panel_width(cx);
+        let panel_width = self.ai_panel_width();
         let panel_open = self.ai_panel.is_some();
 
         div()
@@ -8497,7 +8506,7 @@ impl BoardView {
             None
         };
         let panel_open = self.ai_panel.is_some();
-        let panel_width = self.ai_panel_width(cx);
+        let panel_width = self.ai_panel_width();
         let el_ref = match el_ref {
             Some(e) => e,
             None => return div().absolute().top_3().into_any_element(),
@@ -8785,7 +8794,7 @@ impl BoardView {
         // Uses the panel's *current* (possibly user-resized) width.
         // `right_3` = 12px inset either way.
         const INSET: f32 = 12.0;
-        let panel_width = self.ai_panel_width(cx);
+        let panel_width = self.ai_panel_width();
         let panel_open = self.ai_panel.is_some();
         let weak_tex = weak.clone();
         let tex_label = match self.canvas_texture {
@@ -9230,9 +9239,11 @@ impl BoardView {
     }
 }
 
-/// The update-confirm dialog (0.7 `open_dialog`): snapshot of `update_state`
-/// at open time. Ready → 稍后 / 重启应用 (restart installs); Error → 知道了
-/// (dismiss). Other states open nothing.
+/// The update-confirm dialog: snapshot of `update_state` at open time.
+/// Ready → 稍后 / 重启应用 (restart installs); Error → 知道了 (dismiss).
+/// Other states open nothing. Uses `open_alert_dialog` — a plain 0.9
+/// `Dialog` renders no buttons from `button_props`, so the old `open_dialog`
+/// version showed the "重启后生效" text with no way to actually restart.
 fn open_update_dialog(
     window: &mut Window,
     cx: &mut App,
@@ -9265,45 +9276,40 @@ fn open_update_dialog(
     };
     let weak_ok = weak.clone();
     let weak_cancel = weak.clone();
-    // The open_dialog builder is an Fn (it may run again), so everything it
-    // hands inward is cloned per invocation rather than moved.
-    window.open_dialog(cx, move |dialog, _, _| {
+    // The open_alert_dialog builder is an Fn (it may run again), so everything
+    // it hands inward is cloned per invocation rather than moved.
+    window.open_alert_dialog(cx, move |alert, _, _| {
         let body = body.clone();
         let weak_ok = weak_ok.clone();
         let weak_cancel = weak_cancel.clone();
-        let dialog = dialog.title(title.clone()).content(move |content, _, _| {
-            content.child(
-                div()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .py_1()
-                    .child(body.clone()),
-            )
-        });
+        let alert = alert.title(title.clone()).description(
+            div()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .py_1()
+                .child(body),
+        );
         if restartable {
-            dialog.button_props(
-                DialogButtonProps::default()
-                    .ok_text("重启应用")
-                    .cancel_text("稍后")
-                    .on_ok(move |_, _, cx| {
-                        weak_ok
-                            .update(cx, |this, cx| this.install_and_restart(cx))
-                            .ok();
-                        true
-                    })
-                    .on_cancel(|_, _, _| true),
-            )
-        } else {
-            dialog.button_props(DialogButtonProps::default().ok_text("知道了").on_ok(
-                move |_, _, cx| {
-                    // Error is transient — acknowledge it back to Idle so
-                    // the red title-bar icon goes away.
-                    weak_cancel
-                        .update(cx, |this, cx| this.dismiss_update(cx))
+            alert
+                .confirm()
+                .ok_text("重启应用")
+                .cancel_text("稍后")
+                .on_ok(move |_, _, cx| {
+                    weak_ok
+                        .update(cx, |this, cx| this.install_and_restart(cx))
                         .ok();
                     true
-                },
-            ))
+                })
+                .on_cancel(|_, _, _| true)
+        } else {
+            alert.ok_text("知道了").on_ok(move |_, _, cx| {
+                // Error is transient — acknowledge it back to Idle so
+                // the red title-bar icon goes away.
+                weak_cancel
+                    .update(cx, |this, cx| this.dismiss_update(cx))
+                    .ok();
+                true
+            })
         }
     });
 }
