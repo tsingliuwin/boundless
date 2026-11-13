@@ -5,7 +5,7 @@ edition = "2021"
 description = "A boundless Excalidraw-style whiteboard built on GPUI, with a rig-powered AI agent that draws directly onto the canvas"
 
 [dependencies]
-gpui = { version = "=0.3.11", package = "gpui-pre" }
+gpui = { version = "=0.3.12", package = "gpui-pre" }
 ropey = "1"
 serde = { version = "1", features = ["derive"] }
 image = "0.25"
@@ -27,14 +27,14 @@ futures = "0.3"
 futures-util = "0.3"
 dirs = "6"
 rfd = "0.15"
-# GPUI Kit component library (Input, Button, etc.) — 0.7 ecosystem:
+# GPUI Kit component library (Input, Button, etc.) — 0.9 ecosystem:
 # gpui (zed snapshot, crates.io name gpui-pre) + gpui-base + this crate.
 # Assets ship as gpui-kit-assets, pulled in directly for with_assets().
-gpui-component = "0.9.0"
-gpui-kit-assets = "0.9.0"
-# Platform backend factory (gpui_platform::application()) — the 0.7 ecosystem
+gpui-component = "0.9.1"
+gpui-kit-assets = "0.9.1"
+# Platform backend factory (gpui_platform::application()) — the 0.9 ecosystem
 # dropped Application::new(); desktop apps build via this crate instead.
-gpui-platform = { version = "=0.3.11", package = "gpui-pre-platform", features = [
+gpui-platform = { version = "=0.3.12", package = "gpui-pre-platform", features = [
     "font-kit",
     "runtime_shaders",
 ] }
