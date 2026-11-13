@@ -61,9 +61,11 @@ jobs:
         # Pinned: nightlies after 2026-11-10 ICE on pathfinder_simd 0.5.6's
         # aarch64 NEON declarations (llvm.* via extern "C" — new hard ABI
         # check in rustc; macOS release build only). No upstream fix yet —
-        # bump the pin once pathfinder_simd or rustc resolves it.
-        uses: dtolnay/rust-toolchain@nightly-2026-11-10
+        # bump the pin once pathfinder_simd or rustc resolves it. Dated
+        # nightlies must go through the `toolchain:` input (no such @ref).
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-11-10
           targets: ${{ matrix.target }}
 
       - name: Rust cache

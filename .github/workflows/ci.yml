@@ -33,7 +33,9 @@ jobs:
       - name: Install Rust toolchain
         # Same pin as release.yml: newer nightlies ICE on pathfinder_simd's
         # aarch64 NEON declarations. Keep the two in sync.
-        uses: dtolnay/rust-toolchain@nightly-2026-11-10
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-11-10
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
@@ -73,8 +75,9 @@ jobs:
       - name: Install Rust toolchain
         # Same pin as release.yml: newer nightlies ICE on pathfinder_simd's
         # aarch64 NEON declarations. Keep the two in sync.
-        uses: dtolnay/rust-toolchain@nightly-2026-11-10
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-11-10
           targets: ${{ matrix.target }}
 
       - name: Rust cache
