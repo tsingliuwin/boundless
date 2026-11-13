@@ -140,3 +140,12 @@ minisign = "0.9.1"
 # (vendor/gpui, trackpad pinch -> cmd+scroll synth) targeted gpui 0.2.2 by
 # crate name and no longer applies. Re-port to the gpui-pre snapshot if
 # trackpad pinch-zoom regresses on macOS.
+
+[patch.crates-io]
+# pathfinder_simd 0.5.6 declares NEON LLVM intrinsics via extern "C" +
+# link_name = "llvm.*" — nightlies ≥ 2026-11 ICE on it during
+# monomorphization (aarch64 only; see vendor/pathfinder_simd for the one-line
+# fix). The macOS release build kept passing on rust-cache until the gpui
+# 0.3.12 bump changed the cache key and forced a cold recompile. Drop this
+# patch when upstream ships a fixed version.
+pathfinder_simd = { path = "vendor/pathfinder_simd" }
