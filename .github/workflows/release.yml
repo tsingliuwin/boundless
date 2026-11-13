@@ -58,7 +58,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        # Pinned: nightlies after 2026-11-10 ICE on pathfinder_simd 0.5.6's
+        # aarch64 NEON declarations (llvm.* via extern "C" — new hard ABI
+        # check in rustc; macOS release build only). No upstream fix yet —
+        # bump the pin once pathfinder_simd or rustc resolves it.
+        uses: dtolnay/rust-toolchain@nightly-2026-11-10
         with:
           targets: ${{ matrix.target }}
 
