@@ -14,7 +14,8 @@ use crate::ai::panel::AiPanel;
 use crate::ai::store::{list_sessions, rebind_session_boards as store_rebind, SessionMeta};
 use crate::camera::Camera;
 use crate::history::History;
-use crate::render::rough::{color_u32, paths_for_element, ReadyPath};
+use crate::render::rough::{color_u32, ops_for_element, PaintOp};
+use crate::render::wash::{WashCache, WashDraw};
 use crate::render::{dot_grid, handle_rects, measure_text, point_handle_rects, ShapedTextLine};
 use crate::scene::{
     pages::PageRatio, CanvasBrush, CanvasStroke, CanvasStrokeStyle, Element, ElementId,
@@ -453,6 +454,9 @@ pub struct BoardView {
     /// Per-canvas texture cache (位图画布像素缓冲 → GPU 纹理)，with stale
     /// tracking so the paint phase can free replaced atlas textures.
     canvas_cache: crate::render::raster::CanvasCache,
+    /// Per-element raster watercolor images (the 彩 fill), keyed by element
+    /// and resolution bucket, with the same stale tracking as the canvases.
+    wash_cache: WashCache,
     /// Pixel brush for the next stroke drawn into a raster canvas element
     /// (水彩/钢笔/飞白). Freedraw strokes keep using `style.brush`.
     canvas_brush: CanvasBrush,
@@ -555,6 +559,7 @@ impl BoardView {
             render_cache: crate::render::cache::RenderCache::new(),
             text_cache: crate::render::cache::TextCache::new(),
             canvas_cache: crate::render::raster::CanvasCache::new(),
+            wash_cache: WashCache::new(),
             canvas_brush: CanvasBrush::Ink,
         };
         // Auto-update: poll silently 30s after launch, then every 4h. Only a
@@ -5974,7 +5979,13 @@ struct BoardPaint {
     /// label, painted under the elements.
     page_frames: Vec<PaintQuad>,
     page_labels: Vec<TextPaintItem>,
-    paths: Vec<ReadyPath>,
+    /// Vector paths and raster washes, in scene order: a wash sits where its
+    /// element was painted, under that element's outline and over everything
+    /// before it.
+    paths: Vec<PaintOp>,
+    /// Wash textures retired before this frame's list was built, so that
+    /// none of them is in it; the paint phase frees them.
+    wash_stale: Vec<Arc<RenderImage>>,
     /// Embedded images (Image elements), painted under the vector paths.
     images: Vec<ImagePaintItem>,
     /// Raster canvases paint their surface through `images` too; these frame
@@ -5996,6 +6007,26 @@ struct ImagePaintItem {
 }
 
 impl BoardView {
+    /// Attach `el`'s raster wash to its paint op. Until the wash is at hand
+    /// the op paints its flat glazes — or the wash of another resolution,
+    /// stretched.
+    fn resolve_wash(
+        &self,
+        el: &Element,
+        mut wash: crate::render::rough::WashOp,
+        scale: f64,
+    ) -> PaintOp {
+        let image = match self.wash_cache.image(el, scale) {
+            WashDraw::Ready(image) => Some(image),
+            WashDraw::Pending(older) => older,
+        };
+        if let Some(image) = image {
+            let rect = image.world_rect((el.bounds.x, el.bounds.y));
+            wash.image = Some((self.world_bounds_to_screen(rect), image));
+        }
+        PaintOp::Wash(wash)
+    }
+
     fn build_paint(&self, viewport: Bounds<Pixels>, window: &Window) -> BoardPaint {
         let origin = viewport.origin;
         let margin = px(120.0);
@@ -6096,6 +6127,20 @@ impl BoardView {
         // Free textures of canvases that left the scene (deleted / swapped
         // by undo) before rebuilding any canvas image this frame.
         self.canvas_cache.retain_scene(&self.scene);
+        self.wash_cache.retain_scene(&self.scene);
+
+        // Raster watercolor: hand over what earlier frames queued and take
+        // back what the workers finished, before this frame's paint list is
+        // built, so that what it retires is not painted again.
+        let wash_scale = self.camera.zoom * f64::from(window.scale_factor());
+        let washed = self.wash_cache.work(|el| self.render_cache.geometry(el));
+        if washed || self.wash_cache.busy() {
+            window.request_animation_frame();
+        }
+        // Taken here, before any element resolves its wash into the list
+        // below: a texture retired later in the frame may still be painted
+        // by it, and waits for the next frame.
+        let wash_stale = self.wash_cache.take_stale();
 
         for el in &self.scene.elements {
             if !el.bounds.inflate(40.0, 40.0).intersects(&view_world) {
@@ -6232,19 +6277,22 @@ impl BoardView {
                 }
                 _ => {
                     let geom = self.render_cache.geometry(el);
-                    paths.extend(crate::render::rough::paint_world_geom(
-                        &geom,
-                        el,
-                        &self.camera,
-                        origin,
-                    ));
+                    paths.extend(
+                        crate::render::rough::paint_world_geom(&geom, el, &self.camera, origin)
+                            .into_iter()
+                            .map(|op| match op {
+                                PaintOp::Wash(wash) => self.resolve_wash(el, wash, wash_scale),
+                                op => op,
+                            }),
+                    );
                 }
             }
         }
 
-        // In-progress shapes.
+        // In-progress shapes. Their washes are not rasterized — a draft
+        // changes every frame — so they show the flat glazes until committed.
         if let Some(draft) = &self.draft {
-            paths.extend(paths_for_element(draft, &self.camera, origin));
+            paths.extend(ops_for_element(draft, &self.camera, origin));
         }
         if let DragState::Freedraw { collector, seed } = &self.drag {
             // A tap shows its dot immediately on pen-down.
@@ -6258,7 +6306,7 @@ impl BoardView {
                 // Stable seed for the whole drag: without it the rough
                 // jitter re-randomizes every frame and the line "swims".
                 draft.seed = *seed;
-                paths.extend(paths_for_element(&draft, &self.camera, origin));
+                paths.extend(ops_for_element(&draft, &self.camera, origin));
             }
         }
 
@@ -6385,6 +6433,7 @@ impl BoardView {
             page_frames,
             page_labels,
             paths,
+            wash_stale,
             images,
             canvas_frames,
             texts,
@@ -6831,8 +6880,32 @@ impl Render for BoardView {
                     for img in stale {
                         let _ = window.drop_image(img);
                     }
-                    for rp in paint.paths {
-                        window.paint_path(rp.path, rp.color);
+                    for op in paint.paths {
+                        match op {
+                            PaintOp::Path(rp) => window.paint_path(rp.path, rp.color),
+                            PaintOp::Wash(wash) => match wash.image {
+                                Some((bounds, image)) => {
+                                    let _ = window.paint_image(
+                                        bounds,
+                                        bounds,
+                                        gpui::Corners::all(px(0.0)),
+                                        image.image.clone(),
+                                        0,
+                                        false,
+                                    );
+                                }
+                                None => {
+                                    for rp in wash.fallback {
+                                        window.paint_path(rp.path, rp.color);
+                                    }
+                                }
+                            },
+                        }
+                    }
+                    // Textures of washes replaced or dropped before this
+                    // frame's list was built: nothing paints them any more.
+                    for img in paint.wash_stale {
+                        let _ = window.drop_image(img);
                     }
                     for item in &paint.texts {
                         paint_text_item(item, window, cx);

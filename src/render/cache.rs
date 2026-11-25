@@ -12,7 +12,7 @@
 //! including direct pub-field writes (bound-label loops in board.rs) and
 //! history's whole-`elements`-Vec swap on undo/redo.
 //!
-//! Two caches share this fingerprint machinery:
+//! Three caches share this fingerprint machinery:
 //!
 //! * [`RenderCache`] — world-space geometry ([`WorldGeom`], from
 //!   `crate::render::rough::world_geometry`). Pan/zoom never invalidates it;
@@ -20,6 +20,9 @@
 //! * [`TextCache`] — shaped text lines. Shaping runs at screen font size
 //!   (`font_size × zoom`), so the zoom is mixed into the fingerprint: panning
 //!   hits, zooming re-shapes.
+//! * `render::wash::WashCache` — raster watercolor images, keyed by the
+//!   fingerprint of the element moved to the origin (moving one keeps its
+//!   wash) and by resolution bucket.
 
 use std::{cell::RefCell, collections::HashMap, sync::Arc};
 

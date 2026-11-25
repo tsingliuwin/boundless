@@ -3,6 +3,7 @@
 pub mod cache;
 pub mod raster;
 pub mod rough;
+pub mod wash;
 
 use gpui::{
     fill, point, px, Bounds, Font, Hsla, PaintQuad, Pixels, Point, ShapedLine, Size, TextRun,

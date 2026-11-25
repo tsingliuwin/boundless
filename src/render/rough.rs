@@ -1,13 +1,17 @@
 //! Converts scene elements into GPUI paths with a hand-drawn look,
 //! powered by rough.js' Rust port (roughr / rough_piet).
 
+use std::sync::Arc;
+
 use gpui::{
-    px, Background, FillOptions, FillRule, Hsla, Path, PathBuilder, PathStyle, Pixels, Point,
+    px, Background, Bounds, FillOptions, FillRule, Hsla, Path, PathBuilder, PathStyle, Pixels,
+    Point,
 };
 use rough_piet::KurboGenerator;
 use roughr::Srgba;
 
 use crate::camera::Camera;
+use crate::render::wash::WashImage;
 use crate::scene::{
     curve_samples, diamond_polygon, Element, ElementKind, ElementStyle,
     FillStyle as SceneFillStyle, LineType, StrokeStyle, WBounds, WPoint,
@@ -19,6 +23,22 @@ pub struct ReadyPath {
     pub path: Path,
     /// Solid color for regular op sets; a linear gradient for the 渐变 fill.
     pub color: Background,
+}
+
+/// One item of an element's paint list, in paint order. The board paints a
+/// [`PaintOp::Path`] as it is; a [`PaintOp::Wash`] it resolves through
+/// `render::wash::WashCache` first.
+pub enum PaintOp {
+    Path(ReadyPath),
+    Wash(WashOp),
+}
+
+/// A watercolor wash in the paint list. Unresolved, it paints its `fallback`
+/// — the glazes as flat translucent fills; resolved, the rasterized wash that
+/// `image` points to, filling `image`'s bounds.
+pub struct WashOp {
+    pub fallback: Vec<ReadyPath>,
+    pub image: Option<(Bounds<Pixels>, Arc<WashImage>)>,
 }
 
 /// One roughr op set, decoupled from rough_piet's drawable type so the
@@ -257,8 +277,8 @@ fn options_for(style: &ElementStyle, seed: u64, is_freedraw: bool) -> Options {
 }
 
 /// Fill hachure parameters for the line-based fill styles: (spacing, stroke
-/// width) in world units. Density ordering: Hachure < Dense; Watercolor's base
-/// wash uses Dense-like coverage (its layer passes override these).
+/// width) in world units. Density ordering: Hachure < Dense. 彩 has no
+/// hachure fill any more; its entry only sizes its shadow (see `rough_shape`).
 fn fill_params(style: &ElementStyle) -> (f32, f32) {
     let sw = style.stroke_width as f32;
     let (gap, weight) = match style.fill_style {
@@ -282,6 +302,13 @@ fn fill_params(style: &ElementStyle) -> (f32, f32) {
         style.fill_weight.map_or(weight, |v| v as f32),
     )
 }
+
+/// The glazes of a 彩 wash, outermost first: (seed offset, scale about the
+/// shape's centre, alpha, roughness, bowing). Each is the shape's outline
+/// jittered its own way; the later ones sit a little further in, so the
+/// middle of the wash ends up deeper than its rim.
+const WASH_LAYERS: [(u64, f64, f32, f32, f32); 2] =
+    [(3, 1.000, 0.50, 2.4, 2.0), (7, 0.972, 0.36, 1.8, 1.4)];
 
 /// Scale a Bézier path around `center` by `k`, then offset by (dx, dy) —
 /// the shadow tucks behind the shape and pokes out only on the offset side.
@@ -404,15 +431,31 @@ fn append_bez_path(
     });
 }
 
-/// Generate the rough-styled paint paths for one element.
-/// Returned in paint order: fills first, then strokes. Composition of
-/// [`world_geometry`] + [`paint_world_geom`]; the board's render cache calls
-/// the two stages separately so the geometry stage is skipped on hit.
+/// The vector paths of one element, in paint order: fills first, then
+/// strokes. Its wash, if it has one, is left out — see [`ops_for_element`].
 pub fn paths_for_element(
     el: &Element,
     camera: &Camera,
     canvas_origin: Point<Pixels>,
 ) -> Vec<ReadyPath> {
+    ops_for_element(el, camera, canvas_origin)
+        .into_iter()
+        .filter_map(|op| match op {
+            PaintOp::Path(path) => Some(path),
+            PaintOp::Wash(_) => None,
+        })
+        .collect()
+}
+
+/// Everything one element paints, in paint order: composition of
+/// [`world_geometry`] + [`paint_world_geom`], uncached. The board's render
+/// cache calls the two stages separately so the geometry stage is skipped on
+/// a cache hit; drafts and tests use this.
+pub fn ops_for_element(
+    el: &Element,
+    camera: &Camera,
+    canvas_origin: Point<Pixels>,
+) -> Vec<PaintOp> {
     paint_world_geom(&world_geometry(el), el, camera, canvas_origin)
 }
 
@@ -421,7 +464,7 @@ pub fn paths_for_element(
 /// element (or its style/seed) actually changed.
 /// Build the rough geometry for a closed shape: the outline, the style's
 /// fill (a true fill surface for 实 / 渐变, hachure lines otherwise), the
-/// soft shadow, and watercolor's layered washes.
+/// soft shadow, and 彩's glazes.
 fn rough_shape(
     style: &ElementStyle,
     seed: u64,
@@ -434,7 +477,8 @@ fn rough_shape(
     let center = bounds.center();
 
     // Base pass: outline + the style's fill — except watercolor, whose fill
-    // comes entirely from the layered washes below (stroke-only here).
+    // is the raster wash of `render::wash`, built from the glazes below
+    // (stroke-only here).
     let base_opts = if watercolor {
         let mut o = options_for(style, seed, false);
         o.fill = None;
@@ -502,58 +546,44 @@ fn rough_shape(
         }
 
         match style.fill_style {
-            // 水彩：三层不同角度/透明度的淡彩晕染，再加两道逐层加宽、
-            // 逐层变淡的边缘描边（颜色取填充色加深）—— 颜料在纸缘沉积。
+            // 彩：晕染面不在矢量这一侧画——它是 `render::wash` 按像素光栅
+            // 化的图。这里只给出它的几层「淡彩」轮廓：各自独立抖动，逐层
+            // 略向内收，叠得越多的地方越深，并以 PaintOverride 带上各自的
+            // 透明度。外晕和边缘沉色都烘在那张图里；描边仍是上面的矢量
+            // 轮廓。矢量侧把这些轮廓当普通 FillPath 画出来，就是图还没
+            // 就绪时的替身。
             SceneFillStyle::Watercolor => {
                 let bg = style.background.unwrap_or(0);
                 let op = style.opacity;
-                let base_gap = style.hachure_gap.map_or((sw * 1.1).max(1.2) as f64, |v| v);
-                let washes = [
-                    (-41.0, (base_gap * 1.2).max(1.4), 1.7, 0.60, 7u64),
-                    (49.0, (base_gap * 0.8).max(1.0), 1.5, 0.45, 14),
-                    (-8.0, (base_gap * 1.7).max(2.0), 1.2, 0.32, 21),
-                ];
-                for (angle, gap, wf, af, so) in washes {
-                    let gap = gap as f32;
-                    let mut o = options_for(style, seed.wrapping_add(so), false);
-                    o.fill = Some(srgba(bg, op * af));
-                    o.fill_weight = Some(gap * wf);
-                    o.hachure_gap = Some(gap);
-                    o.set_hachure_angle(Some(angle));
+                let mut glazes = Vec::new();
+                for (dseed, k, alpha, roughness, bowing) in WASH_LAYERS {
+                    let mut o = options_for(style, seed.wrapping_add(dseed), false);
+                    o.stroke = None;
+                    o.roughness = Some(roughness);
+                    o.bowing = Some(bowing);
+                    o.fill_style = Some(FillStyle::Solid);
                     let gen2 = KurboGenerator::new(o);
-                    sets.extend(
+                    glazes.extend(
                         sets_of(&draw(&gen2))
                             .into_iter()
-                            .filter(|s| s.op_set_type == OpSetType::FillSketch)
+                            .filter(|s| s.op_set_type == OpSetType::FillPath)
                             .map(|mut s| {
+                                s.ops = shadow_transform(&s.ops, center, 0.0, 0.0, k);
                                 s.paint = Some(PaintOverride {
-                                    color: Some(color_u32(bg, op * af)),
-                                    width: Some((gap * wf) as f64),
+                                    color: Some(color_u32(bg, op * alpha)),
+                                    width: None,
                                 });
                                 s
                             }),
                     );
                 }
-                let edges = [(1.8, 0.72, 0.30, 28u64), (2.6, 0.55, 0.16, 35)];
-                for (wf, df, af, so) in edges {
-                    let mut o = options_for(style, seed.wrapping_add(so), false);
-                    o.fill = None;
-                    o.stroke = Some(srgba(darken(bg, df), op * af));
-                    o.stroke_width = Some(sw * wf);
-                    let gen2 = KurboGenerator::new(o);
-                    sets.extend(
-                        sets_of(&draw(&gen2))
-                            .into_iter()
-                            .filter(|s| s.op_set_type == OpSetType::Path)
-                            .map(|mut s| {
-                                s.paint = Some(PaintOverride {
-                                    color: Some(color_u32(darken(bg, df), op * af)),
-                                    width: Some((sw * wf) as f64),
-                                });
-                                s
-                            }),
-                    );
-                }
+                // Where the fill goes: after any shadow, before the outline,
+                // so the wash is painted under the outline.
+                let at = sets
+                    .iter()
+                    .position(|s| s.op_set_type == OpSetType::Path)
+                    .unwrap_or(sets.len());
+                sets.splice(at..at, glazes);
             }
             _ => {}
         }
@@ -728,17 +758,18 @@ fn dot_geometry(el: &Element, points: &[WPoint]) -> WorldGeom {
     WorldGeom::Outline(crate::ink::dot_outline(points[0], diameter))
 }
 
-/// Transform cached world geometry into paintable screen-space paths for the
+/// Transform cached world geometry into paintable screen-space items for the
 /// current camera. This is the only per-frame work: flatten (zoom-dependent
-/// density), world_to_screen, and path building.
+/// density), world_to_screen, and path building. A 彩 wash leaves as one
+/// [`PaintOp::Wash`] for the board to resolve.
 pub fn paint_world_geom(
     geom: &WorldGeom,
     el: &Element,
     camera: &Camera,
     canvas_origin: Point<Pixels>,
-) -> Vec<ReadyPath> {
+) -> Vec<PaintOp> {
     let style = &el.style;
-    let mut out: Vec<ReadyPath> = Vec::new();
+    let mut out: Vec<PaintOp> = Vec::new();
 
     let stroke_color = color_u32(style.stroke, style.opacity);
     let fill_color: Background = match (style.background, style.fill_style) {
@@ -756,6 +787,10 @@ pub fn paint_world_geom(
     match geom {
         WorldGeom::Empty => {}
         WorldGeom::Rough(sets) => {
+            // The glazes of a 彩 wash — the true-fill op sets that bring
+            // their own alpha — and where in `out` its wash goes.
+            let mut glazes: Vec<ReadyPath> = Vec::new();
+            let mut glazes_at = 0;
             for set in sets {
                 match set.op_set_type {
                     OpSetType::FillPath => {
@@ -768,10 +803,23 @@ pub fn paint_world_geom(
                             }));
                         append_bez_path(&mut builder, &set.ops, camera, canvas_origin);
                         match builder.build() {
-                            Ok(path) => out.push(ReadyPath {
-                                path,
-                                color: fill_color.into(),
-                            }),
+                            Ok(path) => {
+                                let own_alpha = set.paint.as_ref().and_then(|p| p.color);
+                                let color: Background = own_alpha.map_or(fill_color, Into::into);
+                                let ready = ReadyPath {
+                                    path,
+                                    color: color.into(),
+                                };
+                                match own_alpha {
+                                    Some(_) => {
+                                        if glazes.is_empty() {
+                                            glazes_at = out.len();
+                                        }
+                                        glazes.push(ready);
+                                    }
+                                    None => out.push(PaintOp::Path(ready)),
+                                }
+                            }
                             Err(e) => eprintln!(
                                 "[render] FillPath tessellation failed ({}x{}): {e}",
                                 el.id.to_string().get(..8).unwrap_or("?"),
@@ -793,10 +841,10 @@ pub fn paint_world_geom(
                         let mut builder = PathBuilder::stroke(width_px);
                         append_bez_path(&mut builder, &set.ops, camera, canvas_origin);
                         if let Ok(path) = builder.build() {
-                            out.push(ReadyPath {
+                            out.push(PaintOp::Path(ReadyPath {
                                 path,
                                 color: color.into(),
-                            });
+                            }));
                         }
                     }
                     OpSetType::Path => {
@@ -821,13 +869,24 @@ pub fn paint_world_geom(
                         }
                         append_bez_path(&mut builder, &set.ops, camera, canvas_origin);
                         if let Ok(path) = builder.build() {
-                            out.push(ReadyPath {
+                            out.push(PaintOp::Path(ReadyPath {
                                 path,
                                 color: color.into(),
-                            });
+                            }));
                         }
                     }
                 }
+            }
+            if !glazes.is_empty() {
+                // Where its first glaze sat: after any shadow, before the
+                // outline.
+                out.insert(
+                    glazes_at,
+                    PaintOp::Wash(WashOp {
+                        fallback: glazes,
+                        image: None,
+                    }),
+                );
             }
         }
         WorldGeom::Sampled(passes) => {
@@ -854,10 +913,10 @@ pub fn paint_world_geom(
                     builder.line_to(camera.world_to_screen(*p, canvas_origin));
                 }
                 if let Ok(path) = builder.build() {
-                    out.push(ReadyPath {
+                    out.push(PaintOp::Path(ReadyPath {
                         path,
                         color: color.into(),
-                    });
+                    }));
                 }
             }
         }
@@ -880,10 +939,10 @@ pub fn paint_world_geom(
             }
             builder.close();
             if let Ok(path) = builder.build() {
-                out.push(ReadyPath {
+                out.push(PaintOp::Path(ReadyPath {
                     path,
                     color: stroke_color.into(),
-                });
+                }));
             }
         }
     }
@@ -1053,15 +1112,16 @@ mod tests {
 
     #[test]
     fn all_fill_styles_produce_paths() {
-        // U-RD-001：五种填充样式都必须出图。实 / 渐变 = 真填充面
-        // （FillPath），线 / 密 / 彩 = 排线（FillSketch）。
+        // U-RD-001：五种填充样式都必须出图。实 / 渐 = 真填充面（FillPath），
+        // 彩 = 几层淡彩（带各自透明度的 FillPath，供 render::wash 光栅化），
+        // 线 / 密 = 排线（FillSketch）。
         let camera = Camera::default();
         let origin = gpui::point(px(0.0), px(0.0));
         for (fs, want_fill_path, want_sketch) in [
             (SceneFillStyle::Hachure, false, true),
             (SceneFillStyle::Dense, false, true),
             (SceneFillStyle::Solid, true, false),
-            (SceneFillStyle::Watercolor, false, true),
+            (SceneFillStyle::Watercolor, true, false),
             (SceneFillStyle::Gradient, true, false),
         ] {
             let el = Element::new(
@@ -1089,6 +1149,58 @@ mod tests {
                 "{fs:?} FillSketch presence mismatch"
             );
         }
+    }
+
+    #[test]
+    fn a_watercolor_paints_one_wash_where_its_fill_goes_then_its_outline() {
+        // What the board relies on: the glazes of a 彩 wash leave as one
+        // `PaintOp::Wash`, where the fill of any other style sits, for it to
+        // resolve through `render::wash::WashCache`; the outline follows as
+        // plain paths. Unresolved, the wash paints its glazes as flat fills.
+        let mut el = Element::new(
+            ElementKind::Rectangle,
+            WBounds::new(0.0, 0.0, 120.0, 80.0),
+            ElementStyle {
+                stroke: 0x1e1e1e,
+                background: Some(0xffa8a8),
+                fill_style: SceneFillStyle::Watercolor,
+                ..Default::default()
+            },
+        );
+        el.seed = 7;
+        let camera = Camera::default();
+        let origin = gpui::point(px(0.0), px(0.0));
+
+        let ops = ops_for_element(&el, &camera, origin);
+        let PaintOp::Wash(wash) = &ops[0] else {
+            panic!("the wash comes first, got {} ops", ops.len());
+        };
+        assert!(wash.fallback.len() >= 2, "the glazes stand in for the wash");
+        assert!(
+            wash.image.is_none(),
+            "unresolved until the board resolves it"
+        );
+        assert!(
+            ops[1..].iter().all(|op| matches!(op, PaintOp::Path(_))),
+            "then the outline"
+        );
+        assert_eq!(
+            paths_for_element(&el, &camera, origin).len(),
+            ops.len() - 1,
+            "the vector paths alone leave the wash out"
+        );
+
+        // A shadow is painted first, under the wash.
+        el.style.shadow = Some(crate::scene::Shadow { dx: 6.0, dy: 8.0 });
+        let ops = ops_for_element(&el, &camera, origin);
+        let wash_at = ops
+            .iter()
+            .position(|op| matches!(op, PaintOp::Wash(_)))
+            .expect("the wash is there");
+        assert!(wash_at > 0, "the shadow comes first");
+        assert!(ops[..wash_at]
+            .iter()
+            .all(|op| matches!(op, PaintOp::Path(_))));
     }
 
     #[test]

@@ -91,11 +91,17 @@ L1  单元 (src/**)      纯函数：几何、布局、解析、状态机（现�
 
 | ID | 用例 | 操作 | 断言 | 优先级 | 状态 |
 |---|---|---|---|---|---|
-| U-RD-001 | 五种 fill_style 出图 | 矩形×{hachure,dense,solid,watercolor,gradient} 生成 `paths_for_element` | 全部非空；**任何样式都不走 FillPath**（真机不可见，含 macOS——见测试日志 2026-09-06 追加轮）（实=双遍密排 FillSketch） | P0 | ✅（2026-09-06 更新期望表） |
-| U-RD-002 | 渐变逐线上色 | 用户真实元素（黄底椭圆+飞白）world_geometry | 零 FillPath；每根排线单 OpSet 带色，颜色=按 y 在 lighten/darken(35%) 间精确插值、单调顶亮底暗 | P0 | ✅（2026-09-06 重写，原 FillPath 断言已废弃） |
-| U-RD-003 | fill_params 密度序 | 比较 5 种样式 (gap, weight) | hachure gap > dense > solid；watercolor/gradient 符合预设值 | P1 | 🆕 |
+| U-RD-001 | 五种 fill_style 出图 | 矩形×{hachure,dense,solid,watercolor,gradient} 生成 `paths_for_element` / `world_geometry` | 全部非空；线/密 = FillSketch（排线）；实/渐 = 一道 FillPath 真填充；彩 = 带各自透明度的 FillPath 淡彩层（供 `render::wash` 光栅化） | P0 | ✅（2026-11-25 更新期望表：「FillPath 不可见」的旧结论源自坏掉的 fill_repro 探针） |
+| U-RD-002 | 渐变 = 一道真渐变面 | 用户真实元素（黄底椭圆+飞白）world_geometry | 恰好一道 FillPath、零 FillSketch；paint 输出恰一个 180° LinearGradient | P0 | ✅（2026-11-25 重写为 `gradient_fill_is_one_real_gradient_surface`） |
+| U-RD-003 | fill_params 密度序 | 比较 hachure / dense 的 (gap, weight) | hachure gap > dense；实/渐/彩没有排线参数（彩的条目只给它的阴影定线宽） | P1 | 🆕 |
 | U-RD-004 | hachure 覆盖参数生效 | `hachure_gap/fill_weight/hachure_angle` 设定后几何 | 排线行数 = f(bounds/gap)；角度改变行方向 | P1 | 🆕 |
 | U-RD-005 | dry_width 参数 | 飞白 dry_width=2.0 vs 0.2 | 主笔 PaintOverride.width 线性跟随 | P1 | 🆕 |
+| U-WASH-1 | 栅格水彩：覆盖、柔边、外晕、边缘沉色 | `render::wash::rasterize`（200×100 矩形，2 px/单位） | 中心覆盖且为填充色；远处 alpha=0；轮廓处约半透、由内向外递减、无台阶；近边缘各通道明显深于中心 | P0 | ✅ |
+| U-WASH-2 | 椭圆的水彩填满 | 椭圆元素光栅化（roughr 的椭圆轮廓绕两圈） | 中心覆盖：填充按非零环绕规则，偶奇规则只会剩一圈环 | P0 | ✅ |
+| U-WASH-3 | 水彩缓存 | `WashCache::inline()` | 首帧不排队、元素静止一帧后才排队；移动元素复用同一张图；改样式、跨缩放档位才重做并回收旧图；持续缩放、持续变化的元素不光栅化；删除元素回收 | P0 | ✅ |
+| U-WASH-4 | 后台光栅化 | `WashCache::new()`（线程池） | `work` 只投递和回收，不在调用线程光栅化；结果随后到达；为元素旧状态做的结果被丢弃 | P0 | ✅ |
+| U-WASH-5 | 水彩走 board 的跨帧流程（GPU 读回） | `cargo run --example fill_repro -- wash`：隐藏窗口，两个彩矩形入 `Scene`，每帧按 board 的顺序 retain_scene → work → take_stale → 解析 → 贴图 → 画完 drop_image，直到水彩到位后读回像素 | 两块水彩到位且为各自颜色；与同一元素强画扁平替身的一帧相比：着色起点中位靠外 ≥2 逻辑像素、溢出段的淡入面积 ≥1 px、中心 60 px 见方的红色通道跨度多 ≥6；改样式后新水彩到位、旧纹理交给 drop_image；退出码 0。反向对照：只画替身时恰是这三项失败 | P0 | ✅（2026-11-25） |
+| U-WASH-6 | 真实 app 渲染链路里的彩（GPU 读回） | `cargo run --example fill_repro -- app`：隐藏窗口的根视图是真实 `BoardView`（同 `src/main.rs` 的初始化与 `Root`），`BOUNDLESS_HOME` 指向一次性目录（不碰用户数据），打开一块合成白板：一个实心参照方块 + 带轮廓的彩矩形、彩椭圆，相机不在原点且缩放 125% | 读回帧里参照方块完整 → 建立世界→屏幕映射；两块水彩中心为各自颜色、内部有色阶变化；沿矩形的四条边各量 3 条线，水彩超出轮廓 −4～+11 世界单位（溢出量 + 手抖），**侧栏关闭和打开（画布平移）各测一遍**。反向对照（改 `resolve_wash`）：缩到 85%、平移 8～12 单位、放大 1.5 倍都必须失败 | P0 | ✅（2026-11-25） |
 | U-RD-006 | 阴影渲染 | 带 `shadow` 的矩形 | 输出在最前多两组深色 opset，且几何被偏移 dx/dy | P1 | 🆕 |
 | U-RD-007 | 虚线样式 | dashed 矩形轮廓 | 路径段数显著多于实线（dash 切分） | P2 | 🆕 |
 | U-RD-008 | 缩放稳定性 | 同一元素 zoom 0.5/1/2 各 paint | 路径数恒定（几何世界坐标缓存）；屏幕坐标随 zoom 缩放 | P1 | 🆕 |

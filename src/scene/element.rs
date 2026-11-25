@@ -161,8 +161,9 @@ pub enum LineType {
 }
 
 /// How shape backgrounds are filled: hachure sketch lines (the classic
-/// Excalidraw look, default), dense overlapping hachure (near-solid), or a
-/// solid flat block (chalk-paste panels on a blackboard poster).
+/// Excalidraw look, default), dense overlapping hachure (near-solid), a
+/// solid flat block (chalk-paste panels on a blackboard poster), a
+/// watercolor wash, or a vertical gradient.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FillStyle {
@@ -172,8 +173,8 @@ pub enum FillStyle {
     /// almost as a flat patch while keeping the hand-drawn texture.
     Dense,
     Solid,
-    /// Watercolor wash: several translucent hachure layers at different
-    /// angles plus darkened edge pooling — soft, layered, hand-painted.
+    /// Watercolor wash: a raster image (`render::wash`) with a soft wet
+    /// edge, a bleed past the outline and pigment pooling darker along it.
     Watercolor,
     /// Vertical linear gradient: the fill color fades into a darkened
     /// variant toward the bottom (sky panels, depth shading).
@@ -228,7 +229,8 @@ pub struct ElementStyle {
     pub brush: Option<Brush>,
     /// Agent 级细粒度填充参数。当设置时逐项覆盖 fill_style 预设的派生值：
     /// 排线间距（世界单位）、排线线宽（>= 2× 间距近乎实心）、排线角度
-    /// （默认 -41）。None = 用预设。
+    /// （默认 -41）。None = 用预设。只对排线类样式（hachure / dense）生效；
+    /// 实心、渐变、水彩没有排线。
     #[serde(default)]
     pub hachure_gap: Option<f64>,
     #[serde(default)]
