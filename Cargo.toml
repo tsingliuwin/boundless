@@ -129,6 +129,18 @@ panic = "abort"
 strip = true
 
 [dev-dependencies]
+# GPU read-back for the rendering probe (examples/fill_repro.rs): the probe
+# judges pixels itself through `Window::render_to_image`, which gpui keeps
+# behind its `test-support` feature (the platform crate's feature of the same
+# name turns on the Windows/macOS implementations). Declared as dev-deps so
+# `cargo run` / `cargo build` never enable it — only examples and tests do.
+# Side effect in Cargo.lock: gpui's `bench_metrics?/test-support` weak feature
+# makes the lock list a benchmark stack (criterion, plotters, clap, ...). No
+# feature on Windows or macOS enables it, so it is never compiled.
+gpui = { version = "=0.3.14", package = "gpui-pre", features = ["test-support"] }
+gpui-platform = { version = "=0.3.14", package = "gpui-pre-platform", features = [
+    "test-support",
+] }
 # Full minisign crate (generate keypair + sign), used only by the
 # examples/gen_minisign_keypair.rs and examples/sign_release.rs helpers (local
 # keygen + CI signing). The app itself verifies with the lighter
