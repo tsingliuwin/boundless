@@ -1,7 +1,9 @@
 //! Converts scene elements into GPUI paths with a hand-drawn look,
 //! powered by rough.js' Rust port (roughr / rough_piet).
 
-use gpui::{px, Background, FillOptions, Hsla, Path, PathBuilder, PathStyle, Pixels, Point};
+use gpui::{
+    px, Background, FillOptions, FillRule, Hsla, Path, PathBuilder, PathStyle, Pixels, Point,
+};
 use rough_piet::KurboGenerator;
 use roughr::Srgba;
 
@@ -14,7 +16,7 @@ use roughr::core::{FillStyle, LineCap, LineJoin, OpSetType, Options};
 
 /// One tessellated path ready to paint.
 pub struct ReadyPath {
-    pub path: Path<Pixels>,
+    pub path: Path,
     /// Solid color for regular op sets; a linear gradient for the 渐变 fill.
     pub color: Background,
 }
@@ -937,8 +939,9 @@ pub fn paint_world_geom(
             }
             // NonZero fill: the ribbon can self-intersect at sharp turns and
             // an EvenOdd rule would punch holes there.
-            let mut builder =
-                PathBuilder::fill().with_style(PathStyle::Fill(FillOptions::non_zero()));
+            let mut builder = PathBuilder::fill().with_style(PathStyle::Fill(FillOptions {
+                fill_rule: FillRule::NonZero,
+            }));
             for (i, wp) in outline.iter().enumerate() {
                 let sp = camera.world_to_screen(*wp, canvas_origin);
                 if i == 0 {
